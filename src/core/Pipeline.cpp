@@ -32,14 +32,18 @@ void Pipeline::play() {
         node->set_pool(pool_.get());
     }
 
-    // 3. 在相邻节点之间创建 Queue
+    // 3. 在相邻节点之间创建 Queue（手动注入的队列优先，不覆盖）
+    //    只自动连接 index 0，多输出节点（如 FFmpegDemux）的其余队列手动注入
     //    nodes_[0] → queue[0] → nodes_[1] → queue[1] → nodes_[2] → ...
-    //    N 个节点需要 N-1 个队列
     for (size_t i = 0; i + 1 < nodes_.size(); ++i) {
+        // 任意一方 index 0 已有队列，说明是手动注入的，跳过自动连接
+        if (nodes_[i]->output_queue(0) || nodes_[i + 1]->input_queue(0)) {
+            continue;
+        }
         auto q = std::make_shared<Queue<Buffer*>>(queue_depth_);
         queues_.push_back(q);
-        nodes_[i]->set_output_queue(q);         // 上游的输出
-        nodes_[i + 1]->set_input_queue(q);      // 下游的输入
+        nodes_[i]->set_output_queue(q, 0);
+        nodes_[i + 1]->set_input_queue(q, 0);
     }
 
     // 4. 按顺序启动所有节点线程

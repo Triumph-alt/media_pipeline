@@ -12,8 +12,8 @@ void INode::start() {
 
 void INode::stop() {
     stop_requested_.store(true, std::memory_order_release);
-    if (input_queue_) {
-        input_queue_->flush();
+    for (auto& q : input_queues_) {
+        if (q) q->flush();
     }
     if (thread_.joinable()) {
         thread_.join();
@@ -23,12 +23,15 @@ void INode::stop() {
 void INode::run() {
     // 标准 Filter/Sink 节点的线程循环
     // Source 节点没有输入队列，必须重写 run()
-    assert(input_queue_ && "input_queue_ is null, did you forget to override run()?");
+    assert(input_queues_.size() > 0 && input_queues_[0] &&
+           "input_queues_[0] is null, did you forget to override run()?");
     assert(pool_ && "pool_ is null, did you forget to call set_pool()?");
 
     while (true) {
-        auto result = input_queue_->pop();
-        if (!result.has_value()) break;
+        auto result = input_queues_[0]->pop();
+        if (!result.has_value()) {
+            break;
+        }
 
         Buffer* buf = result.value();
         process(buf);
