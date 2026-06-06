@@ -29,9 +29,7 @@ void INode::run() {
 
     while (true) {
         auto result = input_queues_[0]->pop();
-        if (!result.has_value()) {
-            break;
-        }
+        if (!result.has_value()) break;
 
         Buffer* buf = result.value();
         process(buf);

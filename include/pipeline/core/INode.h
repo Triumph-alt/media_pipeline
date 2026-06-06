@@ -45,12 +45,11 @@ class INode {
         // - 如果要把 buf 传给 output_queues_，必须先调用 pool_->add_ref(buf)
         // - 不需要自己调用 release()，run() 会在 process() 返回后统一 release
         //
-        // index 约定：
-        // - input_queues_[0]：唯一输入（普通节点）
-        // - output_queues_[0]：主输出，视频流或唯一输出
-        // - output_queues_[1]：次输出，音频流（FFmpegDemux 专用）
-        // Source 节点重写 run() 时只往 output_queues_[0] push
-        // FFmpegDemux 重写 run() 时视频往 index 0，音频往 index 1
+        // index 约定（硬编码 0/1，不用枚举）：
+        // - FFmpegDemux: output_queues_[0] = 视频, output_queues_[1] = 音频
+        // - FFmpegMux:   input_queues_[0]  = 视频, input_queues_[1]  = 音频
+        // - 普通节点:    统一用物理 index 0（单输入/单输出）
+        // Source 节点重写 run() 时往 output_queues_[0] push
         virtual void process(Buffer* buf) = 0;
 
         // 标准线程循环，子类一般不需要覆盖

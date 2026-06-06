@@ -27,8 +27,8 @@ FFmpegDemux::FFmpegDemux(const std::string& uri)
 
 FFmpegDemux::~FFmpegDemux() = default;
 
-bool FFmpegDemux::fill_buffer(Buffer* buf, AVPacket* pkt, 
-                            int64_t time_base_num, 
+bool FFmpegDemux::fill_buffer(Buffer* buf, AVPacket* pkt,
+                            int64_t time_base_num,
                             int64_t time_base_den) {
     if (static_cast<size_t>(pkt->size) > buf->size) {
         return false;
@@ -46,6 +46,7 @@ bool FFmpegDemux::fill_buffer(Buffer* buf, AVPacket* pkt,
 
 void FFmpegDemux::run() {
     assert(pool_ && "pool_ is null");
+    // index 0 = 视频输出，index 1 = 音频输出
     assert(!output_queues_.empty() && output_queues_[0] && "video output queue is null");
 
     // 打开媒体源
@@ -92,6 +93,7 @@ void FFmpegDemux::run() {
         }
 
         // 判断是音频包还是视频包
+        // index 0 = 视频，index 1 = 音频
         std::shared_ptr<Queue<Buffer*>> target_queue;
         AVRational time_base{};
 
@@ -99,7 +101,7 @@ void FFmpegDemux::run() {
             target_queue = output_queues_[0];
             time_base = fmt_ctx->streams[video_idx]->time_base;
         } else if (pkt->stream_index == audio_idx &&
-                   output_queues_.size() > 1 && 
+                   output_queues_.size() > 1 &&
                    output_queues_[1]) {
             target_queue = output_queues_[1];
             time_base = fmt_ctx->streams[audio_idx]->time_base;
