@@ -1,14 +1,49 @@
-# 暂时只有一个 main.cpp 验证 FFmpeg 链接
-# 后续 core/ 和 nodes/ 的源码会在这里添加
+# ---- 核心框架源码 ----
+set(CORE_SOURCES
+    core/Buffer.cpp
+    core/Clock.cpp
+    core/Event.cpp
+    core/INode.cpp
+    core/MessageBus.cpp
+    core/Pad.cpp
+    core/Pipeline.cpp
+)
 
-add_executable(media_pipeline main.cpp)
+# ---- 节点源码（后续阶段添加）----
+set(NODE_SOURCES
+    # nodes/DemuxNode.cpp
+    # nodes/DecodeNode.cpp
+    # nodes/VideoRenderNode.cpp
+    # nodes/AudioPlayNode.cpp
+)
 
-target_include_directories(media_pipeline PRIVATE ${FFMPEG_INCLUDE_DIRS})
-target_link_libraries(media_pipeline PRIVATE ${FFMPEG_LIBRARIES})
+# ---- 构建静态库 ----
+add_library(pipeline STATIC
+    ${CORE_SOURCES}
+    ${NODE_SOURCES}
+)
 
-# 静态链接 FFmpeg 时需要这些系统依赖
-target_link_libraries(media_pipeline PRIVATE
+# ---- 头文件搜索路径 ----
+target_include_directories(pipeline PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_include_directories(pipeline PUBLIC
+    ${FFMPEG_INCLUDE_DIRS}
+    ${SDL3_INCLUDE_DIRS}
+)
+
+# ---- 链接库 ----
+target_link_libraries(pipeline PRIVATE
+    ${FFMPEG_LIBRARIES}
+    ${SDL3_LIBRARIES}
+)
+
+# ---- 系统依赖 ----
+target_link_libraries(pipeline PUBLIC
     pthread
     m
     dl
+    z
+    lzma
 )
