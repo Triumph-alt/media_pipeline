@@ -11,7 +11,7 @@ set(CORE_SOURCES
 
 # ---- 节点源码（后续阶段添加）----
 set(NODE_SOURCES
-    # nodes/DemuxNode.cpp
+    nodes/DemuxNode.cpp
     # nodes/DecodeNode.cpp
     # nodes/VideoRenderNode.cpp
     # nodes/AudioPlayNode.cpp
@@ -46,4 +46,5 @@ target_link_libraries(pipeline PUBLIC
     dl
     z
     lzma
+    drm
 )

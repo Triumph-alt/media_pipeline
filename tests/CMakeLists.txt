@@ -10,3 +10,6 @@ target_link_libraries(test_pad PRIVATE pipeline)
 
 add_executable(test_pipeline test_pipeline.cpp)
 target_link_libraries(test_pipeline PRIVATE pipeline)
+
+add_executable(test_demux test_demux.cpp)
+target_link_libraries(test_demux PRIVATE pipeline)
