@@ -69,6 +69,11 @@ public:
     // flush：清空队列，唤醒阻塞中的线程
     void flush();
 
+    // 队列中当前待处理的元素数量
+    size_t queueSize() const { return m_queue ? m_queue->size() : 0; }
+    // 队列容量上限
+    size_t queueMaxSize() const { return m_queue ? m_queue->maxSize() : 0; }
+
 protected:
     // 自我身份认同
     PadDirection m_direction;                         // 端口的方向，SRC 或 SINK

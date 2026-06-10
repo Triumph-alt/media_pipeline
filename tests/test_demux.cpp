@@ -2,6 +2,7 @@
 #include "pipeline/core/INode.h"
 #include "pipeline/core/Event.h"
 #include "pipeline/nodes/DemuxNode.h"
+#include "pipeline/nodes/DecodeNode.h"
 
 #include <cassert>
 #include <cstdio>
@@ -9,7 +10,7 @@
 
 using namespace pipeline;
 
-// ===== 测试用 SinkNode：打印收到的 packet 信息 =====
+// ===== 测试用 SinkNode：打印收到的数据 =====
 
 class PrintSinkNode : public SinkNode {
 public:
@@ -20,22 +21,19 @@ public:
     }
 
     void onReady() override {}
-
     void onNull() override {}
 
 protected:
     void consume(std::shared_ptr<Buffer> buffer) override {
         m_count++;
-        printf("[sink] stream=%d  pts=%ld  dts=%ld  size=%zu  key=%d\n",
+        printf("[sink] stream=%d  pts=%ld  size=%zu\n",
                buffer->streamIndex,
                buffer->pts,
-               buffer->dts,
-               buffer->size,
-               buffer->isKeyFrame());
+               buffer->size);
     }
 
     void handleEOS() override {
-        printf("[sink] EOS reached, total packets: %d\n", m_count);
+        printf("[sink] EOS reached, total frames: %d\n", m_count);
     }
 
 private:
@@ -43,9 +41,9 @@ private:
 };
 
 int main() {
-    printf("=== DemuxNode Test ===\n\n");
+    printf("=== DecodeNode Test ===\n\n");
 
-    Pipeline pipeline("test-demux");
+    Pipeline pipeline("test-decode");
 
     pipeline.setMessageCallback([](const Message& msg) {
         const char* typeStr = "UNKNOWN";
@@ -54,22 +52,26 @@ int main() {
         case Message::Type::WARNING:       typeStr = "WARNING"; break;
         case Message::Type::STATE_CHANGED: typeStr = "STATE"; break;
         case Message::Type::EOS:           typeStr = "EOS"; break;
+        case Message::Type::STREAM_INFO:   typeStr = "STREAM"; break;
         default: break;
         }
         printf("[Bus] %s: %s\n", typeStr, msg.text.c_str());
     });
 
-    // 创建 DemuxNode，读取测试文件
-    auto* demux = pipeline.addNode<DemuxNode>("demux");
+    // DemuxNode → DecodeNode(video) → Sink
+    //           → DecodeNode(audio) → Sink
+    auto* demux  = pipeline.addNode<DemuxNode>("demux");
     demux->setParam("url", std::string("/home/thomasweide/视频/test.mp4"));
 
-    // 创建两个 Sink 分别接收音频和视频
-    auto* videoSink = pipeline.addNode<PrintSinkNode>("vsink");
-    auto* audioSink = pipeline.addNode<PrintSinkNode>("asink");
+    auto* decV   = pipeline.addNode<DecodeNode>("dec-v");
+    auto* decA   = pipeline.addNode<DecodeNode>("dec-a");
+    auto* sinkV  = pipeline.addNode<PrintSinkNode>("sink-v");
+    auto* sinkA  = pipeline.addNode<PrintSinkNode>("sink-a");
 
-    // 连接: demux video_0 → vsink, demux audio_0 → asink
-    demux->link(videoSink, "video_0", "in");
-    demux->link(audioSink, "audio_0", "in");
+    demux->link(decV, "video_0", "in");
+    demux->link(decA, "audio_0", "in");
+    decV->link(sinkV, "out", "in");
+    decA->link(sinkA, "out", "in");
 
     printf("--- play ---\n");
     pipeline.play();

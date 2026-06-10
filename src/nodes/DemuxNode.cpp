@@ -77,8 +77,9 @@ void DemuxNode::onProbe() {
             continue;
         }
 
-        // 创建 SrcPad
-        SrcPad* pad = createSrcPad(padName);
+        // 创建 SrcPad（音频帧小多缓，视频帧大少缓）
+        size_t maxBufs = (mediaType == MediaType::AUDIO) ? 20 : 5;
+        SrcPad* pad = createSrcPad(padName, maxBufs);
 
         // 填充 StreamInfo
         StreamInfo info;
@@ -139,8 +140,19 @@ void DemuxNode::workerLoop() {
             m_stateCV.wait(lock, [this] {
                 return m_state == NodeState::PLAYING || m_stopRequested;
             });
-            if (m_stopRequested) return;
+            if (m_stopRequested) {
+                return;
+            }
         }
+
+        // 主动背压阈值（参考 ffplay）：
+        //   全局总量 = 所有 SrcPad 的 maxBuffers 之和再留些余量
+        //   单队列高压 = 每个 Pad 自己的 maxBuffers
+        size_t maxTotalQueued = 0;
+        for (auto& pad : m_srcPads) {
+            maxTotalQueued += pad->queueMaxSize();
+        }
+        if (maxTotalQueued > 5) maxTotalQueued -= 5;  // 留一点余量
 
         AVPacket* pkt = av_packet_alloc();
         if (!pkt) {
@@ -150,6 +162,24 @@ void DemuxNode::workerLoop() {
         }
 
         while (!m_stopRequested) {
+            // 主动背压（ffplay 风格）：
+            //   条件 1: 所有队列总元素超过全局上限 → 暂停读取
+            //   条件 2: 任意一个队列达到自己的 maxBuffers → 暂停读取
+            size_t totalQueued = 0;
+            bool anyQueueFull = false;
+            for (auto& pad : m_srcPads) {
+                size_t qs = pad->queueSize();
+                totalQueued += qs;
+                if (qs >= pad->queueMaxSize()) {
+                    anyQueueFull = true;
+                }
+            }
+            if (totalQueued >= maxTotalQueued || anyQueueFull) {
+                std::unique_lock lock(m_stateMutex);
+                m_stateCV.wait_for(lock, std::chrono::milliseconds(10));
+                continue;
+            }
+
             int ret = av_read_frame(m_fmtCtx, pkt);
             if (ret < 0) {
                 if (ret == AVERROR_EOF || ret == AVERROR(EIO)) {
@@ -172,7 +202,6 @@ void DemuxNode::workerLoop() {
                 static_cast<size_t>(pkt->stream_index) < m_streamMap.size()) {
                 padIdx = m_streamMap[pkt->stream_index];
             }
-
             if (padIdx < 0) {
                 // 该流无对应 Pad，丢弃
                 av_packet_unref(pkt);
@@ -184,8 +213,8 @@ void DemuxNode::workerLoop() {
             auto buf = Buffer::fromAVPacket(pkt, stream->time_base,
                                             m_pipeline->memoryPool());
 
-            // push 到对应的 SrcPad（带超时，避免一个流阻塞导致全部卡住）
-            m_srcPads[padIdx]->push(buf, std::chrono::milliseconds(100));
+            // 阻塞 push（水位已控制，队列大概率有空间）
+            m_srcPads[padIdx]->push(buf);
 
             av_packet_unref(pkt);
         }
