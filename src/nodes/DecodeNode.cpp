@@ -13,33 +13,37 @@ DecodeNode::DecodeNode(const std::string& name)
     : TransformNode(name) {}
 
 // ===================================================================
-// onProbe：创建输入输出 Pad
+// requestSrcPad：固定 "out"，已存在则复用
 // ===================================================================
 
-void DecodeNode::onProbe() {
-    createSinkPad("in");
-    createSrcPad("out");
+SrcPad* DecodeNode::requestSrcPad(MediaType type) {
+    SrcPad* existing = getSrcPad("out");
+    if (existing) return existing;
+
+    size_t maxBufs = (type == MediaType::VIDEO) ? 5 : 30;
+    return createSrcPad("out", maxBufs);
 }
 
 // ===================================================================
-// onLink：上游连接建立时，保存 codec 参数和 time_base
+// requestSinkPad：固定 "in"，已存在则复用
+// ===================================================================
+
+SinkPad* DecodeNode::requestSinkPad(MediaType type) {
+    SinkPad* existing = getSinkPad("in");
+    if (existing) return existing;
+
+    return createSinkPad("in");
+}
+
+// ===================================================================
+// onLink：收到上游 StreamInfo 时，打开解码器
 // ===================================================================
 
 void DecodeNode::onLink(SinkPad* /*pad*/, const StreamInfo& info) {
     m_codecpar = info.codecpar;
     m_inputTimeBase = info.time_base;
-}
 
-// ===================================================================
-// onReady：打开解码器，更新输出 StreamInfo
-// ===================================================================
-
-void DecodeNode::onReady() {
-    if (!m_codecpar) {
-        m_bus->post({Message::Type::ERROR, this,
-                     "DecodeNode: no codec parameters (onLink not called?)", 0});
-        return;
-    }
+    if (!m_codecpar) return;
 
     // 查找解码器
     const AVCodec* codec = avcodec_find_decoder(m_codecpar->codec_id);
@@ -102,14 +106,25 @@ void DecodeNode::onReady() {
     outInfo.codecId = m_codecpar->codec_id;
     outInfo.time_base = m_codecCtx->time_base;
 
-    m_srcPads[0]->setStreamInfo(outInfo);
+    // 更新 SrcPad 的 StreamInfo
+    if (!m_srcPads.empty()) {
+        m_srcPads[0]->setStreamInfo(outInfo);
+    }
+}
 
-    // 通知下游 StreamInfo 变化
-    m_srcPads[0]->pushEvent(Event::makeStreamInfoChanged(outInfo));
+// ===================================================================
+// onReady：解码器已在 onLink 打开，此处做收尾工作
+// ===================================================================
+
+void DecodeNode::onReady() {
+    // 解码器已打开，无需额外操作
 }
 
 // ===================================================================
 // workerLoop：从 SinkPad pop packet → 送入解码器 → 取出 frame → push
+//
+// packetPending 机制：send_packet 返回 EAGAIN 时，暂存当前 packet，
+// 下次循环不取新包，直接重送同一包。
 // ===================================================================
 
 void DecodeNode::workerLoop() {
@@ -122,73 +137,74 @@ void DecodeNode::workerLoop() {
         if (m_stopRequested) return;
     }
 
+    bool packetPending = false;
+    std::shared_ptr<Buffer> pendingBuf;
+
     while (!m_stopRequested) {
-        auto result = m_sinkPads[0]->pop(std::chrono::milliseconds(100));
+        // 1. 取包：如果没有暂存的包，从 SinkPad 取
+        if (!packetPending) {
+            auto result = m_sinkPads[0]->pop(std::chrono::milliseconds(100));
 
-        if (result.isEmpty()) {
-            // 超时，继续循环检查 stopRequested
-            continue;
-        }
-
-        if (result.hasEvent()) {
-            auto event = result.event();
-            if (event->type == Event::Type::EOS) {
-                // flush 解码器，取出 B 帧缓冲中的剩余帧
-                flushDecoder();
-                // 传播 EOS 到下游
-                for (auto& pad : m_srcPads) {
-                    pad->pushEvent(Event::makeEOS());
-                }
-                break;
-            }
-            // 其他事件忽略
-            continue;
-        }
-
-        if (result.hasBuffer()) {
-            // 构造 AVPacket 引用 Buffer 数据（不拷贝）
-            // 注意：pkt->data 指向 result.buffer() 的内存，result 必须保持存活
-            AVPacket* pkt = av_packet_alloc();
-            pkt->data = static_cast<uint8_t*>(result.buffer()->data->data());
-            pkt->size = static_cast<int>(result.buffer()->size);
-            pkt->pts = result.buffer()->pts;
-            pkt->dts = result.buffer()->dts;
-            pkt->duration = result.buffer()->duration;
-            pkt->stream_index = result.buffer()->streamIndex;
-            if (result.buffer()->isKeyFrame()) {
-                pkt->flags |= AV_PKT_FLAG_KEY;
+            if (result.isEmpty()) {
+                continue;
             }
 
-            // 送 packet 到解码器，EAGAIN 时 drain 后重试
-            while (!m_stopRequested) {
-                int ret = avcodec_send_packet(m_codecCtx, pkt);
-                if (ret == AVERROR(EAGAIN)) {
-                    // 解码器满了，先取出已解码的帧，再重送同一个 packet
-                    while (true) {
-                        auto out = receiveFrame();
-                        if (!out) break;
-                        m_srcPads[0]->push(out);
+            if (result.hasEvent()) {
+                auto event = result.event();
+                if (event->type == Event::Type::EOS) {
+                    flushDecoder();
+                    for (auto& pad : m_srcPads) {
+                        pad->pushEvent(Event::makeEOS());
                     }
-                    continue;  // 重试同一个 pkt
-                }
-                if (ret < 0) {
-                    char errBuf[AV_ERROR_MAX_STRING_SIZE];
-                    av_strerror(ret, errBuf, sizeof(errBuf));
-                    m_bus->post({Message::Type::ERROR, this,
-                                 std::string("DecodeNode: avcodec_send_packet failed: ") + errBuf, ret});
                     break;
                 }
-                break;  // 成功
+                continue;
             }
 
-            av_packet_free(&pkt);
-
-            // 取出所有已解码的帧
-            while (true) {
-                auto out = receiveFrame();
-                if (!out) break;
-                m_srcPads[0]->push(out);
+            if (result.hasBuffer()) {
+                pendingBuf = result.buffer();
+            } else {
+                continue;
             }
+        }
+
+        // 2. 送解码器
+        AVPacket* pkt = av_packet_alloc();
+        pkt->data = static_cast<uint8_t*>(pendingBuf->data->data());
+        pkt->size = static_cast<int>(pendingBuf->size);
+        pkt->pts = pendingBuf->pts;
+        pkt->dts = pendingBuf->dts;
+        pkt->duration = pendingBuf->duration;
+        pkt->stream_index = pendingBuf->streamIndex;
+        if (pendingBuf->isKeyFrame()) {
+            pkt->flags |= AV_PKT_FLAG_KEY;
+        }
+
+        int ret = avcodec_send_packet(m_codecCtx, pkt);
+        av_packet_free(&pkt);
+
+        if (ret == AVERROR(EAGAIN)) {
+            packetPending = true;  // 暂存，下次循环重试
+            continue;
+        }
+        if (ret < 0) {
+            char errBuf[AV_ERROR_MAX_STRING_SIZE];
+            av_strerror(ret, errBuf, sizeof(errBuf));
+            m_bus->post({Message::Type::ERROR, this,
+                         std::string("DecodeNode: avcodec_send_packet failed: ") + errBuf, ret});
+            packetPending = false;
+            continue;
+        }
+
+        // 发送成功，清标记，释放暂存的包
+        packetPending = false;
+        pendingBuf.reset();
+
+        // 3. 取出所有已解码的帧
+        while (true) {
+            auto out = receiveFrame();
+            if (!out) break;
+            m_srcPads[0]->push(out);
         }
     }
 }

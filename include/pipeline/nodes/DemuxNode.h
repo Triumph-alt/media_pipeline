@@ -7,19 +7,17 @@ extern "C" {
 }
 
 #include <string>
-#include <vector>
+#include <unordered_map>
 
 namespace pipeline {
 
 // ===================================================================
 // DemuxNode：解复用节点
 //
-// 继承 TransformNode，但工作模式分两种：
-//   FROM_URL     — 无上游连接，自行打开文件/URL，循环 av_read_frame
-//   FROM_UPSTREAM — 接收上游推送的容器数据进行解复用（预留）
-//
-// onProbe 时打开文件、探测流信息，为每个流创建一个 SrcPad。
-// SrcPad 命名规则："video_0", "audio_0", "subtitle_0" 等。
+// 继承 TransformNode，工作模式 FROM_URL：
+//   onProbe 时打开文件探测流信息（不创建 Pad）
+//   requestSrcPad 时用 av_find_best_stream 找最佳流，按需创建 SrcPad
+//   workerLoop 循环 av_read_frame → push 到对应 SrcPad
 // ===================================================================
 
 class DemuxNode : public TransformNode {
@@ -38,17 +36,19 @@ protected:
         return nullptr;  // DemuxNode 重写了 workerLoop，此函数不会被调用
     }
 
-private:
-    enum class Mode { FROM_URL, FROM_UPSTREAM };
+    // 重写 requestSrcPad：按 MediaType 用 av_find_best_stream 找最佳流
+    SrcPad* requestSrcPad(MediaType type) override;
 
+private:
     // ===== FFmpeg 资源 =====
     AVFormatContext* m_fmtCtx = nullptr;
-    Mode m_mode = Mode::FROM_URL;
 
     // ===== 流索引映射 =====
     // m_streamMap[avStreamIndex] = pipeline SrcPad 的下标
-    // 值为 -1 表示该流被忽略（无对应 SrcPad）
-    std::vector<int> m_streamMap;
+    std::unordered_map<int, int> m_streamMap;
+
+    // 检查 FFmpeg 流类型是否匹配 MediaType
+    bool streamMatchesType(const AVStream* stream, MediaType type) const;
 };
 
 } // namespace pipeline

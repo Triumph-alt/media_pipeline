@@ -17,11 +17,17 @@ public:
     PrintSinkNode(const std::string& name) : SinkNode(name) {}
 
     void onProbe() override {
-        createSinkPad("in");
+        // 不创建 Pad，由 requestSinkPad 按需创建
     }
 
     void onReady() override {}
     void onNull() override {}
+
+    SinkPad* requestSinkPad(MediaType type) override {
+        SinkPad* existing = getSinkPad("in");
+        if (existing) return existing;
+        return createSinkPad("in");
+    }
 
 protected:
     void consume(std::shared_ptr<Buffer> buffer) override {
@@ -68,10 +74,11 @@ int main() {
     auto* sinkV  = pipeline.addNode<PrintSinkNode>("sink-v");
     auto* sinkA  = pipeline.addNode<PrintSinkNode>("sink-a");
 
-    demux->link(decV, "video_0", "in");
-    demux->link(decA, "audio_0", "in");
-    decV->link(sinkV, "out", "in");
-    decA->link(sinkA, "out", "in");
+    // 新的 link API：只传 MediaType
+    demux->link(decV, MediaType::VIDEO);
+    demux->link(decA, MediaType::AUDIO);
+    decV->link(sinkV, MediaType::VIDEO);
+    decA->link(sinkA, MediaType::AUDIO);
 
     printf("--- play ---\n");
     pipeline.play();

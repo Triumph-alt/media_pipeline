@@ -14,9 +14,15 @@ public:
     CountSourceNode(const std::string& name, int count)
         : SourceNode(name), m_maxCount(count) {}
 
-    void onProbe() override { createSrcPad("out"); }
+    void onProbe() override {}
     void onReady() override {}
     void onNull() override {}
+
+    SrcPad* requestSrcPad(MediaType type) override {
+        SrcPad* existing = getSrcPad("out");
+        if (existing) return existing;
+        return createSrcPad("out");
+    }
 
 protected:
     std::shared_ptr<Buffer> generateData() override {
@@ -43,9 +49,15 @@ public:
     int receivedCount = 0;
     int64_t lastPts = -1;
 
-    void onProbe() override { createSinkPad("in"); }
+    void onProbe() override {}
     void onReady() override {}
     void onNull() override {}
+
+    SinkPad* requestSinkPad(MediaType type) override {
+        SinkPad* existing = getSinkPad("in");
+        if (existing) return existing;
+        return createSinkPad("in");
+    }
 
 protected:
     void consume(std::shared_ptr<Buffer> buffer) override {
@@ -63,7 +75,7 @@ void testPadConnectSharesQueue() {
     auto* src = p.addNode<CountSourceNode>("src", 1);
     auto* sink = p.addNode<RecordSinkNode>("sink");
 
-    src->link(sink, "out", "in");
+    src->link(sink, MediaType::VIDEO);
     p.play();
     p.waitForStop();
 
@@ -89,7 +101,7 @@ void testPadPushPop() {
     auto* src = p.addNode<CountSourceNode>("src", 5);
     auto* sink = p.addNode<RecordSinkNode>("sink");
 
-    src->link(sink, "out", "in");
+    src->link(sink, MediaType::VIDEO);
     p.play();
     p.waitForStop();
 
@@ -107,7 +119,7 @@ void testPadEventPropagation() {
     auto* src = p.addNode<CountSourceNode>("src", 3);
     auto* sink = p.addNode<RecordSinkNode>("sink");
 
-    src->link(sink, "out", "in");
+    src->link(sink, MediaType::VIDEO);
     p.play();
     p.waitForStop();
 
@@ -125,7 +137,7 @@ void testPipelineDataFlow() {
     auto* src = p.addNode<CountSourceNode>("src", 10);
     auto* sink = p.addNode<RecordSinkNode>("sink");
 
-    src->link(sink, "out", "in");
+    src->link(sink, MediaType::VIDEO);
 
     p.play();
     p.waitForStop();
@@ -144,7 +156,7 @@ void testPadFlush() {
     auto* src = p.addNode<CountSourceNode>("src", 100);
     auto* sink = p.addNode<RecordSinkNode>("sink");
 
-    src->link(sink, "out", "in");
+    src->link(sink, MediaType::VIDEO);
     p.play();
 
     // 给一点时间让数据流通

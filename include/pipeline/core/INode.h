@@ -25,9 +25,8 @@ class MessageBus;
 
 struct PendingLink {
     INode* srcNode;
-    std::string srcPadName;
     INode* sinkNode;
-    std::string sinkPadName;
+    MediaType mediaType;
 };
 
 // ===================================================================
@@ -54,17 +53,21 @@ public:
     T getParam(const std::string& key, T defaultValue = T{}) const;
     bool hasParam(const std::string& key) const;
 
-    // ===== Pad =====
+    // ===== Pad 查询 =====
     std::vector<SrcPad*> srcPads() const;
     std::vector<SinkPad*> sinkPads() const;
-    virtual SrcPad* getSrcPad(const std::string& name = "out");
-    virtual SinkPad* getSinkPad(const std::string& name = "in");
-    virtual SinkPad* requestSinkPad(const std::string& name);  // 默认返回 nullptr，MuxNode 重写
+    SrcPad* getSrcPad(const std::string& name);
+    SinkPad* getSinkPad(const std::string& name);
+    SrcPad* getSrcPad(MediaType type);      // 按媒体类型查找
+    SinkPad* getSinkPad(MediaType type);    // 按媒体类型查找
+
+    // ===== Pad 按需创建（子类重写以自定义行为）=====
+    // 默认实现：按 MediaType 自动生成名字并创建
+    virtual SrcPad* requestSrcPad(MediaType type);
+    virtual SinkPad* requestSinkPad(MediaType type);
 
     // ===== 连接（延迟绑定：只记录意图，play() Phase 3 才真正连接）=====
-    INode* link(INode* downstream,
-                const std::string& srcPadName = "",
-                const std::string& sinkPadName = "");
+    INode* link(INode* downstream, MediaType type);
 
     // ===== 生命周期（由 Pipeline 调用）=====
     void probe();
@@ -78,7 +81,7 @@ protected:
     explicit INode(const std::string& name);
 
     // 子类重写的虚函数
-    virtual void onProbe() {}                     // 创建 Pad
+    virtual void onProbe() {}                     // 探测能力（不创建 Pad）
     virtual void onReady() = 0;                   // 分配资源
     virtual void onNull() = 0;                    // 释放资源
     virtual void onPlaying() {}                   // 线程开始工作
@@ -122,7 +125,7 @@ T INode::getParam(const std::string& key, T defaultValue) const {
     if (it == m_params.end()) {
         return defaultValue;
     }
-    
+
     auto* ptr = std::get_if<T>(&it->second);
     return ptr ? *ptr : defaultValue;
 }

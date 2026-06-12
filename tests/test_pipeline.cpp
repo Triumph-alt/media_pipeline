@@ -15,8 +15,13 @@ public:
     TestSourceNode(const std::string& name) : SourceNode(name) {}
 
     void onProbe() override {
-        createSrcPad("out");
-        printf("[%s] probe: created src pad\n", m_name.c_str());
+        printf("[%s] probe\n", m_name.c_str());
+    }
+
+    SrcPad* requestSrcPad(MediaType type) override {
+        SrcPad* existing = getSrcPad("out");
+        if (existing) return existing;
+        return createSrcPad("out");
     }
 
     void onReady() override {
@@ -55,8 +60,13 @@ public:
     TestSinkNode(const std::string& name) : SinkNode(name) {}
 
     void onProbe() override {
-        createSinkPad("in");
-        printf("[%s] probe: created sink pad\n", m_name.c_str());
+        printf("[%s] probe\n", m_name.c_str());
+    }
+
+    SinkPad* requestSinkPad(MediaType type) override {
+        SinkPad* existing = getSinkPad("in");
+        if (existing) return existing;
+        return createSinkPad("in");
     }
 
     void onReady() override {
@@ -103,7 +113,7 @@ int main() {
     auto* sink = pipeline.addNode<TestSinkNode>("sink");
 
     // 4. 连接
-    src->link(sink, "out", "in");
+    src->link(sink, MediaType::VIDEO);
 
     // 5. 启动
     printf("\n--- play ---\n");

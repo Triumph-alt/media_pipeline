@@ -56,8 +56,55 @@ SinkPad* INode::getSinkPad(const std::string& name) {
     return nullptr;
 }
 
-SinkPad* INode::requestSinkPad(const std::string& /*name*/) {
-    return nullptr;  // 默认不支持，MuxNode 重写
+SrcPad* INode::getSrcPad(MediaType type) {
+    for (auto& p : m_srcPads) {
+        if (p->streamInfo().type == type) {
+            return p.get();
+        }
+    }
+    return nullptr;
+}
+
+SinkPad* INode::getSinkPad(MediaType type) {
+    for (auto& p : m_sinkPads) {
+        if (p->streamInfo().type == type) {
+            return p.get();
+        }
+    }
+    return nullptr;
+}
+
+// ===== Pad 按需创建（默认实现）=====
+
+SrcPad* INode::requestSrcPad(MediaType type) {
+    // 默认实现：检查是否已有同类型 Pad，有则复用
+    SrcPad* existing = getSrcPad(type);
+    if (existing) return existing;
+
+    // 按 MediaType 自动生成名字
+    std::string name;
+    size_t maxBufs = 5;
+    switch (type) {
+    case MediaType::VIDEO: name = "video"; maxBufs = 5; break;
+    case MediaType::AUDIO: name = "audio"; maxBufs = 20; break;
+    default: name = "out"; break;
+    }
+    return createSrcPad(name, maxBufs);
+}
+
+SinkPad* INode::requestSinkPad(MediaType type) {
+    // 默认实现：检查是否已有同类型 Pad，有则复用
+    SinkPad* existing = getSinkPad(type);
+    if (existing) return existing;
+
+    std::string name;
+    size_t maxBufs = 5;
+    switch (type) {
+    case MediaType::VIDEO: name = "video"; maxBufs = 5; break;
+    case MediaType::AUDIO: name = "audio"; maxBufs = 20; break;
+    default: name = "in"; break;
+    }
+    return createSinkPad(name, maxBufs);
 }
 
 // ===== Pad 创建 =====
@@ -80,21 +127,13 @@ SinkPad* INode::createSinkPad(const std::string& name,
 
 // ===== 连接：只记录意图，不建立物理连接 =====
 
-INode* INode::link(INode* downstream,
-                   const std::string& srcPadName,
-                   const std::string& sinkPadName) {
+INode* INode::link(INode* downstream, MediaType type) {
     PendingLink pending;
     pending.srcNode = this;
-    pending.srcPadName = srcPadName.empty() ? "out" : srcPadName;
     pending.sinkNode = downstream;
-    pending.sinkPadName = sinkPadName.empty() ? "in" : sinkPadName;
+    pending.mediaType = type;
 
-    // 存到 Pipeline 的待连接列表（Pipeline 在 addNode 时设置了 m_pipeline）
-    // 这里先用一个静态容器暂存，Pipeline::play() 时取走
-    // 实际实现中 Pipeline 会遍历所有节点的 pendingLinks
-    // 为简化，我们把 pendingLinks 存在 srcNode 上
     m_pendingLinks.push_back(std::move(pending));
-
     return downstream;
 }
 

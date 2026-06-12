@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <queue>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace pipeline {
@@ -67,6 +69,14 @@ void Pipeline::play() {
     phaseTopologicalSort();
     phaseProbe();
     phaseResolveLinks();
+
+    // 连接阶段有错误则不继续
+    if (m_errorOccurred) {
+        m_state = PipelineState::ERROR;
+        m_bus->post({Message::Type::ERROR, nullptr, "Pipeline build failed"});
+        return;
+    }
+
     phaseValidate();
     phaseReady();
 
@@ -133,66 +143,61 @@ void Pipeline::waitForStop() {
 
 // ===== 7 阶段实现 =====
 
-// Phase 1：拓扑排序（DFS，Source → Transform → Sink）
+// Phase 1：拓扑排序（基于 PendingLink 的边关系，BFS）
 void Pipeline::phaseTopologicalSort() {
-    // 简单实现：按 SourceNode → TransformNode → SinkNode 分组
-    std::vector<INode*> sources, transforms, sinks;
+    // 建邻接表 + 计算入度
+    std::unordered_map<INode*, std::vector<INode*>> adj;
+    std::unordered_map<INode*, int> inDegree;
 
     for (auto& node : m_nodes) {
-        // 通过 Pad 数量判断节点类型
-        bool hasSink = false;
-        bool hasSrc = false;
-        for (auto* pad : node->sinkPads()) {
-            (void)pad;
-            hasSink = true;
-            break;
-        }
-        for (auto* pad : node->srcPads()) {
-            (void)pad;
-            hasSrc = true;
-            break;
-        }
-
-        // 还没 probe，Pad 还没创建，用 requestSinkPad 和 getSrcPad 判断
-        // SourceNode: 无 SinkPad，有 SrcPad
-        // SinkNode: 有 SinkPad，无 SrcPad
-        // TransformNode: 两者都有（或都没有，如 QueueNode）
-        // 这里先简单按添加顺序，probe 之后再真正排序
-        sources.push_back(node.get());
+        inDegree[node.get()] = 0;
     }
 
-    // 暂时按添加顺序，probe 后会重新排序
-    m_sortedNodes = sources;
-}
-
-// Phase 2：Probe（按拓扑顺序 Source → Sink）
-void Pipeline::phaseProbe() {
-    for (auto* node : m_sortedNodes) {
-        node->probe();
+    for (auto& node : m_nodes) {
+        for (auto& link : node->m_pendingLinks) {
+            adj[link.srcNode].push_back(link.sinkNode);
+            inDegree[link.sinkNode]++;
+        }
     }
 
-    // probe 之后重新排序：SourceNode → TransformNode → SinkNode
-    std::vector<INode*> sources, transforms, sinks;
-    for (auto* node : m_sortedNodes) {
-        bool hasSink = !node->sinkPads().empty();
-        bool hasSrc = !node->srcPads().empty();
-
-        if (!hasSink && hasSrc) {
-            sources.push_back(node);
-        } else if (hasSink && !hasSrc) {
-            sinks.push_back(node);
-        } else {
-            transforms.push_back(node);
+    // BFS：入度为 0 的先入队
+    std::queue<INode*> q;
+    for (auto& [node, deg] : inDegree) {
+        if (deg == 0) {
+            q.push(node);
         }
     }
 
     m_sortedNodes.clear();
-    m_sortedNodes.insert(m_sortedNodes.end(), sources.begin(), sources.end());
-    m_sortedNodes.insert(m_sortedNodes.end(), transforms.begin(), transforms.end());
-    m_sortedNodes.insert(m_sortedNodes.end(), sinks.begin(), sinks.end());
+    while (!q.empty()) {
+        INode* node = q.front();
+        q.pop();
+        m_sortedNodes.push_back(node);
 
-    // 统计 Sink 节点数
-    m_sinkCount = static_cast<int>(sinks.size());
+        if (adj.count(node)) {
+            for (auto* neighbor : adj[node]) {
+                inDegree[neighbor]--;
+                if (inDegree[neighbor] == 0) {
+                    q.push(neighbor);
+                }
+            }
+        }
+    }
+
+    // 孤立节点（无 PendingLink）追加到末尾
+    for (auto& node : m_nodes) {
+        if (std::find(m_sortedNodes.begin(), m_sortedNodes.end(), node.get())
+            == m_sortedNodes.end()) {
+            m_sortedNodes.push_back(node.get());
+        }
+    }
+}
+
+// Phase 2：Probe（按拓扑顺序，只探测不创建 Pad）
+void Pipeline::phaseProbe() {
+    for (auto* node : m_sortedNodes) {
+        node->probe();
+    }
 }
 
 // Phase 3：解析连接
@@ -238,7 +243,8 @@ void Pipeline::phaseStart() {
 
 void Pipeline::collectPendingLinks() {
     m_pendingLinks.clear();
-    for (auto& node : m_nodes) {
+    // 按拓扑序收集，保证上游的 PendingLink 先处理
+    for (auto* node : m_sortedNodes) {
         for (auto& link : node->m_pendingLinks) {
             m_pendingLinks.push_back(link);
         }
@@ -247,22 +253,27 @@ void Pipeline::collectPendingLinks() {
 }
 
 void Pipeline::resolveLink(const PendingLink& link) {
-    // 获取 SrcPad
-    SrcPad* srcPad = link.srcNode->getSrcPad(link.srcPadName);
+    // 获取 SrcPad（先按 MediaType 查找，找不到则 request 创建）
+    SrcPad* srcPad = link.srcNode->getSrcPad(link.mediaType);
+    if (!srcPad) {
+        srcPad = link.srcNode->requestSrcPad(link.mediaType);
+    }
     if (!srcPad) {
         m_bus->post({Message::Type::ERROR, link.srcNode,
-                     "SrcPad not found: " + link.srcPadName});
+                     "Stream not available"});
+        m_errorOccurred = true;
         return;
     }
 
-    // 获取 SinkPad（支持 requestSinkPad 动态创建）
-    SinkPad* sinkPad = link.sinkNode->getSinkPad(link.sinkPadName);
+    // 获取 SinkPad（先按 MediaType 查找，找不到则 request 创建）
+    SinkPad* sinkPad = link.sinkNode->getSinkPad(link.mediaType);
     if (!sinkPad) {
-        sinkPad = link.sinkNode->requestSinkPad(link.sinkPadName);
+        sinkPad = link.sinkNode->requestSinkPad(link.mediaType);
     }
     if (!sinkPad) {
         m_bus->post({Message::Type::ERROR, link.sinkNode,
-                     "SinkPad not found: " + link.sinkPadName});
+                     "SinkPad creation failed"});
+        m_errorOccurred = true;
         return;
     }
 
@@ -277,12 +288,27 @@ void Pipeline::resolveLink(const PendingLink& link) {
 
 bool Pipeline::validateTopology() {
     for (auto& node : m_nodes) {
-        // 检查 SinkNode 的 SinkPad 必须已连接
         if (node->sinkPads().empty() && node->srcPads().empty()) {
             m_bus->post({Message::Type::WARNING, node.get(),
                          "Node has no pads"});
         }
     }
+
+    // 统计有连接的 SinkNode 数量
+    m_sinkCount = 0;
+    for (auto* node : m_sortedNodes) {
+        bool isSink = !node->sinkPads().empty() && node->srcPads().empty();
+        if (isSink) {
+            // 检查至少有一个 SinkPad 已连接
+            for (auto* pad : node->sinkPads()) {
+                if (pad->isConnected()) {
+                    m_sinkCount++;
+                    break;
+                }
+            }
+        }
+    }
+
     return true;
 }
 
