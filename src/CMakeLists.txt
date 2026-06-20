@@ -13,7 +13,7 @@ set(CORE_SOURCES
 set(NODE_SOURCES
     nodes/DemuxNode.cpp
     nodes/DecodeNode.cpp
-    # nodes/VideoRenderNode.cpp
+    nodes/VideoRenderNode.cpp
     # nodes/AudioPlayNode.cpp
 )
 

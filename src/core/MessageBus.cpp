@@ -2,55 +2,51 @@
 
 namespace pipeline {
 
+// ===================================================================
+// post: 线程安全投递消息
+// ===================================================================
 void MessageBus::post(Message msg) {
-    std::function<void(const Message&)> cb;
-
     {
-        std::lock_guard lock(m_mutex);
-        if (m_callback) {
-            cb = m_callback;
-        } else {
-            m_queue.push(std::move(msg));
-        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.push(std::move(msg));
     }
-
-    // 回调在锁外调用，避免死锁
-    if (cb) {
-        cb(msg);
-    }
+    cv_.notify_one();
 }
 
-void MessageBus::setCallback(std::function<void(const Message&)> cb) {
-    std::lock_guard lock(m_mutex);
-    m_callback = std::move(cb);
+// ===================================================================
+// waitMessage: Pipeline 监听线程调用，阻塞等待下一条消息
+//
+// running 为 false 且队列空时返回 nullopt（正常退出信号）
+// running 为 false 但队列非空时继续处理剩余消息
+// ===================================================================
+std::optional<Message> MessageBus::waitMessage(std::atomic<bool>& running) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [&] {
+        return !queue_.empty() || !running.load();
+    });
 
-    // 设置回调时，先把队列里积压的消息全部触发
-    while (!m_queue.empty()) {
-        cb(m_queue.front());
-        m_queue.pop();
+    if (queue_.empty()) {
+        return std::nullopt;  // running 为 false 且队列空，退出
     }
-}
 
-std::optional<Message> MessageBus::poll(std::chrono::milliseconds /*timeout*/) {
-    std::lock_guard lock(m_mutex);
-    if (m_queue.empty()) {
-        return std::nullopt;
-    }
-
-    Message msg = std::move(m_queue.front());
-    m_queue.pop();
+    auto msg = std::move(queue_.front());
+    queue_.pop();
     return msg;
 }
 
-std::optional<Message> MessageBus::tryPoll() {
-    std::lock_guard lock(m_mutex);
-    if (m_queue.empty()) {
-        return std::nullopt;
-    }
-    
-    Message msg = std::move(m_queue.front());
-    m_queue.pop();
-    return msg;
+// ===================================================================
+// setObserver: 用户注册观测回调
+// ===================================================================
+void MessageBus::setObserver(ObserverCallback cb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    observer_ = std::move(cb);
+}
+
+// ===================================================================
+// notify: 唤醒可能阻塞在 waitMessage 上的线程
+// ===================================================================
+void MessageBus::notify() {
+    cv_.notify_all();
 }
 
 } // namespace pipeline

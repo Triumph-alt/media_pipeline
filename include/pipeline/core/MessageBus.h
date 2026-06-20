@@ -1,6 +1,7 @@
 #pragma once
 
-#include <chrono>
+#include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -9,56 +10,72 @@
 
 namespace pipeline {
 
-class INode;
+// 前向声明
+class BaseNode;
 
 // ===================================================================
-// Message：节点报告的事件（错误、警告、状态变化等）
+// MessageType: 消息类型
+//
+// EOS     — Sink 节点收到 EOSEvent 后上报，Pipeline 用于 EOS 计数
+// ERROR   — 节点出错后上报，Pipeline 设置 error_occurred_ 并唤醒 waitEOS
+// WARNING — 可恢复的异常（如损坏的 packet、队列满丢帧），透传给用户观测
+// INFO    — 一般信息（如初始化完成），透传给用户观测
 // ===================================================================
-
-class Message {
-public:
-    enum class Type {
-        ERROR,              // 错误
-        WARNING,            // 警告
-        STATE_CHANGED,      // 节点状态变化
-        EOS,                // 某个 Sink 收到 EOS
-        STREAM_INFO,        // 流信息通知
-        BUFFERING,          // 缓冲状态（网络流用）
-        CUSTOM,             // 用户自定义
-    };
-
-    Type type;
-    INode* source = nullptr;        // 来源节点
-    std::string text;               // 描述文本
-    int code = 0;                   // 错误码
-    int streamIndex = -1;
+enum class MessageType {
+    EOS,
+    ERROR,
+    WARNING,
+    INFO,
 };
 
 // ===================================================================
-// MessageBus：消息总线
+// MessageBus: 统一消息总线
 //
-// 节点通过 post() 投递消息，用户通过回调或轮询接收。
-// 线程安全：多节点可同时 post，用户线程同时 poll。
+// 所有节点通过 post() 上报消息，Pipeline 内部运行独立监听线程
+// 通过 waitMessage() 阻塞接收并分发处理。
+//
+// 用户可通过 setObserver() 注册观测回调，只接收 WARNING 和 INFO。
+// 回调在监听线程里执行，用户保证轻量。
 // ===================================================================
-
 class MessageBus {
 public:
-    // 节点调用：投递消息
+    struct Message {
+        MessageType  type;
+        BaseNode*    sender = nullptr;
+        std::string  text;
+        int          code   = 0;
+    };
+
+    using ObserverCallback = std::function<void(const Message&)>;
+
+    // ===== 节点调用（线程安全）=====
     void post(Message msg);
 
-    // 用户设置回调（推荐方式，消息到达时立即触发）
-    void setCallback(std::function<void(const Message&)> cb);
+    // ===== Pipeline 监听线程调用 =====
+    // 阻塞等待下一条消息
+    // running 为 false 且队列空时返回 nullopt，监听线程据此退出
+    std::optional<Message> waitMessage(std::atomic<bool>& running);
 
-    // 用户轮询（可选方式，阻塞等待直到有消息或超时）
-    std::optional<Message> poll(std::chrono::milliseconds timeout);
+    // ===== 用户侧 =====
+    // 注册观测回调，只接收 WARNING 和 INFO
+    void setObserver(ObserverCallback cb);
 
-    // 非阻塞轮询
-    std::optional<Message> tryPoll();
+    // 唤醒可能阻塞在 waitMessage 上的线程（stop 时用）
+    void notify();
+
+    // 触发用户观测回调（Pipeline messageBusLoop 内部调用）
+    // 只有 WARNING / INFO 消息走这条路
+    // 注意：持有 mutex_ 时调用，回调内部不能再调 post()，否则死锁
+    void notifyObserver(const Message& msg) {
+        std::lock_guard lock(mutex_);
+        if (observer_) observer_(msg);
+    }
 
 private:
-    std::queue<Message> m_queue;
-    std::mutex m_mutex;
-    std::function<void(const Message&)> m_callback;
+    std::queue<Message>      queue_;
+    std::mutex               mutex_;
+    std::condition_variable  cv_;
+    ObserverCallback         observer_ = nullptr;
 };
 
 } // namespace pipeline

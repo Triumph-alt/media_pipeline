@@ -1,39 +1,36 @@
 #pragma once
 
-#include "StreamInfo.h"
+#include "pipeline/core/Caps.h"
+#include "pipeline/core/Buffer.h"
 
-#include <memory>
-#include <optional>
+#include <cstdint>
+#include <string>
+#include <variant>
 
 namespace pipeline {
 
-class Event {
-public:
-    enum class Type {
-        EOS,                    // 流结束
-        FLUSH_START,            // 开始 flush
-        FLUSH_DONE,             // flush 完成
-        STREAM_INFO_CHANGED,    // 流参数变化
-        SEEK,                   // seek 请求
-        CUSTOM,                 // 用户自定义
-    };
+// ===================================================================
+// Event: 事件系统（std::variant 实现）
+//
+// 事件与 Buffer 共享同一个 Edge Queue（QueueItem = variant<BufferRef, Event>），
+// 保证事件和数据的严格顺序性。
+//
+// 只有两种事件：
+//   CapsEvent — Ready 阶段顺流传递格式参数，tryPush（满则丢弃）
+//   EOSEvent  — 数据流结束，关键事件，阻塞 push 不允许丢失
+//
+// 错误处理不走队列：出错节点通过 MessageBus 上报 ERROR 后退出 runLoop，
+// Pipeline 收到 ERROR 消息后统一调用 stop() 清理。
+// ===================================================================
+struct EOSEvent {};
 
-    Type type;
-    int streamIndex = -1;       // 针对哪个流（-1 表示全局）
+// Event 是值类型，每个下游各自收到一份独立副本
+using Event = std::variant<CapsEvent, EOSEvent>;
+using QueueItem = std::variant<BufferRef, Event>;
 
-    // 附加数据（按需使用）
-    std::optional<int64_t> seekPosition;         // SEEK 时有效
-    std::optional<StreamInfo> changedStreamInfo; // STREAM_INFO_CHANGED 时有效
-
-    // 工厂方法，负责创建对象并返回
-    static std::shared_ptr<Event> makeEOS(int streamIdx = -1);
-    static std::shared_ptr<Event> makeFlushStart();
-    static std::shared_ptr<Event> makeFlushDone();
-    static std::shared_ptr<Event> makeStreamInfoChanged(const StreamInfo& info);
-    static std::shared_ptr<Event> makeSeek(int64_t position);
-
-private:
-    Event() = default;
-};
+// EOS 是唯一的关键事件，必须阻塞 push 保证送达
+inline bool isCriticalEvent(const Event& event) {
+    return std::holds_alternative<EOSEvent>(event);
+}
 
 } // namespace pipeline
