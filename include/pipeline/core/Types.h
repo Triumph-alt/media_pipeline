@@ -46,12 +46,13 @@ enum class NodeState {
 // ===================================================================
 // PipelineState: Pipeline 整体生命周期
 //
-// NULL_STATE ──(build)──→ BUILT ──(play)──→ RUNNING ──(stop/EOS)──→ STOPPED
+// NULL_STATE ──(build)──→ BUILT ──(play)──→ RUNNING ──(stop)──→ STOPPING ──→ STOPPED
 // ===================================================================
 enum class PipelineState {
     NULL_STATE,
     BUILT,
     RUNNING,
+    STOPPING,   // CAS 占位，保证只有一个线程执行清理
     STOPPED,
     ERROR,
 };

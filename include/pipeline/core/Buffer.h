@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <variant>
+#include <vector>
 
 extern "C" {
 #include <libavutil/avutil.h>

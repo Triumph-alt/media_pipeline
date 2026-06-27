@@ -19,7 +19,7 @@ void MessageBus::post(Message msg) {
 // running 为 false 且队列空时返回 nullopt（正常退出信号）
 // running 为 false 但队列非空时继续处理剩余消息
 // ===================================================================
-std::optional<Message> MessageBus::waitMessage(std::atomic<bool>& running) {
+std::optional<MessageBus::Message> MessageBus::waitMessage(std::atomic<bool>& running) {
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [&] {
         return !queue_.empty() || !running.load();

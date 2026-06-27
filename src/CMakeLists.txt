@@ -1,19 +1,20 @@
 # ---- 核心框架源码 ----
 set(CORE_SOURCES
     core/Buffer.cpp
-    core/Clock.cpp
-    core/Event.cpp
-    core/INode.cpp
-    core/MessageBus.cpp
+    core/BoundedQueue.cpp
+    core/Edge.cpp
     core/Pad.cpp
+    core/BaseNode.cpp
+    core/Graph.cpp
     core/Pipeline.cpp
+    core/MessageBus.cpp
 )
 
 # ---- 节点源码（后续阶段添加）----
 set(NODE_SOURCES
-    nodes/DemuxNode.cpp
-    nodes/DecodeNode.cpp
-    nodes/VideoRenderNode.cpp
+    # nodes/DemuxNode.cpp
+    # nodes/DecodeNode.cpp
+    # nodes/VideoRenderNode.cpp
     # nodes/AudioPlayNode.cpp
 )
 

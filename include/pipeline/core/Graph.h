@@ -14,12 +14,13 @@ namespace pipeline {
 //
 // 职责：
 //   - 维护邻接表（nodes_ + edges_）
-//   - Build 阶段：静态 Caps 检查、环路检测、拓扑排序、孤立节点检测
+//   - Build 阶段：静态 Caps 检查、拓扑排序、环路检测、孤立节点检测
 //   - Ready 阶段：按拓扑顺序三步穿插（onReady → createQueues → onStreamInfo）
 //
-// DemuxNode 懒连接：
-//   link() 时如果 src 是 DemuxNode，只记录 pending_links_，
-//   不创建 Pad 和 Edge。DemuxNode::onReady() 里完成懒连接的 Pad/Edge 创建。
+// Pad 创建机制：
+//   - 节点构造时声明固定 Pad（如 TransformNode 的 "in"）
+//   - link() 时优先查找已有 Pad，找不到时调用 requestSrcPad/requestSinkPad
+//   - 节点自己决定是否允许动态创建（分叉、DemuxNode 多路输出、MuxNode 多路输入）
 // ===================================================================
 class Graph {
 public:
@@ -27,16 +28,16 @@ public:
     void addNode(std::unique_ptr<BaseNode> node);
 
     // 声明连接（Build 阶段）
-    // DemuxNode：记录懒连接意图，不创建 Pad 和 Edge
-    // 其他节点：立即创建 Pad，做 TemplateCaps 兼容性检查
-    void link(BaseNode* src, const std::string& src_pad_name,
-              BaseNode* dst, const std::string& dst_pad_name);
+    // 优先查找已有 Pad，找不到时调用节点的 requestSrcPad/requestSinkPad
+    // 失败情况：目标 Pad 已被占用、节点拒绝创建、TemplateCaps 不兼容
+    bool link(BaseNode* src, const std::string& src_pad_name,
+              BaseNode* dst, const std::string& dst_pad_name,
+              MediaType hint_type = MediaType::CONTAINER);
 
     // Build 阶段：完整校验
-    // 1. 检查所有连接的 TemplateCaps 兼容性
-    // 2. 环路检测（DFS）
-    // 3. 拓扑排序（Kahn 算法），结果存入 topo_order_
-    // 4. 孤立节点检测
+    // 1. 拓扑排序（Kahn 算法），结果存入 topo_order_
+    // 2. 环路检测：topo_order_.size() != nodes_.size() 说明有环
+    // 3. 孤立节点检测：单独遍历，找出入度出度均为 0 的节点
     bool build();
 
     // Ready 阶段：按拓扑顺序三步穿插
