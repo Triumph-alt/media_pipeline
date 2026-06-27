@@ -18,6 +18,16 @@ class Pipeline;
 class Graph;
 
 // ===================================================================
+// NodeState: 节点生命周期状态
+// ===================================================================
+enum class NodeState {
+    NULL_STATE,   // 资源未分配
+    READY,        // 资源已分配（onReady 成功）
+    RUNNING,      // 工作线程运行中
+    ERROR,        // 出错
+};
+
+// ===================================================================
 // BaseNode: 节点抽象基类
 //
 // 生命周期回调（由 Pipeline/Graph 调用）：
@@ -135,10 +145,10 @@ protected:
 // ===================================================================
 class SourceNode : public BaseNode {
 public:
-    explicit SourceNode(const std::string& name) : BaseNode(name) {}
     NodeType nodeType() const override { return NodeType::SOURCE; }
 
 protected:
+    explicit SourceNode(const std::string& name) : BaseNode(name) {}
     void runLoop() override;
 
     // 子类实现：阻塞采集一帧数据，返回 nullptr 表示 EOF
@@ -164,10 +174,10 @@ protected:
 // ===================================================================
 class SinkNode : public BaseNode {
 public:
-    explicit SinkNode(const std::string& name) : BaseNode(name) {}
     NodeType nodeType() const override { return NodeType::SINK; }
 
 protected:
+    explicit SinkNode(const std::string& name) : BaseNode(name) {}
     void runLoop() override;
 
     // 子类实现：消费一帧数据
@@ -185,8 +195,10 @@ protected:
 // ===================================================================
 class TransformNode : public BaseNode {
 public:
-    explicit TransformNode(const std::string& name) : BaseNode(name) {}
     NodeType nodeType() const override { return NodeType::TRANSFORM; }
+
+protected:
+    explicit TransformNode(const std::string& name) : BaseNode(name) {}
 
 protected:
     void runLoop() override;

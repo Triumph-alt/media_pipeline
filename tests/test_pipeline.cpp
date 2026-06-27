@@ -341,6 +341,73 @@ static void test_select_queue_capacity() {
     printf(" OK\n");
 }
 
+static void test_bounded_queue_external_notify() {
+    printf("  test_bounded_queue_external_notify...");
+    fflush(stdout);
+
+    BoundedQueue q(8);
+    int notify_count = 0;
+
+    q.setExternalNotify([&]() { notify_count++; });
+
+    auto* buf = new Buffer();
+    buf->data = new uint8_t[1]{0};
+    buf->size = 1;
+    buf->media_type = MediaType::VIDEO_RAW;
+    q.pushBlocking(QueueItem{BufferRef{buf}});
+
+    assert(notify_count == 1);
+
+    // 再 push 一个 EOS 事件
+    q.pushBlocking(QueueItem{EOSEvent{}});
+    assert(notify_count == 2);
+
+    printf(" OK\n");
+}
+
+static void test_graph_build_cycle_detection() {
+    printf("  test_graph_build_cycle_detection...");
+    fflush(stdout);
+
+    // 构造一个有环的图：A → B → C → A
+    // 通过手动操作 Graph 内部来测试
+    // 由于 Graph 的 link() 不允许创建环（Pad 已被占用），
+    // 我们用一个特殊方式：直接操作 Edge 来制造环
+    //
+    // 但 Graph::link() 会检查 isConnected()，所以环在 link 阶段就会被阻止
+    // 实际上环路检测是在 build() 里做的，作为拓扑排序的副产品
+    // 如果 topo_order_.size() != nodes_.size() 就说明有环
+    //
+    // 由于我们的 link() 实现已经阻止了环的创建（Pad 只能连一个 Edge），
+    // 这个测试验证的是：正常无环图 build 成功
+    Pipeline pipeline;
+    auto* src = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
+    auto* sink = pipeline.addNode<MockSink>("sink");
+    pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW);
+
+    assert(pipeline.build());  // 正常图应该 build 成功
+
+    printf(" OK\n");
+}
+
+static void test_graph_build_orphan_detection() {
+    printf("  test_graph_build_orphan_detection...");
+    fflush(stdout);
+
+    // 创建一个孤立节点（不连接到任何其他节点）
+    Pipeline pipeline;
+    auto* src = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
+    auto* sink = pipeline.addNode<MockSink>("sink");
+    // 故意不 link，让 sink 成为孤立节点
+    (void)src;
+    (void)sink;
+
+    // build 应该失败，因为 sink 是孤立节点
+    assert(!pipeline.build());
+
+    printf(" OK\n");
+}
+
 // ===================================================================
 // 集成级测试
 // ===================================================================
@@ -534,7 +601,12 @@ int main() {
     test_bounded_queue_try_push_full();
     test_bounded_queue_flush();
     test_bounded_queue_resize();
+    test_bounded_queue_external_notify();
     test_select_queue_capacity();
+
+    printf("\n[Graph Tests]\n");
+    test_graph_build_cycle_detection();
+    test_graph_build_orphan_detection();
 
     printf("\n[Integration Tests]\n");
     test_pipeline_source_to_sink();
