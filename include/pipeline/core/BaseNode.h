@@ -6,6 +6,7 @@
 #include "pipeline/core/Pad.h"
 #include "pipeline/core/Types.h"
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -37,10 +38,10 @@ enum class NodeState {
 //   runLoop()      — 工作线程主循环
 //
 // 数据分发（子类调用，不感知下游数量）：
-//   pushToDownstream()    — 单路阻塞，多路 tryPush
-//   sendEventDownstream() — EOS 阻塞，CapsEvent tryPush
-//   sendCapsEvent()       — 向指定 SrcPad 发送 CapsEvent
-//   postMessage()         — 统一上报 MessageBus
+//   pushToDownstream()   — 发送 Buffer 数据，单路阻塞，多路 tryPush
+//   sendCapsEvent()      — 向指定 SrcPad 发送 CapsEvent，阻塞且不丢失
+//   sendEOSDownstream()  — 向所有已连接 SrcPad 广播 EOS，阻塞且不丢失
+//   postMessage()        — 统一上报 MessageBus
 // ===================================================================
 class BaseNode {
 public:
@@ -88,13 +89,11 @@ protected:
     // src_pad_name 非空：推给指定 SrcPad（DemuxNode 按流类型分发）
     void pushToDownstream(Buffer* buf, const std::string& src_pad_name = "");
 
-    // 推送 Event 到所有下游
-    // EOS 关键事件：阻塞 push，不允许丢失
-    // CapsEvent 非关键事件：tryPush，满则丢弃
-    void sendEventDownstream(const Event& event);
+    // 向所有已连接 SrcPad 广播 EOS（阻塞 push，不允许丢失）
+    void sendEOSDownstream();
 
     // 向指定 SrcPad 的下游发送 CapsEvent（阻塞 push，不允许丢失）
-    // 只负责发送，不存储。接收方在 onStreamInfo() 里自行存入 negotiated_caps_
+    // 每个 SrcPad 的 CapsEvent 可以不同；接收方在 onStreamInfo() 里自行存入 negotiated_caps_
     void sendCapsEvent(const std::string& src_pad_name, const CapsEvent& caps);
 
     // ===== 消息上报 =====
@@ -130,7 +129,7 @@ protected:
     std::vector<std::unique_ptr<SrcPad>> src_pads_;
     std::vector<std::unique_ptr<SinkPad>> sink_pads_;
     std::unordered_map<std::string, CapsEvent> negotiated_caps_;
-    bool stop_requested_ = false;
+    std::atomic<bool> stop_requested_{false};
 
     friend class Pipeline;
     friend class Graph;

@@ -74,7 +74,7 @@ void Pipeline::stop() {
 
     // 1. 设置所有节点退出标志
     for (auto& [node, _] : threads_) {
-        node->stop_requested_ = true;
+        node->stop_requested_.store(true);
     }
 
     // 2. flush 所有 Edge Queue，唤醒阻塞中的节点线程

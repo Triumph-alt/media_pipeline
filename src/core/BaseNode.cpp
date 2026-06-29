@@ -101,23 +101,13 @@ void BaseNode::pushToDownstream(Buffer* buf, const std::string& src_pad_name) {
     }
 }
 
-void BaseNode::sendEventDownstream(const Event& event) {
-    if (src_pads_.empty()) {
-        return;
-    }
-
-    bool critical = isCriticalEvent(event);
-
+void BaseNode::sendEOSDownstream() {
     for (auto& pad : src_pads_) {
         if (!pad->isConnected()) {
             continue;
         }
 
-        if (critical) {
-            pad->pushBlocking(QueueItem{event});
-        } else {
-            pad->tryPush(QueueItem{event});
-        }
+        pad->pushBlocking(QueueItem{Event{EOSEvent{}}});
     }
 }
 
@@ -141,7 +131,7 @@ void BaseNode::postMessage(MessageType type, const std::string& text, int code) 
     }
     // ERROR 时设置自己退出
     if (type == MessageType::ERROR) {
-        stop_requested_ = true;
+        stop_requested_.store(true);
     }
 }
 
@@ -150,11 +140,11 @@ void BaseNode::postMessage(MessageType type, const std::string& text, int code) 
 // ===================================================================
 
 void SourceNode::runLoop() {
-    while (!stop_requested_) {
+    while (!stop_requested_.load()) {
         auto* buf = capture();
         if (!buf) {
             // EOF：发送 EOS 给下游，SinkNode 收到后才上报 Pipeline
-            sendEventDownstream(EOSEvent{});
+            sendEOSDownstream();
             break;
         }
         pushToDownstream(buf);
@@ -167,7 +157,7 @@ void SourceNode::runLoop() {
 
 void SinkNode::runLoop() {
     auto* sink_pad = sink_pads_[0].get();
-    while (!stop_requested_) {
+    while (!stop_requested_.load()) {
         auto item = sink_pad->popBlocking();
         if (!item) {
             // flush 唤醒，检查 stop_requested_
@@ -185,7 +175,11 @@ void SinkNode::runLoop() {
 void SinkNode::onEvent(const Event& event) {
     if (std::holds_alternative<EOSEvent>(event)) {
         postMessage(MessageType::EOS, "");
+        return;
     }
+
+    postMessage(MessageType::ERROR,
+                "CapsEvent received in runLoop; sink nodes must consume CapsEvent in onStreamInfo");
 }
 
 // ===================================================================
@@ -195,7 +189,7 @@ void SinkNode::onEvent(const Event& event) {
 void TransformNode::runLoop() {
     auto* sink_pad = sink_pads_[0].get();
     std::vector<Buffer*> outputs;
-    while (!stop_requested_) {
+    while (!stop_requested_.load()) {
         auto item = sink_pad->popBlocking();
         if (!item) break;
 
@@ -212,7 +206,13 @@ void TransformNode::runLoop() {
 }
 
 void TransformNode::onEvent(const Event& event) {
-    sendEventDownstream(event);  // 默认：透传事件给下游
+    if (std::holds_alternative<EOSEvent>(event)) {
+        sendEOSDownstream();
+        return;
+    }
+
+    postMessage(MessageType::ERROR,
+                "CapsEvent received in runLoop; transform nodes must consume CapsEvent in onStreamInfo");
 }
 
 } // namespace pipeline
