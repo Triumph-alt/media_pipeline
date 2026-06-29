@@ -116,9 +116,26 @@ bool Graph::build() {
 // ready: Ready 阶段三步穿插
 // ===================================================================
 bool Graph::ready() {
-    for (auto* node : topo_order_) {
+    // 回滚 Lambda
+    auto rollbackReady = [this](size_t failed_index) {
+        // 按拓扑逆序调用 onStop() 回滚；释放各节点自己持有的具体资源
+        for (size_t n = failed_index + 1; n > 0; --n) {
+            topo_order_[n - 1]->onStop();
+        }
+
+        // 不考虑顺序，全部 reset，Ready 失败后不再保留 CapsEvent 或临时队列
+        for (auto& edge : edges_) {
+            edge->queue.reset();
+        }
+    };
+
+    // 主循环：拓扑遍历
+    for (size_t i = 0; i < topo_order_.size(); ++i) {
+        auto* node = topo_order_[i];
+
         // 步骤1：初始化自身资源
         if (!node->onReady()) {
+            rollbackReady(i);
             return false;
         }
 
@@ -127,6 +144,7 @@ bool Graph::ready() {
 
         // 步骤3：发送/处理 CapsEvent
         if (!node->onStreamInfo()) {
+            rollbackReady(i);
             return false;
         }
     }

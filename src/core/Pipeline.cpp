@@ -37,6 +37,7 @@ bool Pipeline::play() {
 
     // Ready 阶段：三步穿插初始化
     if (!graph_.ready()) {
+        // Ready 阶段失败，不进入 RUNNING，不启动任何线程
         state_ = PipelineState::ERROR;
         return false;
     }
