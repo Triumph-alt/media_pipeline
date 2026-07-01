@@ -35,6 +35,7 @@ struct VideoRawMeta {
 struct AudioRawMeta {
     int sample_rate;
     int channels;
+    int nb_samples;
     AVSampleFormat sample_fmt;
 };
 
@@ -44,6 +45,7 @@ struct EncodedMeta {
     int height = 0;
     int sample_rate = 0;
     int channels = 0;
+    int flags = 0;
     std::vector<uint8_t> extradata;
 };
 

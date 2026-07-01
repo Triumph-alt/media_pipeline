@@ -240,6 +240,97 @@ static void test_buffer_ref() {
     printf(" OK\n");
 }
 
+static void test_buffer_from_avpacket_metadata() {
+    printf("  test_buffer_from_avpacket_metadata...");
+    fflush(stdout);
+
+    uint8_t data[3]{1, 2, 3};
+    AVPacket pkt{};
+    pkt.data = data;
+    pkt.size = sizeof(data);
+    pkt.pts = AV_NOPTS_VALUE;
+    pkt.dts = AV_NOPTS_VALUE;
+    pkt.duration = 90;
+    pkt.flags = AV_PKT_FLAG_KEY;
+
+    auto* buf = Buffer::fromAVPacket(&pkt, MediaType::VIDEO_ENCODED,
+                                     AVRational{1, 90000}, AV_CODEC_ID_H264);
+    assert(buf != nullptr);
+    assert(buf->pts == AV_NOPTS_VALUE);
+    assert(buf->dts == AV_NOPTS_VALUE);
+    assert(buf->duration == 1000);
+
+    auto meta = std::get<EncodedMeta>(buf->meta);
+    assert(meta.codec_id == AV_CODEC_ID_H264);
+    assert(meta.flags == AV_PKT_FLAG_KEY);
+
+    buf->unref();
+    printf(" OK\n");
+}
+
+static void test_buffer_from_avpacket_invalid_type() {
+    printf("  test_buffer_from_avpacket_invalid_type...");
+    fflush(stdout);
+
+    uint8_t data[1]{0};
+    AVPacket pkt{};
+    pkt.data = data;
+    pkt.size = sizeof(data);
+
+    assert(Buffer::fromAVPacket(&pkt, MediaType::VIDEO_RAW, AVRational{1, 1000}) == nullptr);
+
+    printf(" OK\n");
+}
+
+static void test_buffer_from_avframe_invalid_input() {
+    printf("  test_buffer_from_avframe_invalid_input...");
+    fflush(stdout);
+
+    assert(Buffer::fromAVFrame(nullptr, MediaType::VIDEO_RAW, AVRational{1, 1000}) == nullptr);
+
+    AVFrame* frame = av_frame_alloc();
+    assert(frame != nullptr);
+    frame->format = AV_PIX_FMT_YUV420P;
+    frame->width = 0;
+    frame->height = 1080;
+    assert(Buffer::fromAVFrame(frame, MediaType::VIDEO_RAW, AVRational{1, 1000}) == nullptr);
+    av_frame_free(&frame);
+
+    printf(" OK\n");
+}
+
+static void test_buffer_from_avframe_audio_meta() {
+    printf("  test_buffer_from_avframe_audio_meta...");
+    fflush(stdout);
+
+    uint8_t data[16]{};
+    AVFrame* frame = av_frame_alloc();
+    assert(frame != nullptr);
+    frame->format = AV_SAMPLE_FMT_S16;
+    frame->sample_rate = 48000;
+    frame->ch_layout.nb_channels = 2;
+    frame->nb_samples = 4;
+    frame->pts = AV_NOPTS_VALUE;
+    frame->data[0] = data;
+
+    auto* buf = Buffer::fromAVFrame(frame, MediaType::AUDIO_RAW, AVRational{1, 48000});
+    assert(buf != nullptr);
+    assert(buf->pts == AV_NOPTS_VALUE);
+    assert(buf->duration == 83);
+    assert(buf->size == sizeof(data));
+
+    auto meta = std::get<AudioRawMeta>(buf->meta);
+    assert(meta.sample_rate == 48000);
+    assert(meta.channels == 2);
+    assert(meta.nb_samples == 4);
+    assert(meta.sample_fmt == AV_SAMPLE_FMT_S16);
+
+    buf->unref();
+    av_frame_free(&frame);
+
+    printf(" OK\n");
+}
+
 static void test_bounded_queue_basic() {
     printf("  test_bounded_queue_basic...");
     fflush(stdout);
@@ -597,6 +688,10 @@ int main() {
     test_buffer_refcount();
     test_buffer_clone();
     test_buffer_ref();
+    test_buffer_from_avpacket_metadata();
+    test_buffer_from_avpacket_invalid_type();
+    test_buffer_from_avframe_invalid_input();
+    test_buffer_from_avframe_audio_meta();
     test_bounded_queue_basic();
     test_bounded_queue_try_push_full();
     test_bounded_queue_flush();
