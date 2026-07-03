@@ -95,18 +95,19 @@ bool Graph::build() {
         return false;
     }
 
-    // 3. 孤立节点检测：入度出度均为 0 的节点
-    //    这种节点会被 Kahn 算法正常排入 topo_order_，不会被环路检测捕获
+    // 3. 孤立节点检测：单独遍历，不能依赖上面的环路检测结果
+    //    孤立节点入度=0、出度=0，会被 Kahn 算法正常排入 topo_order_，
+    //    不会触发 topo_order_.size() != nodes_.size()
+    //    用 set 一次性收集所有参与过边的节点，总体 O(V+E)
+    std::unordered_set<BaseNode*> connected;
+    for (auto& edge : edges_) {
+        connected.insert(edge->src_node);
+        connected.insert(edge->dst_node);
+    }
     for (auto& node : nodes_) {
-        bool has_edge = false;
-        BaseNode* raw = node.get();
-        for (auto& edge : edges_) {
-            if (edge->src_node == raw || edge->dst_node == raw) {
-                has_edge = true;
-                break;
-            }
+        if (!connected.count(node.get())) {
+            return false;
         }
-        if (!has_edge) return false;  // 孤立节点
     }
 
     return true;

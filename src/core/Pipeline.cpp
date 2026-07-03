@@ -35,6 +35,9 @@ bool Pipeline::build() {
 bool Pipeline::play() {
     if (state_ != PipelineState::BUILT) return false;
 
+    // 重置墙钟基准（Clock::reset 注释：play 时调用）
+    clock_.reset();
+
     // Ready 阶段：三步穿插初始化
     if (!graph_.ready()) {
         // Ready 阶段失败，不进入 RUNNING，不启动任何线程
