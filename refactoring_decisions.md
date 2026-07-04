@@ -217,72 +217,36 @@ Ready 阶段发生在线程启动前，但节点已经可能在 `onReady()` / `o
 
 进入第三阶段之前对 V2.68 已交付代码做的一轮深度审查，修掉 4 个真实缺陷。
 
-### Pipeline::play() 未调 Clock::reset() —— 无音频模式全帧被丢
+### Pipeline::play() 未调 Clock::reset()
 
-`Clock::wall_start_us_` 默认成员初始化为 0，`play()` 里从未调用 `Clock::reset()`。无音频回退模式下 `getPositionUs()` 返回 `nowUs() - 0`（即 `steady_clock` 起点到现在的微秒），第三阶段 `VideoRenderNode` 一算 `diff_us = frame_pts - clock_us` 得到巨大负值，触发所有帧被"落后判定"丢帧。
-
-`play()` 开头补 `clock_.reset()`。仅重置墙钟基准，暂不重置 `audio_base_pts_us_` / `has_audio_` —— 当前 Pipeline 用完即扔的语义下够用；若未来支持 Pipeline 复用（二次 play）需完善为全量 reset。
+`wall_start_us_` 默认 0，无音频回退模式下 `getPositionUs()` 会返回巨大数值，导致 VideoRenderNode 全部帧被判为"落后"丢帧。`play()` 开头补 `clock_.reset()`。只重置墙钟基准，Pipeline 用完即扔的语义下够用；未来支持复用需扩展为全量 reset。
 
 ### Graph::build() 孤立节点检测 O(V×E) → O(V+E)
 
-原实现三重嵌套：外层遍历所有 node，内层遍历所有 edge 找有无关联边。文档 §6.3 明确给了 `unordered_set` 一次性收集 + O(V) 查表的方案，代码没跟上。
-
-改为按文档实现：先一次遍历 `edges_` 将两端 `BaseNode*` 塞进 `connected` set，再一次遍历 `nodes_` 检查是否在 set 中，总体 O(V+E)。同时也让代码与设计文档字面一致，降低 review 成本。
+原三重嵌套遍历。改为文档 §6.3 的 `unordered_set` 方案：一次遍历 `edges_` 收集参与节点，一次遍历 `nodes_` 查表。
 
 ### MessageBus 监听线程提前启动 —— 修复 Ready 失败时 lastError() 为空
 
-原 `play()` 里 `bus_thread_` 在 `graph_.ready()` 之后才启动，Ready 阶段节点 `postMessage(ERROR)` 只落到 bus queue 但**没有消费者**，`messageBusLoop` 从未被触发，`last_error_` 从未被写入。文档 §7.3 承诺的：
+原 `bus_thread_` 在 `graph_.ready()` 之后启动，Ready 阶段 `postMessage(ERROR)` 无人消费，`last_error_` 永远为空。
 
-```cpp
-if (!pipeline.play()) {
-    fprintf(stderr, "pipeline play failed: %s\n", pipeline.lastError().c_str());
-}
-```
+`bus_thread_` 挪到 `graph_.ready()` 之前启动；Ready 失败路径 `bus_running_=false → notify → join`，靠 `waitMessage` 的 `!queue_.empty() || !running` 语义保证 pending 消息先 drain 再退出。副作用：Ready 期间的 WARNING/INFO 也走 observer，与 Running 阶段路径统一。
 
-在原代码下永远打印空字符串。第三阶段 DemuxNode/DecodeNode 大量在 Ready 阶段做真实设备/文件初始化，是必然踩到的场景。
-
-方案调整：
-- `bus_thread_` 挪到 `graph_.ready()` 之前启动（早于任何可能 postMessage 的位置）
-- Ready 失败时先 `bus_running_ = false → bus_.notify() → bus_thread_.join()`，再置 `state_ = ERROR` 返回
-- 依赖 `MessageBus::waitMessage` 的 `!queue_.empty() || !running` 语义，`join` 保证所有 Ready 期消息被 drain 完才退出，`last_error_` 完全可见
-
-副作用是 Ready 期间的 WARNING/INFO 也自动走 observer 回调 —— Ready 和 Running 两阶段的消息路径完全一致，是一致性红利。
-
-Ready 期间 postMessage(EOS) 属于节点作者违约（Sink 线程还没启动，谁能发？），当前不做框架防御。`waitEOS()` 中的 `state_ != RUNNING` 条件在 Ready 失败后仍能让用户不合规调用 `waitEOS()` 安全返回，无需额外保护。
+Ready 期间 postMessage(EOS) 视为节点作者违约（Sink 线程尚未启动），不做框架防御。
 
 ### pushToDownstream 分叉路径 double-unref → UAF
 
-原多路广播分支：
+`tryPush` 值传参 + 内部 `std::move`，caller 交出所有权后无法再管；原代码在失败路径又 `to_push->unref()`，对已 delete 的 Buffer 执行原子 RMW，UAF。单路路径不受影响，多路分叉队列偶尔满一次就命中。
 
-```cpp
-Buffer* to_push = first ? buf : buf->clone();
-first = false;
-if (!pad->tryPush(QueueItem{BufferRef{to_push}}))
-    to_push->unref();      // ← double-unref
-```
+修复：入口 `BufferRef primary(buf)` RAII 全程接管；多路广播每路 `primary.clone()` 分发，循环结束 primary 析构 unref 原 buf。放弃"第一路直传"尾优化，代码不含生命周期状态机。零拷贝上线后（clone → ref+1）额外开销消失。
 
-`tryPush` 值传参 + 内部 `std::move` 到 `BoundedQueue::tryPush`，caller 交出所有权后已经无法再管理。失败路径下 `BoundedQueue::tryPush` 的形参 `item` 析构时 BufferRef 已经 unref 过一次，caller 再 `to_push->unref()` 就是对已 `delete` 对象执行原子 RMW，UAF。当前测试全走单路所以从未触发，多路分叉场景（第三阶段 DemuxNode 立即用到）下队列偶尔满一次就命中。
+顺带清理：`test_bounded_queue_try_push_full` 里同款 double-unref 模式（ASAN 才抓出来），一并修掉。
 
-修复：入口即 `BufferRef primary(buf)` RAII 接管，路径分四类统一处理：
-- 单 SrcPad 阻塞路径：`pushBlocking(QueueItem{std::move(primary)})`
-- 指定 pad 多 SrcPad 路径：`tryPush(QueueItem{std::move(primary)})`
-- 未连接 / 空 pad 集：直接 return，`primary` 出作用域自动 unref
-- **多路广播**：不 move primary，每路 `primary.clone()` 各自新建 BufferRef 分发，循环结束 primary 析构 unref 原 buf
-
-放弃原代码的"第一路直传 + 后续 clone"尾优化，换取代码不含生命周期状态机。多的那一次 clone 在 V2.68 §13 承诺的引用计数零拷贝上线后（clone → ref+1）即消失。
-
-顺带清理：`tests/test_pipeline.cpp::test_bounded_queue_try_push_full` 中同款 double-unref 模式（历史遗留，普通编译从未抓到，ASAN 一跑就现形），一并修掉。
-
-新增 4 个测试覆盖本轮修复：
-- `test_pipeline_forked_broadcast` — 分叉广播成功路径
-- `test_pipeline_forked_backpressure_no_uaf` — 一路慢 Sink 制造背压稳定触发 tryPush 失败分支，ASAN 下能精确抓 UAF
-- `test_pipeline_ready_failure_reports_error` — 覆盖 lastError 修复的核心承诺
-- `test_pipeline_ready_failure_rollback` — 补齐 Ready 事务回滚（原承诺过但无测试）
+新增 4 个测试：`forked_broadcast`、`forked_backpressure_no_uaf`、`ready_failure_reports_error`、`ready_failure_rollback`。
 
 ### 遗留 P2：所有权约定类型化
 
-`BoundedQueue::tryPush(QueueItem)` / `BoundedQueue::pushBlocking(QueueItem)` 的"进来的就归我"所有权约定目前靠注释表达，caller 违约会立即 UAF。本轮的 `pushToDownstream` bug 和 `test_bounded_queue_try_push_full` bug 都是同一款违约的镜像。
+`BoundedQueue::tryPush(QueueItem)` / `pushBlocking(QueueItem)` 的"进来即归我"靠注释表达，本轮两处 UAF 都是同款违约。未来改为 `QueueItem&&` 让类型系统承载。同期把 `TransformNode::process` 的 `std::vector<Buffer*>&` 改为 `std::vector<BufferRef>&`。见 implementation_plan.md 后续优化方向表。
 
-未来可将签名改为 `tryPush(QueueItem&&)` / `pushBlocking(QueueItem&&)` 让类型系统承载所有权（caller 侧被迫 `std::move`，moved-from 后编译器/lint 帮着盯用错）。改动会穿透到 `SrcPad`、所有 caller 及部分测试代码，不在本轮做，作为 P2 清理项进入 implementation_plan.md 的"后续优化方向"表。
+### 删除 NodeState 枚举与 BaseNode::state_ 字段
 
-同类记账：进入第三阶段时 `TransformNode::process(Buffer* input, std::vector<Buffer*>& outputs)` 的 `outputs` 也建议改成 `std::vector<BufferRef>&`，把所有权约定通过类型显式化。
+`stop_requested_` 原子化之后，ERROR 语义由 `stop_requested_ + MessageBus` 承载，其余三个状态零读写。删除 `NodeState` / `state_` / `state()`，避免半状态机的正确性负担。设计文档 §5.1 同步。`PipelineState` 有真实使用者（stop CAS、waitEOS 等待条件），保留。

@@ -276,17 +276,4 @@ FFmpeg 需额外开启 encoder 和 muxer（见第一阶段 1.3 配置）。
 | RTSP 推流 | RTSPPushNode |
 | 线程绑核 | pthread_setaffinity_np |
 | AV Sync 自适应 | 丢帧阈值动态调整 |
-
-## 框架层技术债（P2 清理项）
-
-进入第三阶段之前审查发现、当前不阻塞但值得记账的架构级改动。按优先级排列：
-
-| # | 项 | 说明 | 触发时机 |
-|---|---|---|---|
-| 1 | 队列所有权类型化 | `BoundedQueue::tryPush(QueueItem)` / `pushBlocking(QueueItem)` 目前值传参 + 内部 `std::move`，"进来即归我" 靠注释表达。改为 `QueueItem&&` 让类型系统承载所有权，caller 必须显式 `std::move`，moved-from 后编译器/lint 帮着盯用错。同期把 `TransformNode::process` 的 `std::vector<Buffer*>& outputs` 改为 `std::vector<BufferRef>&`，让处理节点也统一到 RAII 语义 | 第三阶段 DemuxNode/DecodeNode 编写完后一次性重构，避免节点子类刚写好就大改 |
-| 2 | DemuxNode / MuxNode core 基类缺席 | 文档 §14 声明这两个基类放在 `include/pipeline/core/`，含 requestPad/pad_to_type_/waitAnyPadReady/selectMinDtsPad/eos_pads_ 等**与 FFmpeg 无关的**通用骨架；当前只有 Source/Sink/Transform 三个基类。若不补，第三阶段 AVDemuxNode 会把通用骨架和 FFmpeg 具体实现混在一起，后续 RtspDemux 等要重造 | 进入第三阶段实现 DemuxNode 前 |
-| 3 | `Graph::build()` 拓扑排序主循环 O(V×E) | 孤立节点检测已修，但 Kahn 主循环仍在每次弹节点时全扫 `edges_`。应一次性构建邻接表 `node → vector<node*>` 后 O(V+E) 完成 | 与项 1 同期或独立小 PR |
-| 4 | `BoundedQueue::setExternalNotify` 无锁读 std::function | `notifyAfterPush` 在锁外读 `external_notify_`，`setExternalNotify` 在锁内写，理论 race。当前 MuxNode 只在 `onStreamInfo`（线程未启动）设置，不触发；接口文档未明说约束 | 进入第三阶段实现 MuxNode 时明确约束或改为持锁 copy 后锁外调 |
-| 5 | `BaseNode::state_` 死字段 | 声明为 `NodeState state_` 但从未维护，`node->state()` API 存在但永远返回 `NULL_STATE`。要么按文档补全状态转换（在 onReady 成功/线程启动/onStop 等位置更新），要么删掉 | 进入第三阶段前顺手清理 |
-
-以上项每一条都对应设计文档明确承诺过、当前实现未落地或有偏差的地方。第三阶段实施 demo 时按需触发，触发时把对应项从此表移到 refactoring_decisions.md 作为决策记录。
+| 队列所有权类型化 | `BoundedQueue::tryPush/pushBlocking` 改为 `QueueItem&&`，`TransformNode::process` 的 outputs 改为 `std::vector<BufferRef>&`，把"进来即归我"从注释约束升级为类型约束 |

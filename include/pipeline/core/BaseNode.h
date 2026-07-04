@@ -19,16 +19,6 @@ class Pipeline;
 class Graph;
 
 // ===================================================================
-// NodeState: 节点生命周期状态
-// ===================================================================
-enum class NodeState {
-    NULL_STATE,   // 资源未分配
-    READY,        // 资源已分配（onReady 成功）
-    RUNNING,      // 工作线程运行中
-    ERROR,        // 出错
-};
-
-// ===================================================================
 // BaseNode: 节点抽象基类
 //
 // 生命周期回调（由 Pipeline/Graph 调用）：
@@ -42,13 +32,17 @@ enum class NodeState {
 //   sendCapsEvent()      — 向指定 SrcPad 发送 CapsEvent，阻塞且不丢失
 //   sendEOSDownstream()  — 向所有已连接 SrcPad 广播 EOS，阻塞且不丢失
 //   postMessage()        — 统一上报 MessageBus
+//
+// 节点生命周期由 stop_requested_ + MessageBus 表达，不维护独立的 NodeState：
+//   - 正常退出：Pipeline::stop() 置 stop_requested_，runLoop 循环退出
+//   - 出错退出：节点 postMessage(ERROR)（内部同步置 stop_requested_），
+//     Pipeline 从 MessageBus 侧收集 last_error_
 // ===================================================================
 class BaseNode {
 public:
     virtual ~BaseNode() = default;
 
     const std::string& name()  const { return name_; }
-    NodeState          state() const { return state_; }
     virtual NodeType   nodeType() const = 0;
 
     // Pad 访问
@@ -124,7 +118,6 @@ protected:
 
     // ===== 成员 =====
     std::string name_;
-    NodeState state_ = NodeState::NULL_STATE;
     Pipeline* pipeline_ = nullptr;
     std::vector<std::unique_ptr<SrcPad>> src_pads_;
     std::vector<std::unique_ptr<SinkPad>> sink_pads_;

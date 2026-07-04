@@ -422,15 +422,14 @@ public:
 
 ### 5.1 BaseNode（抽象基类）
 
-```cpp
-enum class NodeState { NULL_STATE, READY, RUNNING, ERROR };
+节点生命周期由 `stop_requested_` 原子标志 + MessageBus 表达：正常退出由 Pipeline::stop() 置位 `stop_requested_` 触发；出错时节点调用 `postMessage(ERROR)`，内部同步置位 `stop_requested_`，Pipeline 从 MessageBus 侧收集错误文本。BaseNode 本身不维护额外的状态字段。
 
+```cpp
 class BaseNode {
 public:
     virtual ~BaseNode() = default;
 
     const std::string& name()  const { return name_; }
-    NodeState          state() const { return state_; }
 
     // Pad 访问
     SrcPad*  getSrcPad(const std::string& name);
@@ -525,7 +524,6 @@ protected:
 
     // 成员
     std::string                              name_;
-    NodeState                                state_ = NodeState::NULL_STATE;
     Pipeline*                                pipeline_ = nullptr;
     std::vector<std::unique_ptr<SrcPad>>     src_pads_;
     std::vector<std::unique_ptr<SinkPad>>    sink_pads_;
