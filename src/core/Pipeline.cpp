@@ -38,9 +38,20 @@ bool Pipeline::play() {
     // 重置墙钟基准（Clock::reset 注释：play 时调用）
     clock_.reset();
 
+    // 先启动 MessageBus 监听线程：Ready 阶段节点 postMessage(ERROR/WARNING/INFO)
+    // 需要有人接收，否则 lastError() 在 Ready 失败路径上永远为空。
+    // 顺序必须早于 graph_.ready()。
+    bus_running_ = true;
+    bus_thread_ = std::thread([this]() { messageBusLoop(); });
+
     // Ready 阶段：三步穿插初始化
     if (!graph_.ready()) {
-        // Ready 阶段失败，不进入 RUNNING，不启动任何线程
+        // Ready 失败：先把 bus 收干净，保证 Ready 期间的 ERROR 消息全部落入 last_error_，
+        // 然后再置 ERROR 返回。bus_running_ 翻为 false 后 notify()，
+        // waitMessage 的“队列非空优先返回消息”语义保证 pending 消息不会丢。
+        bus_running_ = false;
+        bus_.notify();
+        if (bus_thread_.joinable()) bus_thread_.join();
         state_ = PipelineState::ERROR;
         return false;
     }
@@ -51,10 +62,6 @@ bool Pipeline::play() {
             active_sink_count_++;
         }
     }
-
-    // 启动 MessageBus 监听线程（最先启动，确保节点 postMessage 时有人接收）
-    bus_running_ = true;
-    bus_thread_ = std::thread([this]() { messageBusLoop(); });
 
     // 按拓扑逆序启动节点线程（Sink 先，Source 后）
     auto& order = graph_.topoOrder();

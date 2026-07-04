@@ -2,6 +2,7 @@
 #include "pipeline/core/Buffer.h"
 #include "pipeline/core/Caps.h"
 
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -152,6 +153,96 @@ protected:
 private:
     int count_ = 0;
     bool got_caps_ = false;
+};
+
+// ===================================================================
+// MockSlowSink: consume 里 sleep 一小段时间，制造下游背压
+// 广播路径下配合小容量队列可以稳定触发 tryPush 失败分支
+// ===================================================================
+class MockSlowSink : public SinkNode {
+public:
+    MockSlowSink(const std::string& name, int sleep_us)
+        : SinkNode(name), sleep_us_(sleep_us) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+    int received() const { return count_; }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+    void consume(Buffer* buf) override {
+        count_++;
+        if (sleep_us_ > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(sleep_us_));
+        }
+    }
+
+private:
+    int sleep_us_;
+    int count_ = 0;
+};
+
+// ===================================================================
+// MockFailingSource: onReady 里 postMessage(ERROR) 后返回 false
+// 用于验证 Ready 阶段错误消息能被 lastError() 拿到
+// ===================================================================
+class MockFailingSource : public SourceNode {
+public:
+    MockFailingSource(const std::string& name, const std::string& err_text)
+        : SourceNode(name), err_text_(err_text) {
+        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+
+protected:
+    bool onReady() override {
+        postMessage(MessageType::ERROR, err_text_);
+        return false;
+    }
+    void onStop() override {}
+    Buffer* capture() override { return nullptr; }
+
+private:
+    std::string err_text_;
+};
+
+// ===================================================================
+// MockOnStopTracker: 记录 onStop 被调用次数
+// 用于验证 Ready 失败时事务性回滚（前置节点已经 onReady 成功后应被回滚）
+// ===================================================================
+class MockOnStopTracker : public SourceNode {
+public:
+    MockOnStopTracker(const std::string& name)
+        : SourceNode(name) {
+        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+    int stopCalled() const { return stop_calls_; }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override { stop_calls_++; }
+    Buffer* capture() override { return nullptr; }
+
+private:
+    int stop_calls_ = 0;
+};
+
+// ===================================================================
+// MockFailingSink: onReady 里让 Ready 阶段推进到中段再失败
+// 前置节点先 onReady 成功，Sink 失败 → 前置的 onStop 应被回滚调用
+// ===================================================================
+class MockFailingSink : public SinkNode {
+public:
+    MockFailingSink(const std::string& name) : SinkNode(name) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+
+protected:
+    bool onReady() override {
+        postMessage(MessageType::ERROR, "sink init failed");
+        return false;
+    }
+    void onStop() override {}
+    void consume(Buffer* buf) override {}
 };
 
 // ===================================================================
@@ -374,8 +465,9 @@ static void test_bounded_queue_try_push_full() {
     buf3->data = new uint8_t[1]{99};
     buf3->size = 1;
     buf3->media_type = MediaType::VIDEO_RAW;
+    // tryPush 值传参：失败时函数内的 QueueItem 析构会 unref buf3，
+    // caller 不能再手动 unref 一次（否则 double-free / UAF，就是 pushToDownstream 修的那个 bug）
     assert(!q.tryPush(QueueItem{BufferRef{buf3}}));
-    buf3->unref();
 
     printf(" OK\n");
 }
@@ -679,6 +771,114 @@ static void test_pipeline_wait_eos_and_stop() {
 }
 
 // ===================================================================
+// 分叉路径：Source 一路输出 fork 给两个 Sink
+// 覆盖 pushToDownstream 的多路广播分支（primary.clone 循环）。
+// 无 UAF → 进程正常收敛到 waitEOS，两路 Sink 都能收到帧
+// ===================================================================
+static void test_pipeline_forked_broadcast() {
+    printf("  test_pipeline_forked_broadcast...");
+    fflush(stdout);
+
+    Pipeline pipeline;
+    auto* src   = pipeline.addNode<MockSource>("src", 20, MediaType::VIDEO_RAW);
+    auto* sink1 = pipeline.addNode<MockSink>("sink1");
+    auto* sink2 = pipeline.addNode<MockSink>("sink2");
+
+    // 第一次 link 直接用 "out"（走 requestSrcPad 创建）
+    assert(pipeline.link(src, "out",  sink1, "in", MediaType::VIDEO_RAW));
+    // 第二次 link 用新 pad 名，触发 SourceNode::requestSrcPad 分叉分支
+    assert(pipeline.link(src, "out2", sink2, "in", MediaType::VIDEO_RAW));
+
+    assert(pipeline.build());
+    assert(pipeline.play());
+    pipeline.waitEOS();
+
+    // 每一路都应收到全部 20 帧（分叉通过 clone 复制，理想情况下不丢）
+    // 队列容量 4 * 20 帧节奏正常也可能因为调度略有丢帧，这里放宽下界，
+    // 关键是断言 “至少收到帧、进程未 crash”
+    assert(sink1->received() > 0);
+    assert(sink2->received() > 0);
+
+    printf(" OK\n");
+}
+
+// ===================================================================
+// 分叉路径压力：一路慢 Sink 制造背压，触发多路 tryPush 失败分支
+// 关键是不 crash（问题 2 的 UAF 在此路径下 ASAN 必现）
+// ===================================================================
+static void test_pipeline_forked_backpressure_no_uaf() {
+    printf("  test_pipeline_forked_backpressure_no_uaf...");
+    fflush(stdout);
+
+    Pipeline pipeline;
+    auto* src   = pipeline.addNode<MockSource>("src", 200, MediaType::VIDEO_RAW);
+    auto* fast  = pipeline.addNode<MockSink>("fast");
+    auto* slow  = pipeline.addNode<MockSlowSink>("slow", 500);  // 每帧 sleep 500us
+
+    assert(pipeline.link(src, "out",  fast, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.link(src, "out2", slow, "in", MediaType::VIDEO_RAW));
+
+    assert(pipeline.build());
+    assert(pipeline.play());
+    pipeline.waitEOS();
+
+    // 快 Sink 应收到大部分帧，慢 Sink 因为队列满会被 tryPush 丢弃一些
+    assert(fast->received() > 0);
+    assert(slow->received() > 0);
+    assert(fast->received() >= slow->received());  // 快侧应至少和慢侧一样多
+
+    printf(" OK\n");
+}
+
+// ===================================================================
+// Ready 失败：错误消息能被 lastError() 拿到
+// 覆盖问题 1 的核心承诺（bus 提前启动 + Ready 失败前 join drain）
+// ===================================================================
+static void test_pipeline_ready_failure_reports_error() {
+    printf("  test_pipeline_ready_failure_reports_error...");
+    fflush(stdout);
+
+    Pipeline pipeline;
+    auto* src  = pipeline.addNode<MockFailingSource>("bad_src", "device open failed");
+    auto* sink = pipeline.addNode<MockSink>("sink");
+
+    assert(pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+    assert(!pipeline.play());   // Ready 失败
+
+    // 修复前这里是空串
+    assert(pipeline.lastError() == "device open failed");
+
+    printf(" OK\n");
+}
+
+// ===================================================================
+// Ready 失败事务性回滚：前置节点 onReady 成功后，
+// 后置节点失败时前置节点的 onStop 应被回滚调用
+// ===================================================================
+static void test_pipeline_ready_failure_rollback() {
+    printf("  test_pipeline_ready_failure_rollback...");
+    fflush(stdout);
+
+    Pipeline pipeline;
+    auto* src  = pipeline.addNode<MockOnStopTracker>("tracker");
+    auto* sink = pipeline.addNode<MockFailingSink>("bad_sink");
+
+    assert(pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+    assert(!pipeline.play());
+
+    // 前置 tracker 的 onReady 已成功、queue 已建、然后 sink 的 onReady 失败
+    // Graph::ready() 应按拓扑逆序回滚：先 sink.onStop 再 tracker.onStop
+    // tracker 至少被 onStop 一次
+    assert(src->stopCalled() >= 1);
+    // sink 上报的错误也应能拿到
+    assert(pipeline.lastError() == "sink init failed");
+
+    printf(" OK\n");
+}
+
+// ===================================================================
 
 int main() {
     printf("=== Phase 2 Unit Tests ===\n\n");
@@ -714,6 +914,12 @@ int main() {
     test_pipeline_caps_propagation();
     test_pipeline_concurrent_stop();
     test_pipeline_wait_eos_and_stop();
+    test_pipeline_forked_broadcast();
+    test_pipeline_forked_backpressure_no_uaf();
+
+    printf("\n[Ready Failure Tests]\n");
+    test_pipeline_ready_failure_reports_error();
+    test_pipeline_ready_failure_rollback();
 
     printf("\n=== All Tests Passed ===\n");
     return 0;

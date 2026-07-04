@@ -49,55 +49,35 @@ SinkPad* BaseNode::addSinkPad(const std::string& name, TemplateCaps caps) {
 // ===================================================================
 void BaseNode::pushToDownstream(Buffer* buf, const std::string& src_pad_name) {
     if (!buf) return;
+    BufferRef primary(buf);   // RAII 接管，从这一行起 buf 只由 primary 拥有
 
     if (!src_pad_name.empty()) {
         // 推给指定 SrcPad（DemuxNode 按流类型分发）
         SrcPad* pad = getSrcPad(src_pad_name);
-        if (!pad || !pad->isConnected()) {
-            buf->unref();
-            return;
-        }
+        if (!pad || !pad->isConnected()) return;   // primary 析构自动 unref
         // 阻塞策略取决于节点总 SrcPad 数量
-        if (src_pads_.size() == 1) {
-            pad->pushBlocking(QueueItem{BufferRef{buf}});
-        } else {
-            if (!pad->tryPush(QueueItem{BufferRef{buf}}))
-                buf->unref();
-        }
+        if (src_pads_.size() == 1)
+            pad->pushBlocking(QueueItem{std::move(primary)});
+        else
+            pad->tryPush(QueueItem{std::move(primary)});
         return;
     }
 
     // 推给所有 SrcPad
-    if (src_pads_.empty()) {
-        buf->unref();
-        return;
-    }
+    if (src_pads_.empty()) return;   // primary 析构自动 unref
 
     if (src_pads_.size() == 1) {
         // 单路：阻塞 push，背压传导
-        if (src_pads_[0]->isConnected()) {
-            src_pads_[0]->pushBlocking(QueueItem{BufferRef{buf}});
-        } else {
-            buf->unref();
-        }
-    } else {
-        // 多路（分叉）：非阻塞 tryPush，满则丢弃
-        bool first = true;
-        for (auto& pad : src_pads_) {
-            if (!pad->isConnected()) {
-                continue;
-            }
+        if (src_pads_[0]->isConnected())
+            src_pads_[0]->pushBlocking(QueueItem{std::move(primary)});
+        return;   // 未连接或已 move：primary 析构自动 unref
+    }
 
-            Buffer* to_push = first ? buf : buf->clone();
-            first = false;
-            if (!pad->tryPush(QueueItem{BufferRef{to_push}})) {
-                to_push->unref();
-            }
-        }
-        if (first) {
-            // 没有任何连接的 SrcPad
-            buf->unref();
-        }
+    // 多路（分叉）：每路独立 clone 深拷贝，非阻塞 tryPush，满则丢弃该路副本
+    // primary 始终持有原 buf，各路只拿 clone 互不影响；出作用域时统一 unref 原 buf
+    for (auto& pad : src_pads_) {
+        if (!pad->isConnected()) continue;
+        pad->tryPush(QueueItem{primary.clone()});
     }
 }
 

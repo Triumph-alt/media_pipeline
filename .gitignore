@@ -13,10 +13,10 @@ third_party/SDL3/
 # ============================================================
 # Communication files (for AI collaboration only)
 # ============================================================
-implementation_plan.md
+# implementation_plan.md
 Media_Pipeline_Framework.md
-Media_Pipeline_Framework_V2.68.md
-refactoring_decisions.md
+# Media_Pipeline_Framework_V2.68.md
+# refactoring_decisions.md
 
 # ============================================================
 # IDE / Editor
