@@ -250,3 +250,36 @@ Ready 期间 postMessage(EOS) 视为节点作者违约（Sink 线程尚未启动
 ### 删除 NodeState 枚举与 BaseNode::state_ 字段
 
 `stop_requested_` 原子化之后，ERROR 语义由 `stop_requested_ + MessageBus` 承载，其余三个状态零读写。删除 `NodeState` / `state_` / `state()`，避免半状态机的正确性负担。设计文档 §5.1 同步。`PipelineState` 有真实使用者（stop CAS、waitEOS 等待条件），保留。
+
+---
+
+## DemuxNode / MuxNode 基类补全
+
+### 抽象基类放入 BaseNode.h
+
+设计文档 §14 把 `SourceNode`、`SinkNode`、`TransformNode`、`DemuxNode`、`MuxNode` 列为五个独立头文件，但当前代码已经把 `SourceNode/SinkNode/TransformNode` 放在 `BaseNode.h` 中。为了保持风格一致并避免为一次补基类而拆分整个节点基类文件结构，决定将 `DemuxNode` / `MuxNode` 也放入 `BaseNode.h`，与另外三个基类在一起。
+
+这两个基类保持**无 FFmpeg 依赖**：只包含格式无关的共享骨架和纯虚钩子。
+
+- `DemuxNode` 负责：
+  - `requestSrcPad` 校验 `hint_type` 为 `VIDEO_ENCODED` / `AUDIO_ENCODED`
+  - `pad_to_type_` 映射维护
+  - `onReady` 中调子类 `openInput` / `probeStreams`，并校验每个 pad 都有对应流
+  - `onStreamInfo` 中 resize Queue 并发送 CapsEvent
+  - `runLoop` 中调子类 `readFrame`，按 `media_type` 把 Buffer 分发到对应 SrcPad（分叉时 clone），EOF 时广播 EOS
+  - `onStop` 中调子类 `closeInput`
+
+- `MuxNode` 负责：
+  - `requestSinkPad` 校验 `hint_type` 为 `VIDEO_ENCODED` / `AUDIO_ENCODED`
+  - `onStreamInfo` 中从每个 SinkPad 收取 CapsEvent，调子类 `allocateContext` / `addStream` / `writeHeader`
+  - `runLoop` 中通过 `waitAnyPadReady` + `selectMinDtsPad` 选择一路数据，调子类 `writePacket`
+  - 所有 SinkPad 都 EOS 后调 `writeTrailer` 并向下游广播 EOS
+  - `onStop` 中调子类 `closeContext`
+
+具体 FFmpeg 实现（`AVFormatContext`、自定义 `AVIOContext` 等）下沉到 `include/pipeline/nodes/AVDemuxNode.h` 和 `AVMuxNode.h`，继承这两个基类并实现钩子。
+
+### 文档同步
+
+- `Media_Pipeline_Framework_V2.68.md` §14 文件结构更新：五个节点基类统一在 `BaseNode.h`，`AVDemuxNode.h` / `AVMuxNode.h` 在 `nodes/` 下。
+- §5.5 / §5.6 增加说明：示例代码为 `AVDemuxNode` / `AVMuxNode` 的 FFmpeg 实现参考，基类定义见 `BaseNode.h`。
+

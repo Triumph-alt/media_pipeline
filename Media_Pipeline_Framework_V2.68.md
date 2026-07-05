@@ -674,6 +674,10 @@ protected:
 
 ### 5.5 DemuxNode
 
+> **说明**：`DemuxNode` 在 `include/pipeline/core/BaseNode.h` 中是**抽象基类**，只包含格式无关的共享骨架（`requestSrcPad`、`pad_to_type_`、流校验、按 `media_type` 分发、`EOS` 传播）。
+> 
+> 本节代码示例展示的是**基于 FFmpeg 的具体实现 `AVDemuxNode`** 的参考写法，继承 `DemuxNode` 并实现 `openInput` / `closeInput` / `probeStreams` / `readFrame` 四个钩子即可。
+
 DemuxNode 在 `link()` 时立刻创建 SrcPad（类型由 `hint_type` 决定），和其他节点的处理方式一致。`onReady()` 阶段打开文件后，对照已经创建好的 Pad 校验文件里是否存在对应的流，找不到则直接报错退出。
 
 ```cpp
@@ -829,6 +833,10 @@ private:
 ```
 
 ### 5.6 MuxNode
+
+> **说明**：`MuxNode` 在 `include/pipeline/core/BaseNode.h` 中是**抽象基类**，只包含格式无关的共享骨架（`requestSinkPad`、CapsEvent 收集、`waitAnyPadReady`、`selectMinDtsPad`、`eos_pads_` 汇合、`EOS` 传播）。
+> 
+> 本节代码示例展示的是**基于 FFmpeg 的具体实现 `AVMuxNode`** 的参考写法，继承 `MuxNode` 并实现 `allocateContext` / `addStream` / `writeHeader` / `writePacket` / `writeTrailer` / `closeContext` 六个钩子即可。
 
 MuxNode 有多个 SinkPad，runLoop 使用多路复用监听：任意一路有数据就取，全部为空才阻塞。
 
@@ -1960,12 +1968,8 @@ media-pipeline/
 │   │   ├── Pad.h                # Pad、SrcPad、SinkPad
 │   │   ├── Edge.h               # Edge，持有 BoundedQueue
 │   │   ├── BoundedQueue.h       # 有界队列，阻塞/非阻塞 API
-│   │   ├── BaseNode.h           # 抽象基类，pushToDownstream
-│   │   ├── SourceNode.h         # Source 基类
-│   │   ├── SinkNode.h           # Sink 基类
-│   │   ├── TransformNode.h      # Transform 基类
-│   │   ├── DemuxNode.h          # Demux 基类（requestSrcPad 动态创建、onReady 校验流）
-│   │   ├── MuxNode.h            # Mux 基类（含多路复用监听）
+│   │   ├── BaseNode.h           # BaseNode + SourceNode + SinkNode + TransformNode
+│   │   │                          # + DemuxNode + MuxNode 五个节点基类
 │   │   ├── Graph.h              # 显式邻接表、拓扑排序、静态协商
 │   │   ├── Pipeline.h           # 三阶段启动、线程管理
 │   │   ├── Clock.h              # 主时钟，AV Sync
@@ -1975,8 +1979,8 @@ media-pipeline/
 │       ├── AudioCaptureNode.h   # ALSA 音频采集
 │       ├── DecodeNode.h         # FFmpeg 解码
 │       ├── EncodeNode.h         # FFmpeg 编码
-│       ├── AVDemuxNode.h        # FFmpeg 解复用
-│       ├── AVMuxNode.h          # FFmpeg 复用
+│       ├── AVDemuxNode.h        # FFmpeg 解复用（继承 DemuxNode 基类）
+│       ├── AVMuxNode.h          # FFmpeg 复用（继承 MuxNode 基类）
 │       ├── VideoRenderNode.h    # SDL3 视频渲染
 │       ├── AudioPlayNode.h      # SDL3 音频播放
 │       ├── FileSinkNode.h       # 本地文件写入

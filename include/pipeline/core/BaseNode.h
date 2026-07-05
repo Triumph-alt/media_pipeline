@@ -7,9 +7,12 @@
 #include "pipeline/core/Types.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace pipeline {
@@ -211,6 +214,124 @@ protected:
         }
         return addSrcPad(name, TemplateCaps{{hint_type}});
     }
+};
+
+// ===================================================================
+// DemuxNode: 解复用基类
+//
+// 子类只需实现 openInput / closeInput / probeStreams / readFrame 四个钩子，
+// 基类统一处理：动态 SrcPad 管理、流存在性校验、CapsEvent 发送、
+// 按 media_type 分发的多路广播、EOS 传播。
+//
+// 无 FFmpeg 依赖：具体格式解析（AVFormatContext 等）留在 AVDemuxNode 实现。
+// ===================================================================
+class DemuxNode : public BaseNode {
+public:
+    NodeType nodeType() const override { return NodeType::DEMUX; }
+
+protected:
+    explicit DemuxNode(const std::string& name) : BaseNode(name) {}
+
+    // === 子类必须实现的格式相关钩子 ===
+
+    // 打开输入源。失败时应 postMessage(ERROR) 并返回 false。
+    virtual bool openInput() = 0;
+
+    // 关闭输入源。
+    virtual void closeInput() = 0;
+
+    // 探测流信息。失败时应 postMessage(ERROR)。
+    // 实现方应将每个 stream_index 对应的 CapsEvent 填入 stream_caps_。
+    virtual bool probeStreams() = 0;
+
+    // 读取下一帧。
+    // 成功：返回 true，*out_buf 指向 ref_count == 1 的 Buffer
+    // EOF：返回 true，*out_buf = nullptr
+    // 错误：返回 false
+    virtual bool readFrame(Buffer** out_buf) = 0;
+
+    // === 基类统一生命周期（子类不要重写）===
+    bool onReady() override final;
+    bool onStreamInfo() override final;
+    void runLoop() override final;
+    void onStop() override final;
+
+    // 动态创建 SrcPad：只接受 VIDEO_ENCODED / AUDIO_ENCODED
+    SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override;
+
+    // pad_name -> MediaType
+    std::unordered_map<std::string, MediaType> pad_to_type_;
+
+    // stream_index -> CapsEvent
+    std::vector<CapsEvent> stream_caps_;
+
+    // pad_name -> stream_index
+    std::unordered_map<std::string, int> pad_to_stream_index_;
+};
+
+// ===================================================================
+// MuxNode: 复用基类
+//
+// 子类只需实现 allocateContext / addStream / writeHeader / writePacket /
+// writeTrailer / closeContext 六个钩子，基类统一处理：动态 SinkPad 管理、
+// CapsEvent 收集、外部 notify 注册、多路复用监听、DTS 最小选择、
+// EOS 汇合、EOS 向下游传播。
+//
+// 无 FFmpeg 依赖：具体容器封装（AVFormatContext / AVIOContext 等）留在
+// AVMuxNode 实现。
+// ===================================================================
+class MuxNode : public BaseNode {
+public:
+    NodeType nodeType() const override { return NodeType::MUX; }
+
+protected:
+    explicit MuxNode(const std::string& name) : BaseNode(name) {}
+
+    // === 子类必须实现的格式相关钩子 ===
+
+    // 按 format_ 分配输出上下文。失败时应 postMessage(ERROR)。
+    virtual bool allocateContext(const std::string& format) = 0;
+
+    // 根据 CapsEvent 添加输出流。stream_index 出参。
+    virtual bool addStream(const CapsEvent& caps, int* stream_index) = 0;
+
+    // 写文件头
+    virtual bool writeHeader() = 0;
+
+    // 写一帧。buf 只读，所有权仍归基类，子类不得 unref。
+    virtual bool writePacket(Buffer* buf, int stream_index) = 0;
+
+    // 写文件尾
+    virtual bool writeTrailer() = 0;
+
+    // 关闭并释放输出上下文
+    virtual void closeContext() = 0;
+
+    // === 基类统一生命周期（子类不要重写）===
+    bool onReady() override final;
+    bool onStreamInfo() override final;
+    void runLoop() override final;
+    void onStop() override final;
+
+    // 动态创建 SinkPad：只接受 VIDEO_ENCODED / AUDIO_ENCODED
+    SinkPad* requestSinkPad(const std::string& name, MediaType hint_type) override;
+
+    // 多路复用辅助
+    SinkPad* waitAnyPadReady();
+    SinkPad* selectMinDtsPad();
+
+    // pad_name -> stream_index
+    std::unordered_map<std::string, int> pad_to_stream_;
+
+    // 已收到 EOS 的 pad 集合
+    std::unordered_set<std::string> eos_pads_;
+
+    // 多路复用等待
+    std::mutex mux_mutex_;
+    std::condition_variable mux_cv_;
+
+    // 输出格式（由子类或用户设置）
+    std::string format_;
 };
 
 } // namespace pipeline

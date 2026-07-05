@@ -195,4 +195,260 @@ void TransformNode::onEvent(const Event& event) {
                 "CapsEvent received in runLoop; transform nodes must consume CapsEvent in onStreamInfo");
 }
 
+// ===================================================================
+// DemuxNode: 格式无关的共享骨架
+// ===================================================================
+
+SrcPad* DemuxNode::requestSrcPad(const std::string& name, MediaType hint_type) {
+    if (hint_type != MediaType::VIDEO_ENCODED && hint_type != MediaType::AUDIO_ENCODED) {
+        return nullptr;
+    }
+    auto* pad = addSrcPad(name, TemplateCaps{{hint_type}});
+    pad_to_type_[name] = hint_type;
+    return pad;
+}
+
+bool DemuxNode::onReady() {
+    if (!openInput()) {
+        return false;
+    }
+
+    if (!probeStreams()) {
+        closeInput();
+        return false;
+    }
+
+    // 校验：用户 link 的每个 pad，在输入源里是否真的有对应类型的流
+    for (const auto& [pad_name, type] : pad_to_type_) {
+        bool found = false;
+        for (size_t i = 0; i < stream_caps_.size(); ++i) {
+            if (stream_caps_[i].media_type == type) {
+                pad_to_stream_index_[pad_name] = static_cast<int>(i);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            postMessage(MessageType::ERROR,
+                        "DemuxNode: no stream matching pad '" + pad_name + "'");
+            closeInput();
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool DemuxNode::onStreamInfo() {
+    for (const auto& [pad_name, type] : pad_to_type_) {
+        auto it = pad_to_stream_index_.find(pad_name);
+        if (it == pad_to_stream_index_.end()) {
+            continue;
+        }
+
+        SrcPad* pad = getSrcPad(pad_name);
+        if (!pad || !pad->isConnected()) {
+            continue;
+        }
+
+        // 先 resize 到正确容量，再发 CapsEvent
+        pad->edge()->queue->resize(selectQueueCapacity(type));
+        sendCapsEvent(pad_name, stream_caps_[it->second]);
+    }
+    return true;
+}
+
+void DemuxNode::runLoop() {
+    while (!stop_requested_.load()) {
+        Buffer* buf = nullptr;
+        if (!readFrame(&buf)) {
+            // 子类已上报 ERROR，直接退出
+            break;
+        }
+        if (!buf) {
+            // EOF
+            sendEOSDownstream();
+            break;
+        }
+
+        BufferRef primary(buf);   // RAII 接管，从这一行起 buf 只由 primary 拥有
+
+        // 按 media_type 分发到所有匹配的已连接 SrcPad。
+        // 每路独立 clone 深拷贝，非阻塞 tryPush，满则丢弃该路副本。
+        // primary 始终持有原 buf，循环结束析构统一 unref。
+        for (auto& pad : src_pads_) {
+            if (!pad->isConnected()) {
+                continue;
+            }
+            const auto& types = pad->templateCaps().supported_types;
+            if (types.empty() || types[0] != buf->media_type) {
+                continue;
+            }
+            pad->tryPush(QueueItem{primary.clone()});
+        }
+    }
+}
+
+void DemuxNode::onStop() {
+    closeInput();
+}
+
+// ===================================================================
+// MuxNode: 格式无关的共享骨架
+// ===================================================================
+
+SinkPad* MuxNode::requestSinkPad(const std::string& name, MediaType hint_type) {
+    if (hint_type != MediaType::VIDEO_ENCODED && hint_type != MediaType::AUDIO_ENCODED) {
+        return nullptr;
+    }
+    return addSinkPad(name, TemplateCaps{{hint_type}});
+}
+
+bool MuxNode::onReady() {
+    return true;
+}
+
+bool MuxNode::onStreamInfo() {
+    if (!allocateContext(format_)) {
+        return false;
+    }
+
+    // 从每个 SinkPad 收取 CapsEvent，并添加输出流
+    for (auto& pad : sink_pads_) {
+        if (!pad->isConnected()) {
+            continue;
+        }
+
+        auto item = pad->popBlocking();
+        if (!item || !std::holds_alternative<Event>(*item)) {
+            postMessage(MessageType::ERROR,
+                        "MuxNode: no CapsEvent on pad '" + pad->name() + "'");
+            closeContext();
+            return false;
+        }
+
+        auto& event = std::get<Event>(*item);
+        if (!std::holds_alternative<CapsEvent>(event)) {
+            postMessage(MessageType::ERROR,
+                        "MuxNode: expected CapsEvent on pad '" + pad->name() + "'");
+            closeContext();
+            return false;
+        }
+
+        const CapsEvent& caps = std::get<CapsEvent>(event);
+        negotiated_caps_[pad->name()] = caps;
+
+        int stream_index = -1;
+        if (!addStream(caps, &stream_index)) {
+            closeContext();
+            return false;
+        }
+        pad_to_stream_[pad->name()] = stream_index;
+
+        // 注册外部 notify：任意一路有数据就唤醒 mux_cv_
+        pad->edge()->queue->setExternalNotify([this]() {
+            std::lock_guard<std::mutex> lock(mux_mutex_);
+            mux_cv_.notify_one();
+        });
+    }
+
+    if (!writeHeader()) {
+        closeContext();
+        return false;
+    }
+
+    return true;
+}
+
+void MuxNode::runLoop() {
+    while (!stop_requested_.load()) {
+        SinkPad* ready_pad = waitAnyPadReady();
+        if (!ready_pad) {
+            break;
+        }
+
+        auto item = ready_pad->tryPop();
+        if (!item) {
+            continue;
+        }
+
+        if (std::holds_alternative<BufferRef>(*item)) {
+            Buffer* buf = std::get<BufferRef>(*item).get();
+            auto it = pad_to_stream_.find(ready_pad->name());
+            if (it != pad_to_stream_.end()) {
+                if (!writePacket(buf, it->second)) {
+                    // 子类已上报 ERROR
+                    break;
+                }
+            }
+        } else if (std::holds_alternative<Event>(*item)) {
+            const Event& event = std::get<Event>(*item);
+            if (std::holds_alternative<EOSEvent>(event)) {
+                eos_pads_.insert(ready_pad->name());
+                if (eos_pads_.size() == sink_pads_.size()) {
+                    writeTrailer();
+                    sendEOSDownstream();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+SinkPad* MuxNode::waitAnyPadReady() {
+    std::unique_lock<std::mutex> lock(mux_mutex_);
+    mux_cv_.wait(lock, [this] {
+        if (stop_requested_.load()) {
+            return true;
+        }
+        for (auto& pad : sink_pads_) {
+            if (pad->edge() && pad->edge()->queue && !pad->edge()->queue->empty()) {
+                return true;
+            }
+        }
+        return false;
+    });
+
+    if (stop_requested_.load()) {
+        return nullptr;
+    }
+
+    return selectMinDtsPad();
+}
+
+SinkPad* MuxNode::selectMinDtsPad() {
+    SinkPad* min_pad = nullptr;
+    int64_t min_dts = std::numeric_limits<int64_t>::max();
+
+    for (auto& pad : sink_pads_) {
+        if (!pad->edge() || !pad->edge()->queue) {
+            continue;
+        }
+
+        auto top = pad->edge()->queue->peek();
+        if (!top) {
+            continue;
+        }
+
+        if (std::holds_alternative<BufferRef>(*top)) {
+            int64_t dts = std::get<BufferRef>(*top)->dts;
+            if (dts < min_dts) {
+                min_dts = dts;
+                min_pad = pad.get();
+            }
+        } else {
+            // Event（EOS 等）优先处理，不参与 DTS 比较
+            if (!min_pad) {
+                min_pad = pad.get();
+            }
+        }
+    }
+
+    return min_pad;
+}
+
+void MuxNode::onStop() {
+    closeContext();
+}
+
 } // namespace pipeline
