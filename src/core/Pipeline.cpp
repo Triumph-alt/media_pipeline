@@ -89,11 +89,7 @@ void Pipeline::stop() {
     }
 
     // 2. flush 所有 Edge Queue，唤醒阻塞中的节点线程
-    for (auto& edge : graph_.edges()) {
-        if (edge->queue) {
-            edge->queue->flush();
-        }
-    }
+    graph_.flushAllQueues();
 
     // 3. join 所有节点线程
     for (auto& [node, thread] : threads_) {

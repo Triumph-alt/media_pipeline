@@ -1026,8 +1026,9 @@ private:
 ### 6.1 Graph 职责
 
 - 维护所有节点和边的显式邻接表
-- Build 阶段：静态 Caps 检查、环路检测、拓扑排序、孤立节点检测
-- Ready 阶段：按拓扑顺序依次执行 onReady() → 建 Queue → onStreamInfo()，三步穿插进行
+- `link()` 阶段：静态 Caps 兼容性检查
+- `build()` 阶段：拓扑排序、环路检测、孤立节点检测
+- `ready()` 阶段：按拓扑顺序依次执行 onReady() → 建 Queue → onStreamInfo()，三步穿插进行
 
 ### 6.2 Graph 数据结构
 
@@ -1048,13 +1049,14 @@ public:
              MediaType hint_type = MediaType::CONTAINER);
 
     // Build 阶段完整校验
-    // 1. 检查所有连接的 TemplateCaps 兼容性（已在 link() 阶段逐条检查过）
-    // 2. 拓扑排序（Kahn 算法），结果存入 topo_order_
-    // 3. 环路检测：topo_order_.size() != nodes_.size() 说明图中存在环，报错
-    // 4. 孤立节点检测：与环路检测无关，需要单独遍历——
+    // 1. 拓扑排序（Kahn 算法），结果存入 topo_order_
+    // 2. 环路检测：topo_order_.size() != nodes_.size() 说明图中存在环，报错
+    // 3. 孤立节点检测：与环路检测无关，需要单独遍历——
     //    检查每个节点是否既不是任何 Edge 的 src_node，也不是任何 Edge 的 dst_node，
     //    这种节点入度、出度均为 0，会被 Kahn 算法正常排进 topo_order_，
     //    不会被环路检测捕获，必须单独检查并返回 false
+    //
+    // 注：TemplateCaps 兼容性检查已在 link() 阶段逐条完成，build() 不再重复。
     bool build();
 
     // Ready 阶段：按拓扑顺序对每个节点依次执行三步
@@ -1066,7 +1068,11 @@ public:
     // 并 reset 已创建的 Edge Queue；返回 false 时 Pipeline::play() 不进入 RUNNING。
     bool ready();
 
+    // 访问拓扑排序结果
     const std::vector<BaseNode*>& topoOrder() const { return topo_order_; }
+
+    // flush 所有 Edge Queue（Pipeline::stop() 使用）
+    void flushAllQueues();
 
 private:
     std::vector<std::unique_ptr<BaseNode>>  nodes_;
@@ -1074,7 +1080,7 @@ private:
     std::vector<BaseNode*>                  topo_order_;
 
     // 静态 Caps 检查：检查两端 TemplateCaps 是否有交集
-    bool checkCapsCompatibility(SrcPad* src, SinkPad* dst);
+    bool checkCapsCompatibility(const TemplateCaps& src, const TemplateCaps& dst);
 
     // 为此节点所有 SrcPad 对应的 Edge 创建 BoundedQueue（固定容量 8）
     // 注：调整到实际正确容量是各节点在 onStreamInfo() 里调用全局的
@@ -1383,8 +1389,7 @@ void Pipeline::stop() {
         node->stop_requested_.store(true);
 
     // 2. flush 所有 Edge Queue，唤醒阻塞中的节点线程
-    for (auto& edge : graph_.edges())
-        edge->queue->flush();
+    graph_.flushAllQueues();
 
     // 3. join 所有节点线程（节点线程退出前做数据层面收尾）
     for (auto& [node, thread] : threads_)

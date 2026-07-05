@@ -46,9 +46,11 @@ public:
     // 步骤3：node->onStreamInfo()
     bool ready();
 
-    // 访问
+    // 访问拓扑排序结果
     const std::vector<BaseNode*>& topoOrder() const { return topo_order_; }
-    const std::vector<std::unique_ptr<Edge>>& edges() const { return edges_; }
+
+    // flush 所有 Edge Queue（Pipeline::stop 使用）
+    void flushAllQueues();
 
 private:
     // 为此节点所有 SrcPad 对应的 Edge 创建 BoundedQueue（容量 8）

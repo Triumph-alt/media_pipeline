@@ -185,9 +185,9 @@ Ready 阶段发生在线程启动前，但节点已经可能在 `onReady()` / `o
 
 节点的 `onStop()` 因此必须支持部分初始化状态：既可能在正常 stop 后调用，也可能在 Ready 失败回滚时调用。
 
-### V2.68 文档同步
+### V2.70 文档同步
 
-`Media_Pipeline_Framework_V2.68.md` 用于记录当前代码对应的设计版本。本轮同步了已实现代码与文档的差异：
+`Media_Pipeline_Framework_V2.70.md` 用于记录当前代码对应的设计版本。本轮同步了已实现代码与文档的差异：
 - `stop_requested_` 原子化及示例中的 `.load()` / `.store(true)`
 - `Graph::ready()` Ready 失败回滚语义
 - `onStop()` 支持 Ready 回滚和部分初始化状态
@@ -280,6 +280,6 @@ Ready 期间 postMessage(EOS) 视为节点作者违约（Sink 线程尚未启动
 
 ### 文档同步
 
-- `Media_Pipeline_Framework_V2.68.md` §14 文件结构更新：五个节点基类统一在 `BaseNode.h`，`AVDemuxNode.h` / `AVMuxNode.h` 在 `nodes/` 下。
+- `Media_Pipeline_Framework.md` §14 文件结构更新：五个节点基类统一在 `BaseNode.h`，`AVDemuxNode.h` / `AVMuxNode.h` 在 `nodes/` 下。
 - §5.5 / §5.6 增加说明：示例代码为 `AVDemuxNode` / `AVMuxNode` 的 FFmpeg 实现参考，基类定义见 `BaseNode.h`。
 

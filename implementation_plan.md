@@ -150,21 +150,21 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 
 ## 第二阶段：核心框架实现
 
-**目标**：按照 V2 设计文档，实现完整的框架骨架。此阶段完成后框架可接入具体节点。
+**目标**：按照设计文档，实现完整的框架骨架。此阶段完成后框架可接入具体节点。
 
-**设计依据**：`Media_Pipeline_Framework_V2.md`
+**设计依据**：`Media_Pipeline_Framework.md`
 
 ### 任务
 
 | 模块 | 关键内容 |
 |------|---------|
-| 基础类型 | MediaType 5 枚举、TemplateCaps、CapsEvent、Event variant、NodeType、NodeState、PipelineState |
+| 基础类型 | MediaType 5 枚举、TemplateCaps、CapsEvent、Event variant、NodeType、PipelineState |
 | Buffer + BufferRef | 原子引用计数、RAII 包装、fromAVPacket/fromAVFrame、clone 深拷贝 |
 | BoundedQueue | 阻塞/非阻塞 push/pop、flush、外部 notify 回调 |
 | Edge | 每条边持有独立 BoundedQueue，根据 TemplateCaps 选择容量 |
 | Pad | 纯接口，通过 Edge 间接访问 Queue |
 | BaseNode 体系 | BaseNode + SourceNode + TransformNode + SinkNode + DemuxNode + MuxNode 基类 |
-| Graph | 邻接表、link（含 DemuxNode 懒连接）、build（静态检查 + 拓扑排序）、ready（三步穿插） |
+| Graph | 邻接表、link（requestPad 动态 Pad + TemplateCaps 检查）、build（拓扑排序 + 环路/孤立节点检测）、ready（三步穿插） |
 | Pipeline | 持有 Graph/Clock/MessageBus，build → play → stop → waitEOS，统管线程 |
 | MessageBus | post + waitMessage |
 | Clock | setAudioPosition 绝对位置 + 墙钟插值 |
