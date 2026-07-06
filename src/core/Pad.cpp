@@ -38,7 +38,7 @@ std::optional<QueueItem> SinkPad::tryPop() {
     return std::nullopt;
 }
 
-std::optional<QueueItem> SinkPad::peek() {
+std::optional<QueueItem> SinkPad::peek() const {
     if (edge_ && edge_->queue) {
         return edge_->queue->peek();
     }

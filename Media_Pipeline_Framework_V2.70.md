@@ -412,7 +412,7 @@ public:
     std::optional<QueueItem> tryPop();
 
     // 查看队首但不取出（MuxNode 选最小 DTS 时使用）
-    std::optional<QueueItem> peek();
+    std::optional<QueueItem> peek() const;
 };
 ```
 
@@ -616,6 +616,8 @@ protected:
 ```
 
 ### 5.4 TransformNode
+
+TransformNode 基类不自动创建 SinkPad；具体 Transform 子类必须在构造函数中声明唯一 SinkPad（通常命名为 `"in"`），并给出自己的输入 TemplateCaps。`runLoop()` 以 `sink_pads_[0]` 作为驱动输入。
 
 ```cpp
 class TransformNode : public BaseNode {
@@ -1391,7 +1393,7 @@ void Pipeline::stop() {
     // 2. flush 所有 Edge Queue，唤醒阻塞中的节点线程
     graph_.flushAllQueues();
 
-    // 3. join 所有节点线程（节点线程退出前做数据层面收尾）
+    // 3. join 所有节点线程（join 遍历顺序不承诺；线程退出已由 stop_requested_ + queue flush 触发）
     for (auto& [node, thread] : threads_)
         if (thread.joinable()) thread.join();
 
@@ -1471,7 +1473,7 @@ void Pipeline::messageBusLoop() {
 **停止顺序**（stop）：
 1. 所有节点 `stop_requested_.store(true)`
 2. flush 所有 Edge Queue
-3. join 所有节点线程（按启动顺序依次退出）
+3. join 所有节点线程（join 遍历顺序不承诺；线程退出已由 `stop_requested_` + queue flush 触发）
 4. 停止 MessageBus 监听线程
 5. 按拓扑逆序调用 onStop()
 

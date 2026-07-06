@@ -103,7 +103,7 @@ public:
     std::optional<QueueItem> tryPop();
 
     // 查看队首但不取出（MuxNode 选最小 DTS 时使用）
-    std::optional<QueueItem> peek();
+    std::optional<QueueItem> peek() const;
 };
 
 } // namespace pipeline

@@ -430,17 +430,15 @@ SinkPad* MuxNode::selectMinDtsPad() {
             continue;
         }
 
-        if (std::holds_alternative<BufferRef>(*top)) {
-            int64_t dts = std::get<BufferRef>(*top)->dts;
-            if (dts < min_dts) {
-                min_dts = dts;
-                min_pad = pad.get();
-            }
-        } else {
+        if (std::holds_alternative<Event>(*top)) {
             // Event（EOS 等）优先处理，不参与 DTS 比较
-            if (!min_pad) {
-                min_pad = pad.get();
-            }
+            return pad.get();
+        }
+
+        int64_t dts = std::get<BufferRef>(*top)->dts;
+        if (dts < min_dts) {
+            min_dts = dts;
+            min_pad = pad.get();
         }
     }
 
