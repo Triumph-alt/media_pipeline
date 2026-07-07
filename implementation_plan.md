@@ -203,7 +203,7 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 
 | 节点 | 关键内容 |
 |------|---------|
-| DemuxNode | 懒连接、av_read_frame、时间戳转微秒、多路分发、EOF 发 EOS |
+| DemuxNode | av_read_frame、时间戳转微秒、多路分发、EOF 发 EOS |
 | DecodeNode | onStreamInfo 打开解码器（输出参数从 ctx 读取，不透传输入）、send/receive、EOS flush |
 | VideoRenderNode | onStreamInfo 初始化 SDL、A/V 同步（超前 100ms sleep / 落后 50ms 丢帧）、sws_scale |
 | AudioPlayNode | onStreamInfo 初始化 SDL 音频、swr_convert、推进 Clock |

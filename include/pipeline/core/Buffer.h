@@ -22,10 +22,8 @@ namespace pipeline {
 
 // ===================================================================
 // BufferMeta: Buffer 的逐帧格式元信息（按数据类型分三种）
-//
-// 当前阶段与 CapsEvent 信息重复（下游节点在 onStreamInfo 阶段已拿到格式），
-// 保留此字段是为了后续支持运行时格式变化（STREAM_INFO_CHANGED），
-// 届时逐帧携带格式信息可处理同一流中途切换分辨率/采样率等场景。
+// 部分基础格式字段与 CapsEvent 重复，但也携带 packet/frame 级属性
+// 同时此字段也为后续运行时格式变化（STREAM_INFO_CHANGED）准备
 // ===================================================================
 struct VideoRawMeta {
     int width, height;
