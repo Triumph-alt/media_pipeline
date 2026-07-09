@@ -104,6 +104,11 @@ void BoundedQueue::flush() {
     }
     not_empty_.notify_all();
     not_full_.notify_all();
+
+    // 唤醒通过 setExternalNotify 注册的外部等待者（如 MuxNode 的 mux_cv_）。
+    // external_notify_ 回调内部可能加其他锁（如 mux_mutex_），必须在
+    // 释放本 Queue 的 mutex_ 之后调用，避免嵌套锁导致死锁。
+    if (external_notify_) external_notify_();
 }
 
 // ===================================================================

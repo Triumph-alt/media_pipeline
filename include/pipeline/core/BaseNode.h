@@ -149,8 +149,7 @@ protected:
     // 子类实现：阻塞采集一帧数据，返回 nullptr 表示 EOF
     virtual Buffer* capture() = 0;
 
-    // 支持分叉：用户连接第二路下游时，Graph::link 找不到已有 SrcPad，调用此方法
-    // 新 Pad 的类型必须与已有 SrcPad 一致
+    // 支持分叉：新 Pad 的类型必须与已有 SrcPad 一致
     SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override {
         if (!src_pads_.empty() &&
             src_pads_[0]->templateCaps().supported_types[0] != hint_type) {

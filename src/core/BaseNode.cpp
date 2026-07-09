@@ -386,7 +386,10 @@ void MuxNode::runLoop() {
             if (std::holds_alternative<EOSEvent>(event)) {
                 eos_pads_.insert(ready_pad->name());
                 if (eos_pads_.size() == sink_pads_.size()) {
-                    writeTrailer();
+                    if (!writeTrailer()) {
+                        postMessage(MessageType::ERROR, "MuxNode: writeTrailer failed");
+                        break;
+                    }
                     sendEOSDownstream();
                     break;
                 }

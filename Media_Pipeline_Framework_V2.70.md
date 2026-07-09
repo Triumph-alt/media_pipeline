@@ -552,8 +552,7 @@ protected:
 };
 ```
 
-需要注意的是：
-1. 用户可能对同一路输出再连一个下游，比如采集画面一路直接本地预览，一路拿来编码，所以 SourceNode 的 requestSrcPad 需要重写，需要支持分叉，Graph::link 发现目标 SrcPad 不存在，会调用这里创建
+需要注意的是用户可能对同一路输出连接多个下游，比如采集到的画面可以一路直接本地预览，一路编码之后传输，甚至可以有别的路用来作别的格式的编码或者其他的处理，**所以 SourceNode 的 requestSrcPad 需要重写，需要支持分叉**，如果`Graph::link` 发现目标 SrcPad 不存在，会调用这里创建
 
 
 ### 5.3 SinkNode
@@ -1084,7 +1083,7 @@ bool Graph::build() {
         connected.insert(edge->dst_node);
     }
     for (auto& node : nodes_) {
-        if (!connected.count(node.get())) {
+        if (!connected.count(node.get())) { // O(V) 一次查表
             return false;
         }
     }
@@ -1092,7 +1091,8 @@ bool Graph::build() {
 }
 ```
 
-**TemplateCaps 兼容性检查已在 `link()` 阶段逐条完成，`build()` 不再重复**
++ **TemplateCaps 兼容性检查已在 `link()` 阶段逐条完成，`build()` 不再重复**
++ Kahn 拓扑排序主循环里当前实现整体O(V×E)，若要降到O(V+E)需要在 Graph 里额外维护邻接表，反而会造成一定的数据冗余。考虑到本项目中 V×E 的实际开销极低，所以当前实现不引入邻接表优化
 
 ### 6.4 Ready 流程
 
@@ -1879,6 +1879,7 @@ Pipeline::waitEOS
 
 5. AV Sync 目前只采用固定阈值：视频超前 100ms sleep，落后 50ms 丢帧。后续需要根据实际播放延迟、队列积压、音频缓冲等情况动态调整，避免不同文件和设备上同步策略过于僵硬
 
+6. `Clock::setAudioPosition` 分两次 store `audio_base_pts_us_` 和 `audio_base_wall_us_`，`getPositionUs` 分两次 load，理论上可能读到 (新 pts, 旧 wall) 或 (旧 pts, 新 wall) 的组合，导致 elapsed 计算漂几毫秒。在当前 100ms / 50ms 的固定阈值下这几毫秒完全可以忽略，后续再看看处不处理
 
 ---
 

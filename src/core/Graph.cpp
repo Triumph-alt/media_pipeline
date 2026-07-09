@@ -29,10 +29,16 @@ bool Graph::link(BaseNode* src, const std::string& src_pad_name,
     // 1. 查找或请求 SrcPad
     SrcPad* src_pad = src->getSrcPad(src_pad_name);
     if (src_pad) {
-        if (src_pad->isConnected()) return false;  // 已被占用
+        if (src_pad->isConnected()) {
+            // src_pad 已被占用
+            return false;
+        }
     } else {
         src_pad = src->requestSrcPad(src_pad_name, hint_type);
-        if (!src_pad) return false;  // 节点拒绝创建
+        if (!src_pad) {
+            // 节点拒绝创建
+            return false;
+        }
     }
 
     // 2. 查找或请求 SinkPad
@@ -62,7 +68,7 @@ bool Graph::link(BaseNode* src, const std::string& src_pad_name,
 // build: Build 阶段完整校验
 // ===================================================================
 bool Graph::build() {
-    // 1. 拓扑排序（Kahn 算法）
+    // 拓扑排序（Kahn 算法）
     std::unordered_map<BaseNode*, int> in_degree;
     for (auto& node : nodes_) in_degree[node.get()] = 0;
 
@@ -90,20 +96,20 @@ bool Graph::build() {
         }
     }
 
-    // 2. 环路检测：topo 排序结果数量 != 节点数量 → 有环
+    // 环路检测，如果 topo 排序结果数量不等于节点数量，就说明有环
     if (topo_order_.size() != nodes_.size()) {
         return false;
     }
 
-    // 3. 孤立节点检测：单独遍历，不能依赖上面的环路检测结果
-    //    孤立节点入度=0、出度=0，会被 Kahn 算法正常排入 topo_order_，
-    //    不会触发 topo_order_.size() != nodes_.size()
-    //    用 set 一次性收集所有参与过边的节点，总体 O(V+E)
+    // 孤立节点入度=0、出度=0，会被正常排入 topo_order_
+    // 所以需要单独遍历，不能依赖上面的环路检测结果
     std::unordered_set<BaseNode*> connected;
+    // O(E) 一次遍历收集
     for (auto& edge : edges_) {
         connected.insert(edge->src_node);
         connected.insert(edge->dst_node);
     }
+    // O(V) 一次查表
     for (auto& node : nodes_) {
         if (!connected.count(node.get())) {
             return false;
