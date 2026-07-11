@@ -33,12 +33,23 @@ namespace pipeline {
 struct TemplateCaps {
     std::vector<MediaType> supported_types;
 
+    // 检查 TemplateCaps 是否有交集
     bool isCompatibleWith(const TemplateCaps& other) const {
         for (auto t : supported_types) {
             for (auto o : other.supported_types) {
                 if (t == o) {
                     return true;
                 }
+            }
+        }
+        return false;
+    }
+
+    // 检验某具体类型是否属于本能力集合
+    bool contains(MediaType t) const {
+        for (auto x : supported_types) {
+            if (x == t) {
+                return true;
             }
         }
         return false;

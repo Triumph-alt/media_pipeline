@@ -217,6 +217,12 @@ struct TemplateCaps {
                 if (t == o) return true;
         return false;
     }
+
+    bool contains(MediaType t) const {
+        for (auto s : supported_types)
+            if (s == t) return true;
+        return false;
+    }
 };
 
 // 动态参数事件：携带运行时确定的真实参数
@@ -236,6 +242,9 @@ struct CapsEvent {
     std::vector<uint8_t> extradata;   // SPS/PPS 等
 };
 ```
+
++ isCompatibleWith 函数检验两端 TemplateCaps 是否有交集，Graph::link 阶段使用
++ contains 函数检验某具体类型是否属于本能力集合，主要是 requestPad 里做"hint_type 是否落在已有 pad 能力集合内"的分叉检查，以及 send/receiveCapsEvent 里做"CapsEvent.media_type 是否落在 pad 能力集合内"的校验
 
 ### 3.3 Event（事件）
 
@@ -355,6 +364,13 @@ size_t selectQueueCapacity(MediaType type);
 
 ### 4.1 Pad 基类
 
+Pad 承载两层类型信息：
+
+- **`template_caps_`（TemplateCaps，能力集合，静态）**：构造 / requestPad 时确立，声明"本 pad 可承载的 MediaType 集合"。Build 阶段 `Graph::link` 用它做粗粒度的交集兼容性检查。
+- **`actual_type_`（optional<MediaType>，实际类型，动态）**：Ready 阶段 CapsEvent 流经 pad 时由 `BaseNode::sendCapsEvent` / `receiveCapsEvent` 内部设置，代表本 pad 实际承载的具体类型。Ready 之前查询得 `nullopt` 是契约的一部分；Ready 之后所有已连接 pad 的 `actualType()` 必有值。
+
+两者严格分层：`template_caps_` 是能力声明，`actual_type_` 是运行时事实。runLoop 阶段的类型分发一律读 `actualType()`，绝不把能力集合的其中某一个成员单独作为"实际类型"来使用
+
 ```cpp
 enum class PadDir { SRC, SINK };
 
@@ -364,6 +380,9 @@ public:
     PadDir             dir()  const { return dir_; }
     BaseNode*          node() const { return node_; }
     TemplateCaps       templateCaps() const { return template_caps_; }
+
+    // 返回具体类型，当然在 Ready 被调用之前是返回 nullopt
+    std::optional<MediaType> actualType() const { return actual_type_; }
 
     bool isConnected() const { return edge_ != nullptr; }
     Edge* edge() const { return edge_; }
@@ -375,9 +394,20 @@ protected:
     TemplateCaps   template_caps_;
     Edge*          edge_ = nullptr;   // 连接到的 Edge（一对一）
 
-    friend class Graph;  // Graph 负责建立连接，设置 edge_
+    friend class Graph;  // Graph::link 里写 edge_
+
+private:
+    // actual_type 的唯一设值时机就是 BaseNode 的 send/receiveCapsEvent 内部，CapsEvent 流经 pad 且通过 TemplateCaps 校验时
+    // 其他任何路径（子类节点、Graph、requestPad 等）都不得直接设置
+    void setActualType(MediaType t) { actual_type_ = t; }
+
+    std::optional<MediaType> actual_type_;
+
+    friend class BaseNode;  // 仅为 send/receiveCapsEvent 授权设置 actual_type_
 };
 ```
+
+此处 `setActualType` 设计为 private + friend BaseNode，是因为 actual_type 的唯一合法写入路径就是 BaseNode 的 send/receiveCapsEvent，所以此处通过代码组织让契约在源码层面可见
 
 ### 4.2 SrcPad
 
@@ -462,13 +492,7 @@ protected:
     // === 基类统一的数据分发（子类调用，不感知下游数量）===
     void pushToDownstream(Buffer* buf, const std::string& src_pad_name = "");
 
-    // 向所有已连接 SrcPad 广播 EOS（阻塞 push，不允许丢失）
-    // EOS 是运行期流结束事件，所有下游都必须收到。
-    void sendEOSDownstream();
-
-    // 将 CapsEvent 发送给指定 SrcPad 的下游（阻塞 push，不允许丢失）
-    // CapsEvent 是 Ready / onStreamInfo 阶段的流级格式协商事件
-    void sendCapsEvent(const std::string& src_pad_name, const CapsEvent& caps);
+    // 向所有已连接 SrcPad 广播 EOS 运行期流结束事件，不允许丢失，阻塞 push
     // sendEOSDownstream 实现示意：
     // void BaseNode::sendEOSDownstream() {
     //     for (auto& pad : src_pads_) {
@@ -476,6 +500,13 @@ protected:
     //             pad->edge()->queue->pushBlocking(QueueItem{Event{EOSEvent{}}});
     //     }
     // }
+    void sendEOSDownstream();
+
+    // 将 CapsEvent 发送给指定 SrcPad 的下游，不允许丢失，阻塞 push
+    bool sendCapsEvent(const std::string& src_pad_name, const CapsEvent& caps);
+
+    // 从指定 SinkPad 阻塞取一个 CapsEvent，校验并落库
+    bool receiveCapsEvent(const std::string& sink_pad_name);
 
     // 动态创建 Pad（节点构造时声明固定 Pad 时调用，子类构造函数里直接调用）
     SrcPad*  addSrcPad(const std::string& name, TemplateCaps caps);
@@ -510,9 +541,15 @@ protected:
 2. 子类的 onReady 函数具体实现取决于自身需要，比如 Source/DemuxNode 就是打开设备/文件，探测流信息，但不发送 CapsEvent；Transform/SinkNode 只做基础初始化，因为此时尚未收到 CapsEvent，还无法确定具体的参数
 3. 子类的 onStreamInfo 函数具体实现也是取决于自身需要，比如 Source/DemuxNode 就是构造并发送 CapsEvent；Transform/SinkNode 收到上游 CapsEvent 后初始化处理器，再发出自己的 CapsEvent；默认实现返回 true；Sink 节点无需发送
 4. pushToDownstream 的阻塞策略取决于节点总 SrcPad 数量，1个 SrcPad 则 pushBlocking 背压传导）；多个 SrcPad 则 tryPush，各路互不阻塞。src_pad_name 为空时推给所有 SrcPad(SourceNode / TransformNode 场景)；src_pad_name 非空时只推给指定 SrcPad（DemuxNode 按流类型分发场景）
-5. pushToDownstream 函数所有权约定：**调用者交出 buf 的所有权**（buf 的 ref_count 应为 1 且未被其他 BufferRef 持有），函数入口即用 BufferRef 接管，内部 RAII 全程负责 unref：单路传播将 primary move 进 QueueItem 后由队列持有；多路广播则是 primary 全程持有原 buf，各路各自 primary.clone() 深拷贝分发。所以调用者不需要（也不能）再手动 unref
-6. sendCapsEvent 函数中，每个 SrcPad 的 CapsEvent 可以不同，因此必须显式指定 src_pad_name，该函数只负责发送，不存储，**接收方需要在 onStreamInfo() 里自行存入 negotiated_caps_**
-7. 动态请求 Pad 只在 link 时，目标 Pad 不存在时调用，节点构造时已声明的固定 Pad（比如 TransformNode 的 "in"）不走这条路，link 会优先查找已存在的 Pad，只有当 Pad 不存在时，才调用这两个方法，由节点自己决定是否允许动态创建、以及创建出来的 Pad 应该是什么类型。**需要支持分叉的节点（Source/Transform 的多路输出）和多路输入的节点（DemuxNode 的多路输出、MuxNode 的多路输入）一定需要重写对应的方法**
+5. pushToDownstream 函数所有权约定：**调用者交出 buf 的所有权**（buf 的 ref_count 应为 1 且未被其他 BufferRef 持有），函数入口即用 BufferRef 接管，内部 RAII 全程负责 unref：单路传播将 primary move 进 QueueItem 后由队列持有；多路广播则是 primary 全程持有原 buf，各路各自 primary.clone() 深拷贝分发，所以调用者不需要也不能再手动 unref
+6. `sendCapsEvent` 与 `receiveCapsEvent` 是 Ready 阶段 CapsEvent 收发的标准封装，两者对称承担同一件事：**校验 CapsEvent.media_type 是否在 Pad 的 TemplateCaps 集合内**，如果在则 setActualType 并 push/store；不在则 postMessage(ERROR) 返回 false。校验失败时不 setActualType、不 push、不写 negotiated_caps_，pad 状态保持"未协商"，调用方（onStreamInfo）应把 false 传出去触发 Ready 回滚。此处是 `Pad::setActualType` 的**唯一合法调用点**
+    + 每个 SrcPad 的 CapsEvent 可以不同，`sendCapsEvent` 必须显式指定 src_pad_name；且函数**只负责发送，不存储**，接收方在自己的 onStreamInfo 里通过 `receiveCapsEvent` 存入 `negotiated_caps_`
+    + `sendCapsEvent` 失败场景一般就是 src_pad_name 找不到或者未连接（调用方违约）、caps.media_type 不属于 SrcPad.templateCaps（节点作者违约）
+    + `receiveCapsEvent` 失败场景一般就是 sink_pad_name 找不到或者未连接、Queue popBlocking 返回 nullopt（Ready 期间被外部 flush，属异常）、取到的不是 Event（是 BufferRef，视为上游 CapsEvent 未先行发送）、取到 Event 但不是 CapsEvent（视为上游误发 EOS 等）、caps.media_type 不属于 SinkPad.templateCaps
+7. 动态请求 Pad 只在 link 时，目标 Pad 不存在时调用，节点构造时已声明的固定 Pad（比如 TransformNode 的 "in"）不走这条路，link 会优先查找已存在的 Pad，只有当 Pad 不存在时，才调用这两个方法，由节点自己决定是否允许动态创建、创建出来的 Pad 应该是什么类型。**需要支持分叉的节点（Source/Transform 的多路输出）和多路输入的节点（DemuxNode、MuxNode）一定需要重写对应的方法**。requestPad 有两种不同的语义模型，各自对应不同的 TemplateCaps 处理方式：
+    + Source / Transform 分叉：属于再多一路同源输出，新 pad 的 TemplateCaps 必须和已经存在的 pad 的 TemplateCaps 一致，其最终的 ActualType 自然也落在已有 pad 的能力集合内，因为这种情况本质是同一份处理结果的多路拷贝，所以一个 SourceNode/TransformNode 内所有 SrcPad 的能力声明应当一致，所有 SinkPad 的能力声明应当一致
+    + Demux / Mux 多路：属于开一路服务 hint_type 的具体流端口，新 pad 的 TemplateCaps 就是 `{hint_type}`，一个 pad 服务一种流身份。因为在 Demux/Mux 这种节点中，每个 SinkPad 对应容器里一路流，各 pad 天然可能会承载不同类型
+8. requestPad 中的 hint_type **只用于 Ready 之前的能力校验与决定新 pad 的 TemplateCaps，不代表"实际类型 actual_type"**。实际类型由 Ready 阶段的 CapsEvent 敲定，requestPad 不应调用 `setActualType` 直接设置 actual_type，哪怕传入的 hint_type 和事后敲定的最终类型一致
 
 
 ### 5.2 SourceNode
@@ -543,16 +580,21 @@ protected:
 
     // 需要重写，需要支持分叉
     SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override {
-        if (!src_pads_.empty() &&
-            src_pads_[0]->templateCaps().supported_types[0] != hint_type) {
-            return nullptr;
+        if (!src_pads_.empty()) {
+            const auto& existing = src_pads_[0]->templateCaps();
+            if (!existing.contains(hint_type)) {
+                return nullptr;
+            }
+            return addSrcPad(name, existing);   // 复制完整能力集合
         }
+        // 首个 pad：从 hint_type 建立最初的能力集合
         return addSrcPad(name, TemplateCaps{{hint_type}});
     }
 };
 ```
 
 需要注意的是用户可能对同一路输出连接多个下游，比如采集到的画面可以一路直接本地预览，一路编码之后传输，甚至可以有别的路用来作别的格式的编码或者其他的处理，**所以 SourceNode 的 requestSrcPad 需要重写，需要支持分叉**，如果`Graph::link` 发现目标 SrcPad 不存在，会调用这里创建
+在 SourceNode 下，新 SrcPad 是已有 SrcPad 的同源多路拷贝，所以能力集合必须和已有 pad 的保持一致，hint_type 只用于校验"这次 link 想承载的类型是否在已有能力集合内"，不参与 TemplateCaps 的构造
 
 
 ### 5.3 SinkNode
@@ -638,18 +680,21 @@ protected:
                     "CapsEvent received in runLoop; transform nodes must consume CapsEvent in onStreamInfo");
     }
 
-    // 支持分叉：比如 EncodeNode 编码后一路推流一路本地存储。
-    // 新 Pad 的类型必须与已有 SrcPad 一致（同一份处理结果的多路拷贝），
-    // 类型不一致则拒绝创建。
+    // 支持分叉，需要重写函数
     SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override {
-        if (!src_pads_.empty() &&
-            src_pads_[0]->templateCaps().supported_types[0] != hint_type) {
-            return nullptr;
+        if (!src_pads_.empty()) {
+            const auto& existing = src_pads_[0]->templateCaps();
+            if (!existing.contains(hint_type)) {
+                return nullptr;
+            }
+            return addSrcPad(name, existing);   // 复制完整能力集合
         }
         return addSrcPad(name, TemplateCaps{{hint_type}});
     }
 };
 ```
+
+在 TransformNode 下，requestSrcPad 也要支持分叉，比如编码后用户完全可以一路推流，一路本地存储，语义与 SourceNode 的 requestSrcPad 是基本一致的，新 SrcPad 是已有 SrcPad 的同源多路拷贝，能力集合必须一致，`hint_type` 只是用于校验"这次 link 想承载的类型是否在已有能力集合内"
 
 ### 5.5 DemuxNode
 
@@ -658,6 +703,13 @@ protected:
 > 本节代码示例展示的是**基于 FFmpeg 的具体实现 `AVDemuxNode`** 的参考写法，继承 `DemuxNode` 并实现 `openInput` / `closeInput` / `probeStreams` / `readFrame` 四个钩子即可。
 
 DemuxNode 在 `link()` 时立刻创建 SrcPad（类型由 `hint_type` 决定），和其他节点的处理方式一致。`onReady()` 阶段打开文件后，对照已经创建好的 Pad 校验文件里是否存在对应的流，找不到则直接报错退出。
+
+**DemuxNode 内部的三层类型状态**：
+- `pad_to_type_[pad_name] -> MediaType`：表示 Ready 前的期望，requestSrcPad 时由 hint_type 记录，onReady 阶段用它遍历 pad 校验"文件里对应类型的流存在"，onStreamInfo 阶段用它找 stream_index 并调用 sendCapsEvent
+- `pad->templateCaps()`：表示静态的能力集合，requestSrcPad 里就是 `{hint_type}`，Demux 的 pad 是"具体化"语义，一个 pad 只服务一种类型
+- `pad->actualType()`：表示运行时承载的数据类型，sendCapsEvent 在 CapsEvent 通过 TemplateCaps 校验时设定，runLoop 阶段的分发判断一律用 `actualType()`
+
+三者在 DemuxNode 的正确实现下最终指向同一个 MediaType，但概念时序分开，从用户期望，到能力声明，再到运行时实际，互不越权
 
 ```cpp
 class DemuxNode : public BaseNode {
@@ -693,8 +745,7 @@ protected:
         int audio_idx = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
 
         // 3. 校验：已创建的 Pad 对应的类型，文件里是否真的存在
-        //    用户连了视频 Pad 但文件没有视频流 → 报错
-        //    用户连了音频 Pad 但文件没有音频流 → 报错
+        //    用户连了视频 Pad 但文件没有视频流则报错，用户连了音频 Pad 但文件没有音频流也报错
         //    同一类型可以有多个下游（分叉时各自建的 Pad），对应同一路流分发多次
         bool user_wants_video = false;
         bool user_wants_audio = false;
@@ -741,12 +792,16 @@ protected:
 
     // Graph::ready() 在建完 Queue 后调用，此时 Queue 已存在可以写入
     bool onStreamInfo() override {
-        // 向每个已创建的 SrcPad 发送对应类型的 CapsEvent（同一路流，多路下游各发一份）
-        // 先 resize 到正确容量，再发 CapsEvent
+        // 向每个已创建的 SrcPad 发送对应类型的 CapsEvent，同一路流，多路下游各发一份
+        // sendCapsEvent 内部校验 caps.media_type ∈ SrcPad.templateCaps，通过后为 SrcPad setActualType
         for (auto& [pad_name, type] : pad_to_type_) {
             SrcPad* pad = getSrcPad(pad_name);
+            // 先 resize 到正确容量，再发 CapsEvent
             pad->edge()->queue->resize(selectQueueCapacity(type));
-            sendCapsEvent(pad_name, type == MediaType::VIDEO_ENCODED ? video_caps_ : audio_caps_);
+            const CapsEvent& caps = (type == MediaType::VIDEO_ENCODED) ? video_caps_ : audio_caps_;
+            if (!sendCapsEvent(pad_name, caps)) {
+                return false;   // sendCapsEvent 已 postMessage(ERROR)，触发 Ready 回滚
+            }
         }
         return true;
     }
@@ -775,20 +830,16 @@ protected:
                                                st->time_base,
                                                st->codecpar->codec_id);
 
-            // 往所有对应类型的 SrcPad 分发（分叉时一路流对应多个 Pad）
-            // 每个 pad 各自 clone 一份，tryPush，满了丢弃（第一阶段简易策略）
-            bool first = true;
-            for (auto& [pad_name, type] : pad_to_type_) {
-                if (type == media_type) {
-                    Buffer* to_push = first ? buf : buf->clone();
-                    first = false;
-                    SrcPad* pad = getSrcPad(pad_name);
-                    if (!pad->tryPush(QueueItem(BufferRef(to_push))))
-                        to_push->unref();
-                }
+            BufferRef primary(buf);   // RAII 接管，从这一行起 buf 只由 primary 拥有
+
+            // 按 media_type 分发到所有匹配的已连接 SrcPad，判断 pad 是否要收此帧一律用 pad->actualType()
+            // 每路独立 clone 深拷贝，非阻塞 tryPush，满则丢弃该路副本。primary 始终持有原 buf，循环结束析构统一 unref。
+            for (auto& pad : src_pads_) {
+                if (!pad->isConnected()) continue;
+                auto actual = pad->actualType();
+                if (!actual || *actual != media_type) continue;
+                pad->tryPush(QueueItem{primary.clone()});
             }
-            // 如果 first 仍为 true，说明没有匹配的 pad，buf 未被使用
-            if (first) buf->unref();
 
             av_packet_unref(pkt);
         }
@@ -817,7 +868,7 @@ private:
 > 
 > 本节代码示例展示的是**基于 FFmpeg 的具体实现 `AVMuxNode`** 的参考写法，继承 `MuxNode` 并实现 `allocateContext` / `addStream` / `writeHeader` / `writePacket` / `writeTrailer` / `closeContext` 六个钩子即可。
 
-MuxNode 有多个 SinkPad，runLoop 使用多路复用监听：任意一路有数据就取，全部为空才阻塞。
+MuxNode 有多个 SinkPad，requestSinkPad 采用"具体化"语义（每个 pad 服务一种流类型，TemplateCaps = `{hint_type}`）。onStreamInfo 阶段通过 `receiveCapsEvent` 从每个 SinkPad 收取 CapsEvent（内部完成"能力校验 + setActualType + 存入 negotiated_caps_"），然后初始化输出容器；runLoop 使用多路复用监听：任意一路有数据就取，全部为空才阻塞。
 
 ```cpp
 class MuxNode : public BaseNode {
@@ -852,15 +903,13 @@ protected:
         }
 
         for (auto& pad : sink_pads_) {
-            // 从 Queue 中取出 CapsEvent（上游的 onStreamInfo 已推入）
-            auto item = pad->popBlocking();
-            if (!item || !std::holds_alternative<Event>(*item)) continue;
-            auto& event = std::get<Event>(*item);
-            if (!std::holds_alternative<CapsEvent>(event)) continue;
-            const CapsEvent& caps = std::get<CapsEvent>(event);
+            if (!pad->isConnected()) continue;
 
-            // 存储收到的 CapsEvent
-            negotiated_caps_[pad->name()] = caps;
+            // receiveCapsEvent 内部完成 popBlocking 加校验（Event / CapsEvent / caps.media_type ∈ SinkPad.templateCaps），然后setActualType，最后存入 negotiated_caps_[pad->name()]
+            // 若失败已 postMessage(ERROR)，调用方直接返回 false 触发 Ready 回滚
+            if (!receiveCapsEvent(pad->name())) return false;
+
+            const CapsEvent& caps = negotiated_caps_[pad->name()];
 
             // 用 CapsEvent 初始化输出流
             AVStream* st = avformat_new_stream(fmt_ctx_, nullptr);
@@ -1060,6 +1109,12 @@ private:
 节点构造时声明的固定 Pad（如 TransformNode 唯一的 SinkPad "in"）在首次 `link()` 时直接命中，不触发 `request*Pad`；只有分叉场景或 DemuxNode/MuxNode 的多路 Pad 才会真正调用到。
 
 目标 Pad 已被占用、节点拒绝创建（requestPad 返回 nullptr）或两端 TemplateCaps 无交集，这三种情况均返回 false 表示失败
+
+**hint_type 的作用范围**：hint_type 只用于两个位置：
+(a) 目标 Pad 不存在时传给 `requestPad`，让节点决定是否创建、以及新 pad 的 TemplateCaps 长什么样；
+(b) 无。对固定 Pad 命中的场景，Graph::link **只做两端 TemplateCaps 交集，不会额外用 hint_type 做校验**。因此 hint_type **不等价于"这条 edge 的最终 selected type"**，也不代表"实际类型 actual_type"，真正的类型由 Ready 阶段的 CapsEvent 敲定
+
+举例：`src.TemplateCaps = {VIDEO_RAW, AUDIO_RAW}`、`sink.TemplateCaps = {VIDEO_RAW}`，用户 `link(..., hint_type=AUDIO_RAW)`。Graph 只看交集非空就允许连接；但如果上游 Ready 阶段真的发 AUDIO_RAW CapsEvent，`receiveCapsEvent` 会因 `AUDIO_RAW ∉ sink.TemplateCaps` 而失败，Ready 回滚。这就是静态粗粒度和动态精确分层设计所要接受的代价，错误会从 Build 推迟到 Ready 抓，但依然抓得住，未来若希望 Build 阶段就拦下这类错误，可以选择优化
 
 ### 6.3 build 流程
 
@@ -1466,6 +1521,20 @@ FileSinkNode / RTSPPushNode
      VideoRenderNode.in (VIDEO_RAW)"
 ```
 
+**Pad 的两层类型信息**：
+
+| 层次 | 存储 | 生效时机 | 用途 |
+|-----|-----|--------|-----|
+| 能力集合 | `Pad::template_caps_`（TemplateCaps） | 构造 / requestPad 时确立 | Build 阶段 `Graph::link` 的粗粒度兼容性检查、Ready 阶段 send/receiveCapsEvent 的精确校验 |
+| 实际类型 | `Pad::actual_type_`（optional<MediaType>） | Ready 阶段 CapsEvent 流经 pad 时 | Ready 阶段完成后 runLoop 里的类型分发判断（如 DemuxNode 按 media_type 分发） |
+
+分层规则：
+1. `actual_type` 的**唯一设值时机 = Ready 阶段 send/receiveCapsEvent 中 CapsEvent 流经时**（`setActualType` 是 Pad 的 private 方法 + friend BaseNode 授权）
+2. Ready 之前 `pad->actualType()` 一律返回 `nullopt`，是契约的一部分，任何代码不得依赖"Ready 前 actualType 有值"
+3. Ready 之后所有**已连接**的 pad 的 `actualType()` 必有值；如果 Ready 走完某个 pad 依然是 nullopt，说明该 pad 未连接或该 pad 从未收/发过 CapsEvent，视为节点作者违约
+4. runLoop 阶段的类型判断**只查 `actualType()`**，绝对不能从 TemplateCaps 里取某个元素当实际类型用
+5. **requestPad 里不调 `setActualType`**
+
 ### 8.2 第二阶段：动态协商（Ready 时）
 
 Ready 阶段的 CapsEvent 传递按拓扑顺序逐节点完成。每个节点只在自己的 `onStreamInfo()` 中消费上游 CapsEvent、完成本节点初始化，并在需要时向下游发送新的 CapsEvent，顺流传递：
@@ -1494,16 +1563,23 @@ Ready 阶段的 CapsEvent 传递按拓扑顺序逐节点完成。每个节点只
 2. 用 width / height / pix_fmt 初始化 SDL 窗口和纹理
 3. 它没有下游，没有 SrcPad，不需要构造输出 CapsEvent
 
+**BaseNode 的两个 CapsEvent helper**：
+- `bool sendCapsEvent(src_pad_name, caps)`：**校验 caps.media_type ∈ SrcPad.templateCaps → setActualType → pushBlocking**。校验失败时 postMessage(ERROR) 并返回 false，此时不 setActualType、不 push。
+- `bool receiveCapsEvent(sink_pad_name)`：**popBlocking → 校验取到的是 Event 且是 CapsEvent → 校验 caps.media_type ∈ SinkPad.templateCaps → setActualType → 存入 negotiated_caps_**。任一步失败 postMessage(ERROR) 并返回 false。
+
+两个 helper 对称、返回 bool。**上游节点的 onStreamInfo 里凡是需要发/收 CapsEvent 的位置一律通过它们**（不要绕开自己 popBlocking 手写"取 + 校验"），保证：
+- Pad 的 actual_type 在唯一路径下被设置
+- CapsEvent 与 Pad 能力集合的匹配错误一律在 Ready 阶段抓住
+- helper 返回 false 时 `onStreamInfo` 直接把 false 传出去触发 Ready 事务性回滚，`lastError()` 可查
+
 DecodeNode::onStreamInfo() 参考实现：
 
 ```cpp
 bool DecodeNode::onStreamInfo() override {
-    // 1. 从 SinkPad Queue 取出上游的 CapsEvent
-    auto item = sink_pads_[0]->popBlocking();
-    const CapsEvent& in_caps = ...;
-
-    // 存储收到的 CapsEvent
-    negotiated_caps_["in"] = in_caps;
+    // 1. 用 receiveCapsEvent 从 SinkPad Queue 取 CapsEvent
+    //    内部完成：popBlocking → 校验类型 → setActualType → 存入 negotiated_caps_["in"]
+    if (!receiveCapsEvent("in")) return false;
+    const CapsEvent& in_caps = negotiated_caps_["in"];
 
     // 2. 打开解码器
     codec_ = avcodec_find_decoder(in_caps.codec_id);
@@ -1515,7 +1591,7 @@ bool DecodeNode::onStreamInfo() override {
         ctx_->extradata_size = (int)in_caps.extradata.size();
     }
     if (avcodec_open2(ctx_, codec_, nullptr) < 0) {
-        pipeline_->bus()->post(Message{MessageType::ERROR, this, "DecodeNode: failed to open decoder"});
+        postMessage(MessageType::ERROR, "DecodeNode: failed to open decoder");
         return false;
     }
 
@@ -1532,8 +1608,9 @@ bool DecodeNode::onStreamInfo() override {
     out_caps.sample_fmt  = ctx_->sample_fmt;
 
     // 4. resize SrcPad 的 Edge Queue 到正确容量，再推给下游
+    //    sendCapsEvent 内部校验 out_caps.media_type ∈ SrcPad.templateCaps 并 setActualType
     src_pads_[0]->edge()->queue->resize(selectQueueCapacity(out_caps.media_type));
-    sendCapsEvent("out_0", out_caps);
+    if (!sendCapsEvent("out_0", out_caps)) return false;
     return true;
 }
 ```
@@ -1880,6 +1957,19 @@ Pipeline::waitEOS
 5. AV Sync 目前只采用固定阈值：视频超前 100ms sleep，落后 50ms 丢帧。后续需要根据实际播放延迟、队列积压、音频缓冲等情况动态调整，避免不同文件和设备上同步策略过于僵硬
 
 6. `Clock::setAudioPosition` 分两次 store `audio_base_pts_us_` 和 `audio_base_wall_us_`，`getPositionUs` 分两次 load，理论上可能读到 (新 pts, 旧 wall) 或 (旧 pts, 新 wall) 的组合，导致 elapsed 计算漂几毫秒。在当前 100ms / 50ms 的固定阈值下这几毫秒完全可以忽略，后续再看看处不处理
+
+7. **Graph::link 的 hint_type 校验时机**：目前 hint_type 只用于目标 Pad 不存在时传给 `requestPad`，对固定 Pad 命中的场景 Graph 只做 TemplateCaps 交集检查，这会让一部分类型错误（用户传 hint_type=VIDEO_RAW 但 sink 只支持 AUDIO_RAW，两端 TemplateCaps 交集非空但 hint_type 与 sink 不匹配）从 Build 推迟到 Ready 才通过 `receiveCapsEvent` 抓到，不爆雷，只是不严谨。未来可考虑将 link 签名改为：
+```cpp
+bool link(BaseNode* src, const std::string& src_pad,
+            BaseNode* dst, const std::string& dst_pad);
+bool link(BaseNode* src, const std::string& src_pad,
+            BaseNode* dst, const std::string& dst_pad,
+            MediaType hint_type);
+// 内部：bool link(..., std::optional<MediaType> hint_type);
+```
+无 hint_type 时行为不变；有 hint_type 时额外校验 `hint_type ∈ src.TemplateCaps ∧ hint_type ∈ sink.TemplateCaps`。这只是把 link 阶段的"用户约束"提前拦下，不会把 hint_type 升级为 actual_type，actual_type 仍由 CapsEvent 敲定
+
+8. 当前 `actual_type_` 唯一设值时机是 Ready 阶段的 send/receiveCapsEvent，此时节点线程尚未启动，靠"onStreamInfo 完成 → 线程启动"的天然屏障保证 runLoop 一致可见，不需要 atomic。若未来支持运行时格式变化（§3.1 提到的 STREAM_INFO_CHANGED，每帧 Buffer 携带格式信息 → runLoop 里可能触发 actual_type_ 被重设），必须把 `optional<MediaType>` 升级为 atomic 或加读写锁，并同步 review 所有依赖 actualType() 的 runLoop 路径的一致性假设。
 
 ---
 

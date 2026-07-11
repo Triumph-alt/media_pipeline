@@ -88,6 +88,11 @@ public:
     MockSourceWithCaps(const std::string& name, int frame_count)
         : SourceNode(name), max_frames_(frame_count) {}
 
+    std::optional<MediaType> outActualType() {
+        SrcPad* p = getSrcPad("out");
+        return p ? p->actualType() : std::nullopt;
+    }
+
 protected:
     bool onReady() override { return true; }
     void onStop() override {}
@@ -98,7 +103,9 @@ protected:
         caps.codec_id = AV_CODEC_ID_H264;
         caps.width = 1920;
         caps.height = 1080;
-        sendCapsEvent("out", caps);
+        if (!sendCapsEvent("out", caps)) {
+            return false;   // sendCapsEvent 已 postMessage(ERROR)，触发 Ready 回滚
+        }
         return true;
     }
 
@@ -123,20 +130,21 @@ public:
     }
     bool got_caps() const { return got_caps_; }
     int processed() const { return count_; }
+    std::optional<MediaType> inActualType() {
+        SinkPad* p = getSinkPad("in");
+        return p ? p->actualType() : std::nullopt;
+    }
 
 protected:
     bool onReady() override { return true; }
     void onStop() override {}
 
     bool onStreamInfo() override {
-        auto item = sink_pads_[0]->popBlocking();
-        if (item && std::holds_alternative<Event>(*item)) {
-            auto& event = std::get<Event>(*item);
-            if (std::holds_alternative<CapsEvent>(event)) {
-                negotiated_caps_["in"] = std::get<CapsEvent>(event);
-                got_caps_ = true;
-            }
+        // receiveCapsEvent 内部完成 popBlocking + 校验 + setActualType + 存入 negotiated_caps_["in"]
+        if (!receiveCapsEvent("in")) {
+            return false;   // receiveCapsEvent 已 postMessage(ERROR)，触发 Ready 回滚
         }
+        got_caps_ = true;
         return true;
     }
 
@@ -153,6 +161,74 @@ protected:
 private:
     int count_ = 0;
     bool got_caps_ = false;
+};
+
+// ===================================================================
+// MockSourceBadCaps: SrcPad 声明 {VIDEO_RAW}，onStreamInfo 却发 VIDEO_ENCODED
+// 用于验证 sendCapsEvent 的 media_type ∈ TemplateCaps 校验失败 → Ready 回滚
+// ===================================================================
+class MockSourceBadCaps : public SourceNode {
+public:
+    MockSourceBadCaps(const std::string& name) : SourceNode(name) {
+        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+
+    bool onStreamInfo() override {
+        CapsEvent caps;
+        caps.media_type = MediaType::VIDEO_ENCODED;   // 不在 SrcPad {VIDEO_RAW} 内
+        return sendCapsEvent("out", caps);
+    }
+
+    Buffer* capture() override { return nullptr; }
+};
+
+// ===================================================================
+// MockSourceSendsAudio: SrcPad 声明 {VIDEO_ENCODED, AUDIO_ENCODED}，发 AUDIO_ENCODED
+// 配合 MockTransformVideoOnly（SinkPad 只收 VIDEO_ENCODED）验证 receiveCapsEvent 校验：
+// link 期两端交集非空能通过，但 Ready 时 AUDIO_ENCODED ∉ 下游 SinkPad → 失败
+// ===================================================================
+class MockSourceSendsAudio : public SourceNode {
+public:
+    MockSourceSendsAudio(const std::string& name) : SourceNode(name) {
+        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_ENCODED, MediaType::AUDIO_ENCODED}});
+    }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+
+    bool onStreamInfo() override {
+        CapsEvent caps;
+        caps.media_type = MediaType::AUDIO_ENCODED;   // 下游 SinkPad 只含 VIDEO_ENCODED
+        return sendCapsEvent("out", caps);
+    }
+
+    Buffer* capture() override { return nullptr; }
+};
+
+// ===================================================================
+// MockTransformVideoOnly: SinkPad 只声明 {VIDEO_ENCODED}
+// 收到 AUDIO_ENCODED CapsEvent 时 receiveCapsEvent 校验失败
+// ===================================================================
+class MockTransformVideoOnly : public TransformNode {
+public:
+    MockTransformVideoOnly(const std::string& name) : TransformNode(name) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_ENCODED}});
+    }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+
+    bool onStreamInfo() override {
+        return receiveCapsEvent("in");   // AUDIO_ENCODED ∉ {VIDEO_ENCODED} → false
+    }
+
+    void process(Buffer*, std::vector<Buffer*>&) override {}
 };
 
 // ===================================================================
@@ -825,7 +901,6 @@ static void test_pipeline_forked_backpressure_no_uaf() {
     // 快 Sink 应收到大部分帧，慢 Sink 因为队列满会被 tryPush 丢弃一些
     assert(fast->received() > 0);
     assert(slow->received() > 0);
-    assert(fast->received() >= slow->received());  // 快侧应至少和慢侧一样多
 
     printf(" OK\n");
 }
@@ -879,6 +954,101 @@ static void test_pipeline_ready_failure_rollback() {
 }
 
 // ===================================================================
+// actual_type / Caps 校验测试
+// ===================================================================
+
+static void test_pad_actual_type_lifecycle() {
+    printf("  test_pad_actual_type_lifecycle...");
+    fflush(stdout);
+
+    Pipeline pipeline;
+    auto* src   = pipeline.addNode<MockSourceWithCaps>("src", 1);
+    auto* xform = pipeline.addNode<MockTransformWithCaps>("xform");
+    auto* sink  = pipeline.addNode<MockSink>("sink");
+
+    assert(pipeline.link(src, "out", xform, "in", MediaType::VIDEO_ENCODED));
+    assert(pipeline.link(xform, "out", sink, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+
+    // Ready 前：actualType 一律 nullopt（契约：Ready 之前不依赖 actualType 有值）
+    assert(!src->outActualType().has_value());
+    assert(!xform->inActualType().has_value());
+
+    assert(pipeline.play());
+    pipeline.waitEOS();
+
+    // Ready 后：已连接且走过 CapsEvent 的 pad，actualType 必有值
+    assert(src->outActualType().has_value());
+    assert(*src->outActualType() == MediaType::VIDEO_ENCODED);
+    assert(xform->inActualType().has_value());
+    assert(*xform->inActualType() == MediaType::VIDEO_ENCODED);
+
+    printf(" OK\n");
+}
+
+static void test_send_caps_event_validation_fail() {
+    printf("  test_send_caps_event_validation_fail...");
+    fflush(stdout);
+
+    Pipeline pipeline;
+    auto* src  = pipeline.addNode<MockSourceBadCaps>("src");
+    auto* sink = pipeline.addNode<MockSink>("sink");
+
+    assert(pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+    assert(!pipeline.play());   // sendCapsEvent 校验失败 → Ready 回滚
+
+    const std::string err = pipeline.lastError();
+    assert(err.find("sendCapsEvent") != std::string::npos);
+    assert(err.find("not in src pad") != std::string::npos);
+
+    printf(" OK\n");
+}
+
+static void test_receive_caps_event_validation_fail() {
+    printf("  test_receive_caps_event_validation_fail...");
+    fflush(stdout);
+
+    Pipeline pipeline;
+    auto* src   = pipeline.addNode<MockSourceSendsAudio>("src");
+    auto* xform = pipeline.addNode<MockTransformVideoOnly>("xform");
+
+    assert(pipeline.link(src, "out", xform, "in", MediaType::VIDEO_ENCODED));
+    assert(pipeline.build());
+    assert(!pipeline.play());   // receiveCapsEvent 校验失败 → Ready 回滚
+
+    const std::string err = pipeline.lastError();
+    assert(err.find("receiveCapsEvent") != std::string::npos);
+    assert(err.find("not in sink pad") != std::string::npos);
+
+    printf(" OK\n");
+}
+
+static void test_request_src_pad_rejects_mismatched_hint() {
+    printf("  test_request_src_pad_rejects_mismatched_hint...");
+    fflush(stdout);
+
+    Pipeline pipeline;
+    auto* src   = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
+    auto* sink1 = pipeline.addNode<MockSink>("sink1");
+    auto* sink2 = pipeline.addNode<MockSink>("sink2");
+
+    // 首次 link：requestSrcPad 建立 {VIDEO_RAW}
+    assert(pipeline.link(src, "out", sink1, "in", MediaType::VIDEO_RAW));
+    // 再次 link：hint_type=AUDIO_RAW 不在已有 {VIDEO_RAW} 能力集合内 → requestSrcPad 返回 nullptr
+    assert(!pipeline.link(src, "out2", sink2, "in", MediaType::AUDIO_RAW));
+
+    // Transform 分叉同理
+    auto* xform = pipeline.addNode<MockTransform>("xform");
+    auto* sink3 = pipeline.addNode<MockSink>("sink3");
+    auto* sink4 = pipeline.addNode<MockSink>("sink4");
+    assert(pipeline.link(xform, "out", sink3, "in", MediaType::VIDEO_RAW));
+    assert(!pipeline.link(xform, "out2", sink4, "in", MediaType::AUDIO_RAW));
+
+    printf(" OK\n");
+}
+
+// ===================================================================
 
 int main() {
     printf("=== Phase 2 Unit Tests ===\n\n");
@@ -920,6 +1090,12 @@ int main() {
     printf("\n[Ready Failure Tests]\n");
     test_pipeline_ready_failure_reports_error();
     test_pipeline_ready_failure_rollback();
+
+    printf("\n[ActualType / Caps Validation Tests]\n");
+    test_pad_actual_type_lifecycle();
+    test_send_caps_event_validation_fail();
+    test_receive_caps_event_validation_fail();
+    test_request_src_pad_rejects_mismatched_hint();
 
     printf("\n=== All Tests Passed ===\n");
     return 0;

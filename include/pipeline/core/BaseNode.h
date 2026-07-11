@@ -32,7 +32,8 @@ class Graph;
 //
 // 数据分发（子类调用，不感知下游数量）：
 //   pushToDownstream()   — 发送 Buffer 数据，单路阻塞，多路 tryPush
-//   sendCapsEvent()      — 向指定 SrcPad 发送 CapsEvent，阻塞且不丢失
+//   sendCapsEvent()      — 向指定 SrcPad 发送 CapsEvent：校验 media_type ∈ 能力集合 → setActualType → 阻塞 push，失败返回 false
+//   receiveCapsEvent()   — 从指定 SinkPad 收取 CapsEvent：pop → 校验 → setActualType → 存 negotiated_caps_，失败返回 false
 //   sendEOSDownstream()  — 向所有已连接 SrcPad 广播 EOS，阻塞且不丢失
 //   postMessage()        — 统一上报 MessageBus
 //
@@ -86,40 +87,33 @@ protected:
     // src_pad_name 非空：推给指定 SrcPad（DemuxNode 按流类型分发）
     void pushToDownstream(Buffer* buf, const std::string& src_pad_name = "");
 
-    // 向所有已连接 SrcPad 广播 EOS（阻塞 push，不允许丢失）
+    // 向所有已连接 SrcPad 广播 EOS，阻塞 push，不允许丢失
     void sendEOSDownstream();
 
-    // 向指定 SrcPad 的下游发送 CapsEvent（阻塞 push，不允许丢失）
-    // 每个 SrcPad 的 CapsEvent 可以不同；接收方在 onStreamInfo() 里自行存入 negotiated_caps_
-    void sendCapsEvent(const std::string& src_pad_name, const CapsEvent& caps);
+    // 向指定 SrcPad 的下游发送 CapsEvent，阻塞 push，不允许丢失
+    // 内部校验 caps.media_type ∈ SrcPad.templateCaps
+    // 每个 SrcPad 的 CapsEvent 可以不同；函数只负责发送，不存储
+    bool sendCapsEvent(const std::string& src_pad_name, const CapsEvent& caps);
 
-    // ===== 消息上报 =====
+    // 从指定 SinkPad 收取 CapsEvent，阻塞 pop，不允许丢失
+    // 内部校验取到的是 Event 且是 CapsEvent，并且 caps.media_type ∈ SinkPad.templateCaps
+    // 任一步失败 postMessage(ERROR) 返回 false
+    bool receiveCapsEvent(const std::string& sink_pad_name);
 
-    // 统一上报 MessageBus
+    // 消息上报：统一上报 MessageBus
     void postMessage(MessageType type, const std::string& text, int code = 0);
 
-    // ===== Pad 管理 =====
-
+    // Pad 管理
     SrcPad*  addSrcPad(const std::string& name, TemplateCaps caps);
     SinkPad* addSinkPad(const std::string& name, TemplateCaps caps);
 
-    // ===== 动态请求 Pad（Graph::link 在目标 Pad 不存在时调用）=====
-    //
-    // 节点构造时已声明的固定 Pad（比如 TransformNode 的 "in"）不走这条路，
-    // Graph::link 会优先查找已存在的 Pad。只有当 Pad 不存在时，才调用这两个
-    // 方法，由节点自己决定是否允许动态创建、以及创建出来的 Pad 应该是什么类型。
-    //
-    // hint_type 是用户在 link() 调用时传入的类型提示，节点据此判断：
-    //   - 类型合法 → 创建并返回新 Pad
-    //   - 类型不合法（不支持的 MediaType，或与节点已有输出类型冲突）→ 返回 nullptr
-    //
-    // 默认实现返回 nullptr，表示该节点不支持动态创建 Pad。
-    // 需要支持分叉的节点（Source/Transform 的多路输出）和多路输入的节点
-    // （DemuxNode 的多路输出、MuxNode 的多路输入）需要重写对应的方法。
+    // 动态请求 Pad：hint_type 是用户在 link() 调用时传入的类型提示，节点据此判断：
+    // 类型合法创建并返回新 Pad；类型不合法（不支持的 MediaType，或与节点已有输出类型冲突）返回 nullptr
+    // 需要支持分叉的节点需要重写对应的方法
     virtual SrcPad*  requestSrcPad(const std::string& name, MediaType hint_type) { return nullptr; }
     virtual SinkPad* requestSinkPad(const std::string& name, MediaType hint_type) { return nullptr; }
 
-    // ===== 成员 =====
+    // 成员
     std::string name_;
     Pipeline* pipeline_ = nullptr;
     std::vector<std::unique_ptr<SrcPad>> src_pads_;
@@ -149,12 +143,18 @@ protected:
     // 子类实现：阻塞采集一帧数据，返回 nullptr 表示 EOF
     virtual Buffer* capture() = 0;
 
-    // 支持分叉：新 Pad 的类型必须与已有 SrcPad 一致
+    // 支持分叉，新 SrcPad 是已有 SrcPad 的同源多路拷贝，能力集合必须与已有 pad 一致
+    // hint_type 只用于校验"这次 link 想承载的类型是否落在已有能力集合内"，不参与 TemplateCaps 构造。
     SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override {
-        if (!src_pads_.empty() &&
-            src_pads_[0]->templateCaps().supported_types[0] != hint_type) {
-            return nullptr;
+        if (!src_pads_.empty()) {
+            // 如果已有 SrcPad，复制完整能力集合
+            const auto& existing = src_pads_[0]->templateCaps();
+            if (!existing.contains(hint_type)) {
+                return nullptr;
+            }
+            return addSrcPad(name, existing);
         }
+        // 如果是首个 pad，从 hint_type 建立最初的能力集合
         return addSrcPad(name, TemplateCaps{{hint_type}});
     }
 };
@@ -205,11 +205,15 @@ protected:
     // 子类可重写：处理事件（默认透传给下游）
     virtual void onEvent(const Event& event);
 
-    // 支持分叉（如 EncodeNode 编码后一路推流、一路本地录制）
+    // 支持分叉，新 SrcPad 是已有 SrcPad 的同源多路拷贝，能力集合必须与已有 pad 一致
+    // hint_type 只用于校验"这次 link 想承载的类型是否落在已有能力集合内"
     SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override {
-        if (!src_pads_.empty() &&
-            src_pads_[0]->templateCaps().supported_types[0] != hint_type) {
-            return nullptr;
+        if (!src_pads_.empty()) {
+            const auto& existing = src_pads_[0]->templateCaps();
+            if (!existing.contains(hint_type)) {
+                return nullptr;
+            }
+            return addSrcPad(name, existing);   // 复制完整能力集合
         }
         return addSrcPad(name, TemplateCaps{{hint_type}});
     }

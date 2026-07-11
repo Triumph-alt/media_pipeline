@@ -91,15 +91,71 @@ void BaseNode::sendEOSDownstream() {
     }
 }
 
-void BaseNode::sendCapsEvent(const std::string& src_pad_name, const CapsEvent& caps) {
+bool BaseNode::sendCapsEvent(const std::string& src_pad_name, const CapsEvent& caps) {
     SrcPad* pad = getSrcPad(src_pad_name);
     if (!pad || !pad->isConnected()) {
-        return;
+        postMessage(MessageType::ERROR,
+                    "sendCapsEvent: src pad '" + src_pad_name + "' not found or not connected");
+        return false;
     }
 
-    // CapsEvent 不允许丢失，用阻塞 push
-    // 只负责发送，不存储。接收方在 onStreamInfo() 里自行存入 negotiated_caps_
+    // 校验 CapsEvent.media_type 落在 SrcPad 的能力集合内
+    if (!pad->templateCaps().contains(caps.media_type)) {
+        postMessage(MessageType::ERROR,
+                    "sendCapsEvent: caps.media_type not in src pad '" + src_pad_name + "' template caps");
+        return false;
+    }
+
+    // 校验通过就 setActualType（唯一合法调用点），阻塞 push（CapsEvent 不允许丢失）
+    pad->setActualType(caps.media_type);
     pad->pushBlocking(QueueItem{Event{caps}});
+    return true;
+}
+
+bool BaseNode::receiveCapsEvent(const std::string& sink_pad_name) {
+    SinkPad* pad = getSinkPad(sink_pad_name);
+    if (!pad || !pad->isConnected()) {
+        postMessage(MessageType::ERROR,
+                    "receiveCapsEvent: sink pad '" + sink_pad_name + "' not found or not connected");
+        return false;
+    }
+
+    auto item = pad->popBlocking();
+    if (!item) {
+        // Ready 期间被外部 flush，属异常
+        postMessage(MessageType::ERROR,
+                    "receiveCapsEvent: queue flushed, no CapsEvent on pad '" + sink_pad_name + "'");
+        return false;
+    }
+
+    if (!std::holds_alternative<Event>(*item)) {
+        // 取到的是 Buffer，视为上游 CapsEvent 未先行发送
+        postMessage(MessageType::ERROR,
+                    "receiveCapsEvent: expected CapsEvent on pad '" + sink_pad_name + "', got Buffer");
+        return false;
+    }
+
+    const Event& event = std::get<Event>(*item);
+    if (!std::holds_alternative<CapsEvent>(event)) {
+        // 取到 Event 但不是 CapsEvent（如 EOS），视为上游误发
+        postMessage(MessageType::ERROR,
+                    "receiveCapsEvent: expected CapsEvent on pad '" + sink_pad_name + "', got other Event");
+        return false;
+    }
+
+    const CapsEvent& caps = std::get<CapsEvent>(event);
+
+    // 校验 CapsEvent.media_type 落在 SinkPad 的能力集合内
+    if (!pad->templateCaps().contains(caps.media_type)) {
+        postMessage(MessageType::ERROR,
+                    "receiveCapsEvent: caps.media_type not in sink pad '" + sink_pad_name + "' template caps");
+        return false;
+    }
+
+    // 校验通过：setActualType（唯一合法调用点），存入 negotiated_caps_
+    pad->setActualType(caps.media_type);
+    negotiated_caps_[sink_pad_name] = caps;
+    return true;
 }
 
 // ===================================================================
@@ -252,8 +308,11 @@ bool DemuxNode::onStreamInfo() {
         }
 
         // 先 resize 到正确容量，再发 CapsEvent
+        // sendCapsEvent 内部校验 caps.media_type ∈ SrcPad.templateCaps，通过后 setActualType
         pad->edge()->queue->resize(selectQueueCapacity(type));
-        sendCapsEvent(pad_name, stream_caps_[it->second]);
+        if (!sendCapsEvent(pad_name, stream_caps_[it->second])) {
+            return false;   // sendCapsEvent 已 postMessage(ERROR)，触发 Ready 回滚
+        }
     }
     return true;
 }
@@ -273,15 +332,15 @@ void DemuxNode::runLoop() {
 
         BufferRef primary(buf);   // RAII 接管，从这一行起 buf 只由 primary 拥有
 
-        // 按 media_type 分发到所有匹配的已连接 SrcPad。
+        // 按 media_type 分发到所有匹配的已连接 SrcPad，判断 pad 是否要收此帧一律用 pad->actualType()
         // 每路独立 clone 深拷贝，非阻塞 tryPush，满则丢弃该路副本。
         // primary 始终持有原 buf，循环结束析构统一 unref。
         for (auto& pad : src_pads_) {
             if (!pad->isConnected()) {
                 continue;
             }
-            const auto& types = pad->templateCaps().supported_types;
-            if (types.empty() || types[0] != buf->media_type) {
+            auto actual = pad->actualType();
+            if (!actual || *actual != buf->media_type) {
                 continue;
             }
             pad->tryPush(QueueItem{primary.clone()});
@@ -319,24 +378,14 @@ bool MuxNode::onStreamInfo() {
             continue;
         }
 
-        auto item = pad->popBlocking();
-        if (!item || !std::holds_alternative<Event>(*item)) {
-            postMessage(MessageType::ERROR,
-                        "MuxNode: no CapsEvent on pad '" + pad->name() + "'");
+        // receiveCapsEvent 内部完成 popBlocking + 校验 + setActualType + 存入 negotiated_caps_
+        // 若失败已 postMessage(ERROR)，此处 closeContext 后触发 Ready 回滚
+        if (!receiveCapsEvent(pad->name())) {
             closeContext();
             return false;
         }
 
-        auto& event = std::get<Event>(*item);
-        if (!std::holds_alternative<CapsEvent>(event)) {
-            postMessage(MessageType::ERROR,
-                        "MuxNode: expected CapsEvent on pad '" + pad->name() + "'");
-            closeContext();
-            return false;
-        }
-
-        const CapsEvent& caps = std::get<CapsEvent>(event);
-        negotiated_caps_[pad->name()] = caps;
+        const CapsEvent& caps = negotiated_caps_[pad->name()];
 
         int stream_index = -1;
         if (!addStream(caps, &stream_index)) {
