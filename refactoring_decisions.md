@@ -283,3 +283,21 @@ Ready 期间 postMessage(EOS) 视为节点作者违约（Sink 线程尚未启动
 - `Media_Pipeline_Framework.md` §14 文件结构更新：五个节点基类统一在 `BaseNode.h`，`AVDemuxNode.h` / `AVMuxNode.h` 在 `nodes/` 下。
 - §5.5 / §5.6 增加说明：示例代码为 `AVDemuxNode` / `AVMuxNode` 的 FFmpeg 实现参考，基类定义见 `BaseNode.h`。
 
+---
+
+## Pad 类型体系分层
+
+### TemplateCaps 与实际类型拆分
+
+原代码多处把 `templateCaps().supported_types[0]` 当作实际承载类型使用，隐含假设 TemplateCaps 永远只有一个元素。实际语义应分层：`TemplateCaps` 是 Pad 的静态能力集合，实际类型由 Ready 阶段流经 Pad 的 `CapsEvent.media_type` 决定。
+
+本轮调整：
+- `TemplateCaps` 增加 `contains(MediaType)`，用于检查某个具体类型是否落在能力集合内。
+- `Pad` 增加 `actual_type_` 和只读 `actualType()`；`setActualType()` 为 private，仅授权 `BaseNode` 的 CapsEvent 收发路径调用。
+- `sendCapsEvent()` 改为返回 `bool`，负责校验 SrcPad 能力、设置 SrcPad actual type、再阻塞发送 CapsEvent。
+- 新增 `receiveCapsEvent()`，统一完成 SinkPad pop、事件类型校验、能力校验、设置 SinkPad actual type，并写入 `negotiated_caps_`。
+- Source/Transform 分叉新 SrcPad 时复制已有 Pad 的完整 TemplateCaps；Demux/Mux 的动态 Pad 继续保持 `{hint_type}` 单类型语义。
+- `MuxNode::onStreamInfo()` 改用 `receiveCapsEvent()`；`DemuxNode::runLoop()` 改用 `pad->actualType()` 分发，不再读取 TemplateCaps 第一个元素。
+
+`pad_to_type_` 保留为 DemuxNode Ready 前的私有期望类型：onReady 时 CapsEvent 还没发送，Pad 的 actual type 尚未确定；Ready 后运行期分发则只依赖 `actualType()`。
+
