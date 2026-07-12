@@ -301,3 +301,25 @@ Ready 期间 postMessage(EOS) 视为节点作者违约（Sink 线程尚未启动
 
 `pad_to_type_` 保留为 DemuxNode Ready 前的私有期望类型：onReady 时 CapsEvent 还没发送，Pad 的 actual type 尚未确定；Ready 后运行期分发则只依赖 `actualType()`。
 
+---
+
+## DemuxNode / MuxNode 第一轮收敛
+
+本轮目标是先闭合可运行骨架，不一次性解决所有通用化问题：
+
+- `DemuxNode` 的输入 URL 改为构造参数并由基类 `const` 保存；未来 `AVDemuxNode(name, url)` 转发给基类，不保留 `setUrl()`。
+- `MuxNode` 的格式改为构造参数 `MuxFormat`（MPEGTS / FLV / MP4），由基类 `const` 保存；MP4 在项目内固定表示 fragmented MP4，不支持传统可 seek MP4。
+- Mux 当前固定单输出 `out_0`，TemplateCaps 为 `{CONTAINER}`；多输出等可靠分叉背压策略明确后再做。
+- Mux 基类通过 `appendContainerBytes()` 接收具体后端产生的临时字节，先暂存到 pending；Ready 阶段的 Header 字节等 runLoop 启动后再阻塞发送，避免下游尚无消费者时死锁。
+- 输出顺序固定为 CONTAINER Caps → Header bytes → media bytes → trailer bytes → EOS。
+- Ready 失败路径不再局部 close；Demux/Mux 资源统一由 Graph 回滚调用 `onStop()` 释放。
+- `Graph::link()` 改为事务语义：记录本次动态创建的 Pad，后续步骤失败时通过 `releaseSrcPad()` / `releaseSinkPad()` 撤销；已有 Pad 不删除，Demux release 同步清理 `pad_to_type_`。
+- Mux Ready 要求至少一个输入且所有 SinkPad 均已连接；进入 Running 后以 `sink_pads_.size()` 作为 EOS 汇合目标，不再维护额外的 active 输入计数。
+- 后端错误由具体类上报，框架协议错误由抽象基类上报，基类不重复补发泛化错误。
+
+刻意延期：ContainerMeta、同类型多 Track、Mux 多输出、最终交织策略、网络阻塞 I/O 的实际中断机制和具体 AVDemuxNode/AVMuxNode 实现。
+
+后续已完成的两项收敛：
+- `probeStreams()` 不再通过子类写 `stream_caps_` 隐式交接结果，改为 `probeStreams(DemuxProbeResult*)` 显式返回可选的最佳视频/音频 Caps。基类负责验证返回类型、校验用户请求的流是否存在并保存正式状态；同时删除 `stream_caps_` 和 `pad_to_stream_index_`。
+- `readFrame()` 不再使用 `bool + Buffer**`，改为 `DemuxReadResult`，显式区分 `BUFFER`、`END_OF_STREAM`、`CANCELLED`、`ERROR` 并用 `BufferRef` 传递所有权。无关流由具体类内部跳过，不暴露 `SKIP`；`CANCELLED` 为后续网络 I/O 中断预留明确语义。
+

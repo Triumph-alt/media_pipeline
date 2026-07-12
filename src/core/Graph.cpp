@@ -7,20 +7,16 @@
 namespace pipeline {
 
 // ===================================================================
-// addNode: 添加节点
+// 添加节点
 // ===================================================================
 void Graph::addNode(std::unique_ptr<BaseNode> node) {
     nodes_.push_back(std::move(node));
 }
 
 // ===================================================================
-// link: 声明连接
-//
-// 优先查找已有 Pad，找不到时调用节点的 requestSrcPad/requestSinkPad。
-// 三种失败情况返回 false：
-//   1. 目标 Pad 已被占用（isConnected()）
-//   2. 节点拒绝创建（requestPad 返回 nullptr）
-//   3. TemplateCaps 不兼容
+// 声明连接，优先查找已有 Pad，找不到时调用节点的 requestSrcPad/requestSinkPad
+// 若目标Pad已被占用（isConnected()），节点拒绝创建（requestPad返回nullptr）或TemplateCaps不兼容
+// 返回 false
 // ===================================================================
 bool Graph::link(BaseNode* src, const std::string& src_pad_name,
                  BaseNode* dst, const std::string& dst_pad_name,
@@ -28,6 +24,7 @@ bool Graph::link(BaseNode* src, const std::string& src_pad_name,
 {
     // 1. 查找或请求 SrcPad
     SrcPad* src_pad = src->getSrcPad(src_pad_name);
+    bool src_pad_created = false;
     if (src_pad) {
         if (src_pad->isConnected()) {
             // src_pad 已被占用
@@ -39,19 +36,41 @@ bool Graph::link(BaseNode* src, const std::string& src_pad_name,
             // 节点拒绝创建
             return false;
         }
+        src_pad_created = true;
     }
 
     // 2. 查找或请求 SinkPad
     SinkPad* sink_pad = dst->getSinkPad(dst_pad_name);
+    bool sink_pad_created = false;
     if (sink_pad) {
-        if (sink_pad->isConnected()) return false;  // 已被占用
+        if (sink_pad->isConnected()) {
+            // 已被占用；回滚本次 link 新建的 SrcPad
+            if (src_pad_created) {
+                src->releaseSrcPad(src_pad);
+            }
+            return false;
+        }
     } else {
         sink_pad = dst->requestSinkPad(dst_pad_name, hint_type);
-        if (!sink_pad) return false;  // 节点拒绝创建
+        if (!sink_pad) {
+            // 节点拒绝创建；回滚本次 link 新建的 SrcPad
+            if (src_pad_created) {
+                src->releaseSrcPad(src_pad);
+            }
+            return false;
+        }
+        sink_pad_created = true;
     }
 
     // 3. 静态 Caps 检查
     if (!checkCapsCompatibility(src_pad->templateCaps(), sink_pad->templateCaps())) {
+        // 后续步骤失败时，需要撤销本次新建的 Pad，已有固定 Pad 或此前存在的未连接 Pad 不删
+        if (sink_pad_created) {
+            dst->releaseSinkPad(sink_pad);
+        }
+        if (src_pad_created) {
+            src->releaseSrcPad(src_pad);
+        }
         return false;
     }
 

@@ -17,6 +17,14 @@ enum class MediaType {
     CONTAINER,       // 容器封装后数据（Mux 输出）
 };
 
+// 通用 MuxNode 支持的流式容器格式。
+// MP4 在本项目中固定表示 fragmented MP4；传统的可 seek MP4 不属于此抽象。
+enum class MuxFormat {
+    MPEGTS,
+    FLV,
+    MP4,
+};
+
 // ===================================================================
 // NodeType: 节点类型（5 类）
 //

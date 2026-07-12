@@ -21,6 +21,7 @@ namespace pipeline {
 //   - 节点构造时声明固定 Pad（如 TransformNode 的 "in"）
 //   - link() 时优先查找已有 Pad，找不到时调用 requestSrcPad/requestSinkPad
 //   - 节点自己决定是否允许动态创建（分叉、DemuxNode 多路输出、MuxNode 多路输入）
+//   - link() 具有事务语义：后续步骤失败时释放本次新建的 Pad，不留下残留状态
 // ===================================================================
 class Graph {
 public:
@@ -29,21 +30,21 @@ public:
 
     // 声明连接（Build 阶段）
     // 优先查找已有 Pad，找不到时调用节点的 requestSrcPad/requestSinkPad
-    // 失败情况：目标 Pad 已被占用、节点拒绝创建、TemplateCaps 不兼容
+    // 若后续失败（目标 Pad 已被占用、节点拒绝创建、TemplateCaps 不兼容），释放本次 link 新创建的 Pad，已有 Pad 保持不变
     bool link(BaseNode* src, const std::string& src_pad_name,
               BaseNode* dst, const std::string& dst_pad_name,
               MediaType hint_type = MediaType::CONTAINER);
 
     // Build 阶段：完整校验
-    // 1. 拓扑排序（Kahn 算法），结果存入 topo_order_
-    // 2. 环路检测：topo_order_.size() != nodes_.size() 说明有环
-    // 3. 孤立节点检测：单独遍历，找出入度出度均为 0 的节点
+    // 拓扑排序（Kahn 算法），结果存入 topo_order_
+    // 环路检测：topo_order_.size() != nodes_.size() 说明有环
+    // 孤立节点检测：单独遍历，找出入度出度均为 0 的节点
     bool build();
 
     // Ready 阶段：按拓扑顺序三步穿插
-    // 步骤1：node->onReady()
-    // 步骤2：createQueuesForNode(node)
-    // 步骤3：node->onStreamInfo()
+    // node->onReady()
+    // createQueuesForNode(node)
+    // node->onStreamInfo()
     bool ready();
 
     // 访问拓扑排序结果
