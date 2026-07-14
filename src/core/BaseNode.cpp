@@ -411,8 +411,7 @@ void DemuxNode::runLoop() {
         BufferRef primary = std::move(result.buffer);
 
         // 按 media_type 分发到所有匹配的已连接 SrcPad，判断 pad 是否要收此帧一律用 pad->actualType()
-        // 每路独立 clone 深拷贝，非阻塞 tryPush，满则丢弃该路副本。
-        // primary 始终持有原 buf，循环结束析构统一 unref。
+        // 单路匹配：直接 pushBlocking，背压传导，不丢帧。
         for (auto& pad : src_pads_) {
             if (!pad->isConnected()) {
                 continue;
@@ -421,7 +420,8 @@ void DemuxNode::runLoop() {
             if (!actual || *actual != primary->media_type) {
                 continue;
             }
-            pad->tryPush(QueueItem{primary.clone()});
+            pad->pushBlocking(QueueItem{std::move(primary)});
+            break;  // 单路匹配后 primary 已移走，退出循环
         }
     }
 }

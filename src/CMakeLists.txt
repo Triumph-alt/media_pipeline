@@ -10,12 +10,12 @@ set(CORE_SOURCES
     core/MessageBus.cpp
 )
 
-# ---- 节点源码（后续阶段添加）----
+# ---- 节点源码（第三阶段）----
 set(NODE_SOURCES
-    # nodes/DemuxNode.cpp
-    # nodes/DecodeNode.cpp
-    # nodes/VideoRenderNode.cpp
-    # nodes/AudioPlayNode.cpp
+    nodes/AVDemuxNode.cpp
+    nodes/DecodeNode.cpp
+    nodes/VideoRenderNode.cpp
+    nodes/AudioPlayNode.cpp
 )
 
 # ---- 构建静态库 ----
