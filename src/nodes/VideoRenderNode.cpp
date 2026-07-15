@@ -47,14 +47,13 @@ bool VideoRenderNode::onStreamInfo() {
 // consume 返回前等待主线程呈现完当前帧，保证纯视频播放按显示速度向上游
 // 传递背压，不让 Decode 在几秒内跑完整个文件。
 // ===================================================================
-void VideoRenderNode::consume(Buffer* buf) {
+void VideoRenderNode::consume(const Buffer* buf) {
     if (!buf || !buf->data || buf->size == 0) {
         return;
     }
 
-    // consume() 得到的是借用指针；mailbox 需要独立持有一份引用。
-    buf->ref();
-    BufferRef frame(buf);
+    // consume() 得到的是发布后的只读 Buffer；mailbox 独立持有同一底层对象的引用。
+    BufferRef frame = buf->share();
 
     std::unique_lock lock(mailbox_mutex_);
     while (pending_frame_ && !mailbox_cancelled_ && !stop_requested_.load()) {
@@ -199,7 +198,7 @@ bool VideoRenderNode::ensureTexture(int width, int height) {
     return true;
 }
 
-void VideoRenderNode::releasePendingFrame(Buffer* expected) {
+void VideoRenderNode::releasePendingFrame(const Buffer* expected) {
     std::lock_guard lock(mailbox_mutex_);
     if (pending_frame_.get() == expected) {
         pending_frame_ = BufferRef{};
@@ -231,7 +230,7 @@ VideoPresentResult VideoRenderNode::presentOnMainThread() {
         frame = pending_frame_;
     }
 
-    Buffer* buf = frame.get();
+    const Buffer* buf = frame.get();
     const auto* meta = std::get_if<VideoRawMeta>(&buf->meta);
     if (!meta) {
         failRender("VideoRenderNode: received buffer without VideoRawMeta");

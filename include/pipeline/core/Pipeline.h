@@ -109,6 +109,9 @@ private:
 // ===================================================================
 template<typename T, typename... Args>
 T* Pipeline::addNode(const std::string& name, Args&&... args) {
+    if (state_ != PipelineState::NULL_STATE) {
+        return nullptr;
+    }
     auto node = std::make_unique<T>(name, std::forward<Args>(args)...);
     node->pipeline_ = this;
     T* ptr = node.get();

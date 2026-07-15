@@ -1,59 +1,46 @@
 #include "pipeline/core/Graph.h"
 
-#include <algorithm>
 #include <queue>
 #include <unordered_set>
 
 namespace pipeline {
 
-// ===================================================================
-// 添加节点
-// ===================================================================
 void Graph::addNode(std::unique_ptr<BaseNode> node) {
     nodes_.push_back(std::move(node));
 }
 
-// ===================================================================
-// 声明连接，优先查找已有 Pad，找不到时调用节点的 requestSrcPad/requestSinkPad
-// 若目标Pad已被占用（isConnected()），节点拒绝创建（requestPad返回nullptr）或TemplateCaps不兼容
-// 返回 false
-// ===================================================================
 bool Graph::link(BaseNode* src, const std::string& src_pad_name,
                  BaseNode* dst, const std::string& dst_pad_name,
                  MediaType hint_type)
 {
-    // 1. 查找或请求 SrcPad
+    // 固定 Pad 优先；名称不存在时才让节点按 hint_type 决定是否创建动态 Pad
     SrcPad* src_pad = src->getSrcPad(src_pad_name);
     bool src_pad_created = false;
     if (src_pad) {
         if (src_pad->isConnected()) {
-            // src_pad 已被占用
             return false;
         }
     } else {
         src_pad = src->requestSrcPad(src_pad_name, hint_type);
         if (!src_pad) {
-            // 节点拒绝创建
             return false;
         }
         src_pad_created = true;
     }
 
-    // 2. 查找或请求 SinkPad
     SinkPad* sink_pad = dst->getSinkPad(dst_pad_name);
     bool sink_pad_created = false;
     if (sink_pad) {
         if (sink_pad->isConnected()) {
-            // 已被占用；回滚本次 link 新建的 SrcPad
             if (src_pad_created) {
                 src->releaseSrcPad(src_pad);
             }
             return false;
         }
     } else {
+        // 目标 SinkPad 的回滚顺序必须先于本次新建 SrcPad，保持 link 的事务性
         sink_pad = dst->requestSinkPad(dst_pad_name, hint_type);
         if (!sink_pad) {
-            // 节点拒绝创建；回滚本次 link 新建的 SrcPad
             if (src_pad_created) {
                 src->releaseSrcPad(src_pad);
             }
@@ -62,9 +49,8 @@ bool Graph::link(BaseNode* src, const std::string& src_pad_name,
         sink_pad_created = true;
     }
 
-    // 3. 静态 Caps 检查
+    // 静态能力失败时，只有本次 request 创建的 Pad 才属于当前 link 的回滚范围
     if (!checkCapsCompatibility(src_pad->templateCaps(), sink_pad->templateCaps())) {
-        // 后续步骤失败时，需要撤销本次新建的 Pad，已有固定 Pad 或此前存在的未连接 Pad 不删
         if (sink_pad_created) {
             dst->releaseSinkPad(sink_pad);
         }
@@ -74,114 +60,135 @@ bool Graph::link(BaseNode* src, const std::string& src_pad_name,
         return false;
     }
 
-    // 4. 创建 Edge（不含 Queue，Queue 在 ready() 阶段创建）
+    auto route = src_pad->route();
+    if (!route) {
+        if (sink_pad_created) {
+            dst->releaseSinkPad(sink_pad);
+        }
+        if (src_pad_created) {
+            src->releaseSrcPad(src_pad);
+        }
+        return false;
+    }
+
+    // 每条 Edge 都是 Route 的独立静态订阅者；成功前不连接两端 Pad，保证失败可回滚
+    auto subscription = route->subscribe();
+    if (!subscription) {
+        if (sink_pad_created) {
+            dst->releaseSinkPad(sink_pad);
+        }
+        if (src_pad_created) {
+            src->releaseSrcPad(src_pad);
+        }
+        return false;
+    }
+
+    // Edge 同时保存 DAG 端点和数据面 Subscription；连接完成后 Pad 才正式占用
     auto edge = Edge::create(src, src_pad_name, dst, dst_pad_name);
+    edge->subscription = std::move(subscription);
     src_pad->edge_ = edge.get();
     sink_pad->edge_ = edge.get();
     edges_.push_back(std::move(edge));
-
     return true;
 }
 
-// ===================================================================
-// build: Build 阶段完整校验
-// ===================================================================
 bool Graph::build() {
-    // 拓扑排序（Kahn 算法）
+    // Kahn 算法：in_degree 只依赖 Edge 的图端点，不依赖 Route 的数据面状态
     std::unordered_map<BaseNode*, int> in_degree;
-    for (auto& node : nodes_) in_degree[node.get()] = 0;
-
+    for (auto& node : nodes_) {
+        in_degree[node.get()] = 0;
+    }
     for (auto& edge : edges_) {
-        in_degree[edge->dst_node]++;
+        ++in_degree[edge->dst_node];
     }
 
-    std::queue<BaseNode*> q;
-    for (auto& [node, deg] : in_degree) {
-        if (deg == 0) q.push(node);
+    std::queue<BaseNode*> ready;
+    for (auto& [node, degree] : in_degree) {
+        if (degree == 0) {
+            ready.push(node);
+        }
     }
 
     topo_order_.clear();
-    while (!q.empty()) {
-        BaseNode* node = q.front();
-        q.pop();
+    while (!ready.empty()) {
+        BaseNode* node = ready.front();
+        ready.pop();
         topo_order_.push_back(node);
 
         for (auto& edge : edges_) {
-            if (edge->src_node == node) {
-                if (--in_degree[edge->dst_node] == 0) {
-                    q.push(edge->dst_node);
-                }
+            if (edge->src_node == node && --in_degree[edge->dst_node] == 0) {
+                ready.push(edge->dst_node);
             }
         }
     }
 
-    // 环路检测，如果 topo 排序结果数量不等于节点数量，就说明有环
+    // 未被 Kahn 消耗完说明至少存在环，不能进入 Ready/Running
     if (topo_order_.size() != nodes_.size()) {
         return false;
     }
 
-    // 孤立节点入度=0、出度=0，会被正常排入 topo_order_
-    // 所以需要单独遍历，不能依赖上面的环路检测结果
+    // 孤立节点不会被环检测捕获，必须单独拒绝
     std::unordered_set<BaseNode*> connected;
-    // O(E) 一次遍历收集
     for (auto& edge : edges_) {
         connected.insert(edge->src_node);
         connected.insert(edge->dst_node);
     }
-    // O(V) 一次查表
     for (auto& node : nodes_) {
         if (!connected.count(node.get())) {
             return false;
         }
     }
 
+    return sealAllRoutes();
+}
+
+bool Graph::sealAllRoutes() {
+    // 同源分叉 Pad 共享 Route；按原始指针去重，确保每条逻辑流仅 seal 一次
+    std::unordered_set<OutputRoute*> sealed;
+    for (auto& node : nodes_) {
+        for (auto& pad : node->src_pads_) {
+            auto route = pad->route();
+            if (!route || !pad->isConnected() || sealed.count(route.get())) {
+                continue;
+            }
+            if (!route->seal()) {
+                return false;
+            }
+            sealed.insert(route.get());
+        }
+    }
     return true;
 }
 
-// ===================================================================
-// flushAllQueues: 唤醒所有 Edge Queue 上阻塞的线程
-//
-// Pipeline::stop() 使用，避免把 Graph 内部的 edges_ 容器直接暴露出去。
-// ===================================================================
-void Graph::flushAllQueues() {
-    for (auto& edge : edges_) {
-        if (edge->queue) {
-            edge->queue->flush();
+void Graph::cancelAllRoutes() {
+    // cancel 是全局停止/Ready 回滚路径；同一 Route 只需取消一次即可唤醒全部订阅者
+    std::unordered_set<OutputRoute*> cancelled;
+    for (auto& node : nodes_) {
+        for (auto& pad : node->src_pads_) {
+            auto route = pad->route();
+            if (route && cancelled.insert(route.get()).second) {
+                route->cancel();
+            }
         }
     }
 }
 
-// ===================================================================
-// ready: Ready 阶段三步穿插
-// ===================================================================
 bool Graph::ready() {
-    // 回滚 Lambda
+    // Ready 尚未启动节点线程；失败时先 cancel Route 唤醒可能的 Caps 等待，再逆拓扑释放资源
     auto rollbackReady = [this](size_t failed_index) {
-        // 按拓扑逆序调用 onStop() 回滚；释放各节点自己持有的具体资源
+        cancelAllRoutes();
         for (size_t n = failed_index + 1; n > 0; --n) {
             topo_order_[n - 1]->onStop();
         }
-
-        // 不考虑顺序，全部 reset，Ready 失败后不再保留 CapsEvent 或临时队列
-        for (auto& edge : edges_) {
-            edge->queue.reset();
-        }
     };
 
-    // 主循环：拓扑遍历
+    // 拓扑顺序保证上游先 publish Caps，下游随后 acquire/校验该 Caps
     for (size_t i = 0; i < topo_order_.size(); ++i) {
         auto* node = topo_order_[i];
-
-        // 步骤1：初始化自身资源
         if (!node->onReady()) {
             rollbackReady(i);
             return false;
         }
-
-        // 步骤2：为此节点所有 SrcPad 的 Edge 创建 BoundedQueue
-        createQueuesForNode(node);
-
-        // 步骤3：发送/处理 CapsEvent
         if (!node->onStreamInfo()) {
             rollbackReady(i);
             return false;
@@ -190,21 +197,6 @@ bool Graph::ready() {
     return true;
 }
 
-// ===================================================================
-// createQueuesForNode: 为节点所有 SrcPad 的 Edge 创建 BoundedQueue
-// ===================================================================
-void Graph::createQueuesForNode(BaseNode* node) {
-    for (auto& pad : node->src_pads_) {
-        if (pad->edge_ && !pad->edge_->queue) {
-            // 固定容量 8，后续在 onStreamInfo() 里 resize 到正确容量
-            pad->edge_->queue = std::make_unique<BoundedQueue>(8);
-        }
-    }
-}
-
-// ===================================================================
-// checkCapsCompatibility: 检查 TemplateCaps 兼容性
-// ===================================================================
 bool Graph::checkCapsCompatibility(const TemplateCaps& src, const TemplateCaps& dst) {
     return src.isCompatibleWith(dst);
 }

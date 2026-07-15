@@ -25,12 +25,12 @@ protected:
     bool onReady() override { return true; }
     void onStop() override;
     bool onStreamInfo() override;
-    void process(Buffer* input, std::vector<Buffer*>& outputs) override;
+    void process(const Buffer* input, std::vector<Buffer*>& outputs) override;
     void onEvent(const Event& event) override;
 
 private:
     // 将 Buffer 数据转为 AVPacket（深拷贝 payload），用于 avcodec_send_packet
-    AVPacket* toAVPacket(Buffer* buf);
+    AVPacket* toAVPacket(const Buffer* buf);
 
     AVCodecContext* ctx_       = nullptr;
     const AVCodec*  codec_    = nullptr;

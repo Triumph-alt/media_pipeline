@@ -159,10 +159,10 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 | 模块 | 关键内容 |
 |------|---------|
 | 基础类型 | MediaType 5 枚举、TemplateCaps、CapsEvent、Event variant、NodeType、PipelineState |
-| Buffer + BufferRef | 原子引用计数、RAII 包装、fromAVPacket/fromAVFrame、clone 深拷贝 |
-| BoundedQueue | 阻塞/非阻塞 push/pop、flush、外部 notify 回调 |
-| Edge | 每条边持有独立 BoundedQueue，根据 TemplateCaps 选择容量 |
-| Pad | 纯接口，通过 Edge 间接访问 Queue |
+| Buffer + BufferRef | 原子引用计数、RAII 包装、fromAVPacket/fromAVFrame、发布后只读、分叉共享 payload |
+| OutputRoute | 静态有界多订阅者日志、Subscription 独立游标、Delivery 处理后 ack、可靠阻塞背压、cancel |
+| Edge | 每条边持有源 OutputRoute 的一个 RouteSubscription |
+| Pad | SrcPad 绑定逻辑 Route，SinkPad 通过 Edge Subscription acquire/ack |
 | BaseNode 体系 | BaseNode + SourceNode + TransformNode + SinkNode + DemuxNode + MuxNode 基类 |
 | Graph | 邻接表、link（requestPad 动态 Pad + TemplateCaps 检查）、build（拓扑排序 + 环路/孤立节点检测）、ready（三步穿插） |
 | Pipeline | 持有 Graph/Clock/MessageBus，build → play → stop → waitEOS，统管线程 |
@@ -180,17 +180,18 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 ### 验收标准
 
 - [x] TemplateCaps 兼容性检查测试通过
-- [x] Buffer + BufferRef 生命周期测试通过（创建/拷贝/移动/释放/clone）
-- [x] BoundedQueue 阻塞/非阻塞/flush/外部 notify 测试通过
-- [x] Pad 通过 Edge Queue 正确传递数据（通过 Pipeline 集成测试间接覆盖）
-- [x] BaseNode pushToDownstream 单路阻塞、多路 tryPush 测试通过（通过 Pipeline 集成测试间接覆盖）
+- [x] Buffer + BufferRef 生命周期测试通过，消费接口发布后只读
+- [x] OutputRoute 共享 BufferRef、独立订阅游标、处理后 ack、最慢订阅者背压、取消唤醒和事件顺序测试通过
+- [x] Pad/Edge 通过共享 Route 和独立 Subscription 正确传递数据
+- [x] 同源分叉对每项只 publish 一次，全部可靠订阅者收到完整序列且不深拷贝 payload
 - [x] Graph::build 检出不兼容连接、环路、孤立节点并报错
 - [x] Graph::ready 三步穿插执行，CapsEvent 顺流传递
 - [x] Pipeline build → play → stop 完整生命周期测试
 - [x] 线程按拓扑逆序启动，stop 后全部退出无泄漏（并发 stop + waitEOS+stop 测试通过）
 - [x] 编译时 `-fno-exceptions -fno-rtti`
 - [x] Ready 阶段 `postMessage(ERROR)` 后 `lastError()` 可查询到错误文本（bus 提前启动 + 失败路径 join drain）
-- [x] 分叉路径（多 SrcPad 广播）在下游背压 tryPush 失败时不发生 UAF / double-unref（ASAN 覆盖）
+- [x] 分叉路径在慢订阅者下通过 Route 硬容量可靠背压，两路都收到完整序列，无 UAF / double-unref
+- [x] Route publish/acquire 等待可被 Pipeline stop/cancel 唤醒
 - [x] Ready 失败时事务性回滚，前置节点 `onStop()` 按拓扑逆序被调用
 
 ---
@@ -270,10 +271,11 @@ FFmpeg 需额外开启 encoder 和 muxer（见第一阶段 1.3 配置）。
 | 方向 | 说明 |
 |------|------|
 | MemoryPool | 分级内存池减少 malloc 碎片（当前 Buffer 用 new/delete） |
-| Buffer 零拷贝 | 引用计数替代 clone() 深拷贝 |
+| 分叉传输零拷贝 | 已完成：Route Entry 单份 BufferRef，订阅者共享只读 payload；端到端 FFmpeg/设备零拷贝另行优化 |
+| Route 字节预算 | 当前按条目数硬限，后续增加 payload 字节上限和节点级总内存预算 |
 | DMA-BUF | V4L2 采集零拷贝 |
 | 硬件编解码 | VAAPI / V4L2 M2M |
 | RTSP 推流 | RTSPPushNode |
 | 线程绑核 | pthread_setaffinity_np |
 | AV Sync 自适应 | 丢帧阈值动态调整 |
-| 队列所有权类型化 | `BoundedQueue::tryPush/pushBlocking` 改为 `QueueItem&&`，`TransformNode::process` 的 outputs 改为 `std::vector<BufferRef>&`，把"进来即归我"从注释约束升级为类型约束 |
+| 输出所有权类型化 | `TransformNode::process` 的 outputs 后续改为 `std::vector<BufferRef>`；输入已通过 const Buffer + RouteDelivery ack 收紧 |

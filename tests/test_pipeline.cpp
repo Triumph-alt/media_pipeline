@@ -52,7 +52,7 @@ protected:
     bool onReady() override { return true; }
     void onStop() override {}
 
-    void process(Buffer* input, std::vector<Buffer*>& outputs) override {
+    void process(const Buffer* input, std::vector<Buffer*>& outputs) override {
         count_++;
         auto* out = new Buffer();
         out->data = new uint8_t[input->size];
@@ -77,7 +77,7 @@ public:
 protected:
     bool onReady() override { return true; }
     void onStop() override {}
-    void consume(Buffer* buf) override { count_++; }
+    void consume(const Buffer* buf) override { count_++; }
 
 private:
     int count_ = 0;
@@ -140,7 +140,7 @@ protected:
     void onStop() override {}
 
     bool onStreamInfo() override {
-        // receiveCapsEvent 内部完成 popBlocking + 校验 + setActualType + 存入 negotiated_caps_["in"]
+        // receiveCapsEvent 内部完成 acquire + 校验 + setActualType + ack + 存入 negotiated_caps_["in"]
         if (!receiveCapsEvent("in")) {
             return false;   // receiveCapsEvent 已 postMessage(ERROR)，触发 Ready 回滚
         }
@@ -148,7 +148,7 @@ protected:
         return true;
     }
 
-    void process(Buffer* input, std::vector<Buffer*>& outputs) override {
+    void process(const Buffer* input, std::vector<Buffer*>& outputs) override {
         count_++;
         auto* out = new Buffer();
         out->data = new uint8_t[input->size];
@@ -228,12 +228,12 @@ protected:
         return receiveCapsEvent("in");   // AUDIO_ENCODED ∉ {VIDEO_ENCODED} → false
     }
 
-    void process(Buffer*, std::vector<Buffer*>&) override {}
+    void process(const Buffer*, std::vector<Buffer*>&) override {}
 };
 
 // ===================================================================
 // MockSlowSink: consume 里 sleep 一小段时间，制造下游背压
-// 广播路径下配合小容量队列可以稳定触发 tryPush 失败分支
+// 配合小容量 OutputRoute 验证慢订阅者不会丢帧，并最终反压生产者
 // ===================================================================
 class MockSlowSink : public SinkNode {
 public:
@@ -246,7 +246,7 @@ public:
 protected:
     bool onReady() override { return true; }
     void onStop() override {}
-    void consume(Buffer* buf) override {
+    void consume(const Buffer* buf) override {
         count_++;
         if (sleep_us_ > 0) {
             std::this_thread::sleep_for(std::chrono::microseconds(sleep_us_));
@@ -318,7 +318,7 @@ protected:
         return false;
     }
     void onStop() override {}
-    void consume(Buffer* buf) override {}
+    void consume(const Buffer* buf) override {}
 };
 
 // ===================================================================
@@ -498,128 +498,234 @@ static void test_buffer_from_avframe_audio_meta() {
     printf(" OK\n");
 }
 
-static void test_bounded_queue_basic() {
-    printf("  test_bounded_queue_basic...");
-    fflush(stdout);
-
-    BoundedQueue q(4);
-    assert(q.empty());
-    assert(q.size() == 0);
-    assert(!q.full());
-
+static BufferRef makeRouteBuffer(uint8_t value) {
     auto* buf = new Buffer();
-    buf->data = new uint8_t[1]{42};
+    buf->data = new uint8_t[1]{value};
     buf->size = 1;
     buf->media_type = MediaType::VIDEO_RAW;
+    return BufferRef{buf};
+}
 
-    q.pushBlocking(QueueItem{BufferRef{buf}});
-    assert(q.size() == 1);
+static void test_output_route_shared_delivery() {
+    printf("  test_output_route_shared_delivery...");
+    fflush(stdout);
 
-    auto item = q.tryPop();
-    assert(item.has_value());
-    assert(std::holds_alternative<BufferRef>(*item));
-    assert(q.empty());
+    auto route = std::make_shared<OutputRoute>(4);
+    auto first = route->subscribe();
+    auto second = route->subscribe();
+    assert(route->seal());
+
+    BufferRef source = makeRouteBuffer(42);
+    const Buffer* original = source.get();
+    assert(route->publishBlocking(QueueItem{source}) == RoutePublishResult::PUBLISHED);
+
+    auto first_delivery = first.acquireBlocking();
+    auto second_delivery = second.acquireBlocking();
+    assert(first_delivery && second_delivery);
+
+    const auto& first_ref = std::get<BufferRef>(first_delivery->item());
+    const auto& second_ref = std::get<BufferRef>(second_delivery->item());
+    assert(first_ref.get() == original);
+    assert(second_ref.get() == original);
+    assert(first_ref.get() == second_ref.get());
+
+    assert(first_delivery->ack());
+    assert(route->retainedItems() == 1);
+    assert(second_delivery->ack());
+    assert(route->retainedItems() == 0);
 
     printf(" OK\n");
 }
 
-static void test_bounded_queue_try_push_full() {
-    printf("  test_bounded_queue_try_push_full...");
+static void test_output_route_ack_controls_backpressure() {
+    printf("  test_output_route_ack_controls_backpressure...");
     fflush(stdout);
 
-    BoundedQueue q(2);
+    auto route = std::make_shared<OutputRoute>(1);
+    auto fast = route->subscribe();
+    auto slow = route->subscribe();
+    assert(route->seal());
+    assert(route->publishBlocking(QueueItem{makeRouteBuffer(1)}) == RoutePublishResult::PUBLISHED);
 
-    for (int i = 0; i < 2; i++) {
-        auto* buf = new Buffer();
-        buf->data = new uint8_t[1]{static_cast<uint8_t>(i)};
-        buf->size = 1;
-        buf->media_type = MediaType::VIDEO_RAW;
-        assert(q.tryPush(QueueItem{BufferRef{buf}}));
+    auto fast_delivery = fast.acquireBlocking();
+    auto slow_delivery = slow.acquireBlocking();
+    assert(fast_delivery && slow_delivery);
+    assert(fast_delivery->ack());
+
+    std::atomic<bool> publish_finished{false};
+    std::thread publisher([&] {
+        auto result = route->publishBlocking(QueueItem{makeRouteBuffer(2)});
+        assert(result == RoutePublishResult::PUBLISHED);
+        publish_finished = true;
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(!publish_finished.load());
+    assert(route->retainedItems() == 1);
+
+    assert(slow_delivery->ack());
+    publisher.join();
+    assert(publish_finished.load());
+
+    auto fast_second = fast.acquireBlocking();
+    auto slow_second = slow.acquireBlocking();
+    assert(fast_second && slow_second);
+    assert(fast_second->ack());
+    assert(slow_second->ack());
+
+    printf(" OK\n");
+}
+
+static void test_output_route_delivery_abandon_retries() {
+    printf("  test_output_route_delivery_abandon_retries...");
+    fflush(stdout);
+
+    auto route = std::make_shared<OutputRoute>(1);
+    auto subscriber = route->subscribe();
+    assert(route->seal());
+    assert(route->publishBlocking(QueueItem{makeRouteBuffer(7)}) == RoutePublishResult::PUBLISHED);
+
+    const Buffer* first_ptr = nullptr;
+    {
+        auto delivery = subscriber.acquireBlocking();
+        assert(delivery);
+        first_ptr = std::get<BufferRef>(delivery->item()).get();
+        // 未 ack，析构后同一订阅者应重新取得同一项。
     }
 
-    auto* buf3 = new Buffer();
-    buf3->data = new uint8_t[1]{99};
-    buf3->size = 1;
-    buf3->media_type = MediaType::VIDEO_RAW;
-    // tryPush 值传参：失败时函数内的 QueueItem 析构会 unref buf3，
-    // caller 不能再手动 unref 一次（否则 double-free / UAF，就是 pushToDownstream 修的那个 bug）
-    assert(!q.tryPush(QueueItem{BufferRef{buf3}}));
+    auto retry = subscriber.acquireBlocking();
+    assert(retry);
+    assert(std::get<BufferRef>(retry->item()).get() == first_ptr);
+    assert(retry->ack());
+    assert(route->retainedItems() == 0);
 
     printf(" OK\n");
 }
 
-static void test_bounded_queue_flush() {
-    printf("  test_bounded_queue_flush...");
+static void test_output_route_ack_after_processing() {
+    printf("  test_output_route_ack_after_processing...");
     fflush(stdout);
 
-    BoundedQueue q(4);
-    q.pushBlocking(QueueItem{EOSEvent{}});
-    q.flush();
-    // flush 后队列不可再用，不崩溃就算成功
+    auto route = std::make_shared<OutputRoute>(1);
+    auto subscriber = route->subscribe();
+    assert(route->seal());
+    assert(route->publishBlocking(QueueItem{makeRouteBuffer(1)}) == RoutePublishResult::PUBLISHED);
+
+    auto delivery = subscriber.acquireBlocking();
+    assert(delivery);
+
+    std::atomic<bool> publish_finished{false};
+    std::thread publisher([&] {
+        assert(route->publishBlocking(QueueItem{makeRouteBuffer(2)}) ==
+               RoutePublishResult::PUBLISHED);
+        publish_finished = true;
+    });
+
+    // acquire 并不释放容量；只有处理完成后的 ack 才允许第二次 publish。
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(!publish_finished.load());
+    assert(delivery->ack());
+    publisher.join();
+    assert(publish_finished.load());
+
+    auto second = subscriber.acquireBlocking();
+    assert(second && second->ack());
 
     printf(" OK\n");
 }
 
-static void test_bounded_queue_resize() {
-    printf("  test_bounded_queue_resize...");
+static void test_output_route_cancel_wakes_subscriber() {
+    printf("  test_output_route_cancel_wakes_subscriber...");
     fflush(stdout);
 
-    BoundedQueue q(2);
+    auto route = std::make_shared<OutputRoute>(1);
+    auto subscriber = route->subscribe();
+    assert(route->seal());
 
-    for (int i = 0; i < 2; i++) {
-        auto* buf = new Buffer();
-        buf->data = new uint8_t[1]{static_cast<uint8_t>(i)};
-        buf->size = 1;
-        buf->media_type = MediaType::VIDEO_RAW;
-        assert(q.tryPush(QueueItem{BufferRef{buf}}));
-    }
-    assert(q.full());
+    std::atomic<bool> returned{false};
+    std::thread consumer([&] {
+        auto delivery = subscriber.acquireBlocking();
+        assert(!delivery);
+        returned = true;
+    });
 
-    q.resize(4);
-    assert(!q.full());
-
-    auto* buf3 = new Buffer();
-    buf3->data = new uint8_t[1]{3};
-    buf3->size = 1;
-    buf3->media_type = MediaType::VIDEO_RAW;
-    assert(q.tryPush(QueueItem{BufferRef{buf3}}));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(!returned.load());
+    route->cancel();
+    consumer.join();
+    assert(returned.load());
 
     printf(" OK\n");
 }
 
-static void test_select_queue_capacity() {
-    printf("  test_select_queue_capacity...");
+static void test_output_route_cancel_wakes_publisher() {
+    printf("  test_output_route_cancel_wakes_publisher...");
     fflush(stdout);
 
-    assert(selectQueueCapacity(MediaType::VIDEO_RAW) == DEFAULT_QUEUE_CAPACITY_VIDEO_RAW);
-    assert(selectQueueCapacity(MediaType::AUDIO_RAW) == DEFAULT_QUEUE_CAPACITY_AUDIO_RAW);
-    assert(selectQueueCapacity(MediaType::VIDEO_ENCODED) == DEFAULT_QUEUE_CAPACITY_ENCODED);
-    assert(selectQueueCapacity(MediaType::AUDIO_ENCODED) == DEFAULT_QUEUE_CAPACITY_ENCODED);
-    assert(selectQueueCapacity(MediaType::CONTAINER) == DEFAULT_QUEUE_CAPACITY_CONTAINER);
+    auto route = std::make_shared<OutputRoute>(1);
+    auto subscriber = route->subscribe();
+    assert(route->seal());
+    assert(route->publishBlocking(QueueItem{makeRouteBuffer(1)}) == RoutePublishResult::PUBLISHED);
+
+    std::atomic<RoutePublishResult> result{RoutePublishResult::PUBLISHED};
+    std::thread publisher([&] {
+        result = route->publishBlocking(QueueItem{makeRouteBuffer(2)});
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    route->cancel();
+    publisher.join();
+    assert(result.load() == RoutePublishResult::CANCELLED);
+    assert(!subscriber.acquireBlocking());
 
     printf(" OK\n");
 }
 
-static void test_bounded_queue_external_notify() {
-    printf("  test_bounded_queue_external_notify...");
+static void test_output_route_event_order() {
+    printf("  test_output_route_event_order...");
     fflush(stdout);
 
-    BoundedQueue q(8);
-    int notify_count = 0;
+    auto route = std::make_shared<OutputRoute>(4);
+    auto subscriber = route->subscribe();
+    assert(route->seal());
 
-    q.setExternalNotify([&]() { notify_count++; });
+    CapsEvent caps;
+    caps.media_type = MediaType::VIDEO_RAW;
+    assert(route->publishBlocking(QueueItem{Event{caps}}) == RoutePublishResult::PUBLISHED);
+    assert(route->publishBlocking(QueueItem{makeRouteBuffer(9)}) == RoutePublishResult::PUBLISHED);
+    assert(route->publishBlocking(QueueItem{Event{EOSEvent{}}}) == RoutePublishResult::PUBLISHED);
 
-    auto* buf = new Buffer();
-    buf->data = new uint8_t[1]{0};
-    buf->size = 1;
-    buf->media_type = MediaType::VIDEO_RAW;
-    q.pushBlocking(QueueItem{BufferRef{buf}});
+    auto first = subscriber.acquireBlocking();
+    assert(first && std::holds_alternative<Event>(first->item()));
+    assert(std::holds_alternative<CapsEvent>(std::get<Event>(first->item())));
+    assert(first->ack());
 
-    assert(notify_count == 1);
+    auto second = subscriber.acquireBlocking();
+    assert(second && std::holds_alternative<BufferRef>(second->item()));
+    assert(second->ack());
 
-    // 再 push 一个 EOS 事件
-    q.pushBlocking(QueueItem{EOSEvent{}});
-    assert(notify_count == 2);
+    auto third = subscriber.acquireBlocking();
+    assert(third && std::holds_alternative<Event>(third->item()));
+    assert(std::holds_alternative<EOSEvent>(std::get<Event>(third->item())));
+    assert(third->ack());
+
+    printf(" OK\n");
+}
+
+static void test_select_route_capacity() {
+    printf("  test_select_route_capacity...");
+    fflush(stdout);
+
+    assert(selectRouteCapacity(MediaType::VIDEO_RAW) == 4);
+    assert(selectRouteCapacity(MediaType::AUDIO_RAW) == 50);
+    assert(selectRouteCapacity(MediaType::VIDEO_ENCODED) == 32);
+    assert(selectRouteCapacity(MediaType::AUDIO_ENCODED) == 32);
+    assert(selectRouteCapacity(MediaType::CONTAINER) == 32);
+
+    auto route = std::make_shared<OutputRoute>(2);
+    assert(route->capacity() == 2);
+    route->resize(8);
+    assert(route->capacity() == 8);
 
     printf(" OK\n");
 }
@@ -848,8 +954,8 @@ static void test_pipeline_wait_eos_and_stop() {
 
 // ===================================================================
 // 分叉路径：Source 一路输出 fork 给两个 Sink
-// 覆盖 pushToDownstream 的多路广播分支（primary.clone 循环）。
-// 无 UAF → 进程正常收敛到 waitEOS，两路 Sink 都能收到帧
+// 覆盖同一逻辑 Route 的两个静态可靠订阅者。
+// 两路共享底层 BufferRef，并且都必须收到全部帧。
 // ===================================================================
 static void test_pipeline_forked_broadcast() {
     printf("  test_pipeline_forked_broadcast...");
@@ -869,18 +975,16 @@ static void test_pipeline_forked_broadcast() {
     assert(pipeline.play());
     pipeline.waitEOS();
 
-    // 每一路都应收到全部 20 帧（分叉通过 clone 复制，理想情况下不丢）
-    // 队列容量 4 * 20 帧节奏正常也可能因为调度略有丢帧，这里放宽下界，
-    // 关键是断言 “至少收到帧、进程未 crash”
-    assert(sink1->received() > 0);
-    assert(sink2->received() > 0);
+    // 所有可靠订阅者都应收到完整序列，不允许因下游调度差异丢帧。
+    assert(sink1->received() == 20);
+    assert(sink2->received() == 20);
 
     printf(" OK\n");
 }
 
 // ===================================================================
-// 分叉路径压力：一路慢 Sink 制造背压，触发多路 tryPush 失败分支
-// 关键是不 crash（问题 2 的 UAF 在此路径下 ASAN 必现）
+// 分叉路径压力：一路慢 Sink 使 Route 达到硬容量，验证最慢可靠订阅者
+// 将背压传给 Source，同时快慢两路最终都收到完整序列。
 // ===================================================================
 static void test_pipeline_forked_backpressure_no_uaf() {
     printf("  test_pipeline_forked_backpressure_no_uaf...");
@@ -898,9 +1002,10 @@ static void test_pipeline_forked_backpressure_no_uaf() {
     assert(pipeline.play());
     pipeline.waitEOS();
 
-    // 快 Sink 应收到大部分帧，慢 Sink 因为队列满会被 tryPush 丢弃一些
-    assert(fast->received() > 0);
-    assert(slow->received() > 0);
+    // Route 满时阻塞 publish，不允许任何可靠订阅者丢帧。
+    assert(pipeline.lastError().empty());
+    assert(fast->received() == 200);
+    assert(slow->received() == 200);
 
     printf(" OK\n");
 }
@@ -1062,12 +1167,14 @@ int main() {
     test_buffer_from_avpacket_invalid_type();
     test_buffer_from_avframe_invalid_input();
     test_buffer_from_avframe_audio_meta();
-    test_bounded_queue_basic();
-    test_bounded_queue_try_push_full();
-    test_bounded_queue_flush();
-    test_bounded_queue_resize();
-    test_bounded_queue_external_notify();
-    test_select_queue_capacity();
+    test_output_route_shared_delivery();
+    test_output_route_ack_controls_backpressure();
+    test_output_route_delivery_abandon_retries();
+    test_output_route_ack_after_processing();
+    test_output_route_cancel_wakes_subscriber();
+    test_output_route_cancel_wakes_publisher();
+    test_output_route_event_order();
+    test_select_route_capacity();
 
     printf("\n[Graph Tests]\n");
     test_graph_build_cycle_detection();

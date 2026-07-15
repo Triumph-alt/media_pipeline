@@ -34,10 +34,10 @@ class Graph;
 //   runLoop()      — 工作线程主循环
 //
 // 数据分发（子类调用，不感知下游数量）：
-//   pushToDownstream()   — 发送 Buffer 数据，单路阻塞，多路 tryPush
-//   sendCapsEvent()      — 向指定 SrcPad 发送 CapsEvent：校验 media_type ∈ 能力集合 → setActualType → 阻塞 push，失败返回 false
-//   receiveCapsEvent()   — 从指定 SinkPad 收取 CapsEvent：pop → 校验 → setActualType → 存 negotiated_caps_，失败返回 false
-//   sendEOSDownstream()  — 向所有已连接 SrcPad 广播 EOS，阻塞且不丢失
+//   pushToDownstream()   — 向一个逻辑 OutputRoute 可靠发布一次 Buffer
+//   sendCapsEvent()      — 向指定逻辑 Route 可靠发布一次 CapsEvent：校验 → setActualType → publish
+//   receiveCapsEvent()   — 从指定 Subscription acquire/校验/ack CapsEvent，并存 negotiated_caps_
+//   sendEOSDownstream()  — 向每条逻辑 Route 可靠发布一次 EOS
 //   postMessage()        — 统一上报 MessageBus
 //
 // 节点生命周期由 stop_requested_ + MessageBus 表达，不维护独立的 NodeState：
@@ -85,13 +85,12 @@ protected:
 
     // ===== 数据分发 =====
 
-    // 推送 Buffer 到下游
-    // src_pad_name 为空：推给所有 SrcPad（单路阻塞，多路 tryPush）
-    // src_pad_name 非空：推给指定 SrcPad（DemuxNode 按流类型分发）
-    void pushToDownstream(Buffer* buf, const std::string& src_pad_name = "");
+    // 将一个 Buffer 发布到指定逻辑 Route。src_pad_name 为空时，节点必须只有一条逻辑输出 Route。
+    // Buffer 所有权在调用时转移给 Route；返回 false 表示未发布（取消/无订阅）。
+    bool pushToDownstream(Buffer* buf, const std::string& src_pad_name = "");
 
-    // 向所有已连接 SrcPad 广播 EOS，阻塞 push，不允许丢失
-    void sendEOSDownstream();
+    // 向每条不同的逻辑 Route publish 一次 EOS，不允许丢失。
+    bool sendEOSDownstream();
 
     // 向指定 SrcPad 的下游发送 CapsEvent，阻塞 push，不允许丢失
     // 内部校验 caps.media_type ∈ SrcPad.templateCaps
@@ -107,7 +106,11 @@ protected:
     void postMessage(MessageType type, const std::string& text, int code = 0);
 
     // Pad 管理
+    // 添加新的逻辑输出 Route，并创建其首个 SrcPad。
     SrcPad*  addSrcPad(const std::string& name, TemplateCaps caps);
+
+    // 为已有逻辑输出创建一个新的分叉 SrcPad；新 Pad 与 source_pad 共享 Route。
+    SrcPad*  addBranchedSrcPad(const std::string& name, const SrcPad& source_pad);
     SinkPad* addSinkPad(const std::string& name, TemplateCaps caps);
 
     // 动态请求 Pad，需要支持分叉的节点需要重写对应的方法
@@ -158,7 +161,7 @@ protected:
             if (!existing.contains(hint_type)) {
                 return nullptr;
             }
-            return addSrcPad(name, existing);
+            return addBranchedSrcPad(name, *src_pads_[0]);
         }
         // 如果是首个 pad，从 hint_type 建立最初的能力集合
         return addSrcPad(name, TemplateCaps{{hint_type}});
@@ -181,7 +184,7 @@ protected:
     void runLoop() override;
 
     // 子类实现：消费一帧数据
-    virtual void consume(Buffer* buf) = 0;
+    virtual void consume(const Buffer* buf) = 0;
 
     // 子类可重写：处理事件（默认收到 EOS 时上报 Pipeline）
     virtual void onEvent(const Event& event);
@@ -206,7 +209,7 @@ protected:
     // 子类实现：一个输入，产出 0 到 N 个输出
     // DecodeNode：一个 packet → 0 到 N 帧
     // EncodeNode：一帧 → 0 到 1 个 packet
-    virtual void process(Buffer* input, std::vector<Buffer*>& outputs) = 0;
+    virtual void process(const Buffer* input, std::vector<Buffer*>& outputs) = 0;
 
     // 子类可重写：处理事件（默认透传给下游）
     virtual void onEvent(const Event& event);
@@ -219,7 +222,7 @@ protected:
             if (!existing.contains(hint_type)) {
                 return nullptr;
             }
-            return addSrcPad(name, existing);   // 复制完整能力集合
+            return addBranchedSrcPad(name, *src_pads_[0]);   // 复制完整能力集合
         }
         return addSrcPad(name, TemplateCaps{{hint_type}});
     }
@@ -347,7 +350,7 @@ protected:
 
     // 写一帧。stream_index 是 addStream() 返回的抽象输出流序号；
     // buf 只读且所有权仍归基类。失败前由具体类上报 ERROR。
-    virtual bool writePacket(Buffer* buf, int stream_index) = 0;
+    virtual bool writePacket(const Buffer* buf, int stream_index) = 0;
 
     // 写文件尾；失败前由具体类上报 ERROR。
     virtual bool writeTrailer() = 0;

@@ -25,7 +25,7 @@ public:
 protected:
     bool onReady() override { return true; }
     bool onStreamInfo() override;
-    void consume(Buffer* buf) override;
+    void consume(const Buffer* buf) override;
     void onStop() override;
 
 private:

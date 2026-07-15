@@ -99,8 +99,13 @@ bool DecodeNode::onStreamInfo() {
         out_caps.sample_fmt  = ctx_->sample_fmt;
     }
 
-    // 4. resize SrcPad 的 Edge Queue 到正确容量，再发 CapsEvent
-    src_pads_[0]->edge()->queue->resize(selectQueueCapacity(out_caps.media_type));
+    // 4. 调整逻辑输出 Route 容量，再只发布一次 CapsEvent。
+    auto* output_pad = getSrcPad("out_0");
+    if (!output_pad || !output_pad->isConnected() || !output_pad->route()) {
+        postMessage(MessageType::ERROR, "DecodeNode: output route is not connected");
+        return false;
+    }
+    output_pad->route()->resize(selectRouteCapacity(out_caps.media_type));
     if (!sendCapsEvent("out_0", out_caps)) {
         return false;
     }
@@ -112,7 +117,7 @@ bool DecodeNode::onStreamInfo() {
 // ===================================================================
 // process: send_packet → receive_frame 循环
 // ===================================================================
-void DecodeNode::process(Buffer* input, std::vector<Buffer*>& outputs) {
+void DecodeNode::process(const Buffer* input, std::vector<Buffer*>& outputs) {
     AVPacket* pkt = toAVPacket(input);
     if (!pkt) {
         postMessage(MessageType::ERROR, "DecodeNode: toAVPacket failed");
@@ -213,7 +218,7 @@ void DecodeNode::onStop() {
 // ===================================================================
 // toAVPacket: 将 Buffer 数据转为 AVPacket（深拷贝 payload）
 // ===================================================================
-AVPacket* DecodeNode::toAVPacket(Buffer* buf) {
+AVPacket* DecodeNode::toAVPacket(const Buffer* buf) {
     if (!buf || buf->size > static_cast<size_t>(INT_MAX)) {
         return nullptr;
     }

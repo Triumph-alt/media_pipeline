@@ -128,7 +128,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (!user_requested_stop) {
-        fprintf(stderr, "playback finished\n");
+        fprintf(stderr, "playback finished: rendered %d frames\n",
+                vrender->renderedFrames());
     }
     return 0;
 }

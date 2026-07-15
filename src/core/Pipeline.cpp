@@ -9,6 +9,9 @@ bool Pipeline::link(BaseNode* src, const std::string& src_pad,
                     BaseNode* dst, const std::string& dst_pad,
                     MediaType hint_type)
 {
+    if (state_ != PipelineState::NULL_STATE) {
+        return false;
+    }
     return graph_.link(src, src_pad, dst, dst_pad, hint_type);
 }
 
@@ -88,8 +91,8 @@ void Pipeline::stop() {
         node->stop_requested_.store(true);
     }
 
-    // 2. flush 所有 Edge Queue，唤醒阻塞中的节点线程
-    graph_.flushAllQueues();
+    // 2. cancel 所有 OutputRoute，唤醒阻塞中的 publish/acquire 以及 Mux 外部等待
+    graph_.cancelAllRoutes();
 
     // 3. join 所有节点线程
     for (auto& [node, thread] : threads_) {

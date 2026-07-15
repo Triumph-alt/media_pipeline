@@ -1,48 +1,37 @@
-#include "pipeline/core/Pad.h"
 #include "pipeline/core/Edge.h"
+#include "pipeline/core/Pad.h"
 
 namespace pipeline {
 
-// ===================================================================
-// SrcPad: 通过 Edge Queue 推送数据
-// ===================================================================
-
-void SrcPad::pushBlocking(QueueItem item) {
-    if (edge_ && edge_->queue) {
-        edge_->queue->pushBlocking(std::move(item));
+std::optional<RouteDelivery> SinkPad::acquireBlocking() {
+    if (!edge_ || !edge_->subscription) {
+        return std::nullopt;
     }
+    return edge_->subscription.acquireBlocking();
 }
 
-bool SrcPad::tryPush(QueueItem item) {
-    if (edge_ && edge_->queue) {
-        return edge_->queue->tryPush(std::move(item));
+std::optional<RouteDelivery> SinkPad::tryAcquire() {
+    if (!edge_ || !edge_->subscription) {
+        return std::nullopt;
     }
-    return false;
-}
-
-// ===================================================================
-// SinkPad: 从 Edge Queue 拉取数据
-// ===================================================================
-
-std::optional<QueueItem> SinkPad::popBlocking() {
-    if (edge_ && edge_->queue) {
-        return edge_->queue->popBlocking();
-    }
-    return std::nullopt;
-}
-
-std::optional<QueueItem> SinkPad::tryPop() {
-    if (edge_ && edge_->queue) {
-        return edge_->queue->tryPop();
-    }
-    return std::nullopt;
+    return edge_->subscription.tryAcquire();
 }
 
 std::optional<QueueItem> SinkPad::peek() const {
-    if (edge_ && edge_->queue) {
-        return edge_->queue->peek();
+    if (!edge_ || !edge_->subscription) {
+        return std::nullopt;
     }
-    return std::nullopt;
+    return edge_->subscription.peek();
+}
+
+void SinkPad::setRouteNotify(std::function<void()> callback) {
+    if (!edge_ || !edge_->subscription) {
+        return;
+    }
+    auto route = edge_->subscription.route_;
+    if (route) {
+        route->setNotifyCallback(std::move(callback));
+    }
 }
 
 } // namespace pipeline

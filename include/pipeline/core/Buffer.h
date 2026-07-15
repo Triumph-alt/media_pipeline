@@ -20,6 +20,8 @@ extern "C" {
 
 namespace pipeline {
 
+class BufferRef;
+
 // ===================================================================
 // BufferMeta: Buffer 的逐帧格式元信息（按数据类型分三种）
 // 部分基础格式字段与 CapsEvent 重复，但也携带 packet/frame 级属性
@@ -60,9 +62,10 @@ using BufferMeta = std::variant<VideoRawMeta, AudioRawMeta, EncodedMeta>;
 //   - Buffer::unref() 减少引用计数，归零时 delete this（析构释放 data）
 //   - 通过 BufferRef RAII 包装自动管理
 //
-// 分叉策略（第一阶段）：
-//   - clone() 深拷贝，每路下游各自拥有一份独立副本
-//   - 后续优化为引用计数零拷贝（共享数据区）
+// 分叉策略：
+//   - OutputRoute Entry 只保存一份 BufferRef
+//   - 多个订阅者复制 BufferRef 句柄，共享发布后只读的 payload
+//   - clone() 仅保留为显式深拷贝工具，不用于正式分叉传输
 // ===================================================================
 class Buffer {
 public:
@@ -80,19 +83,22 @@ public:
     BufferMeta meta;
 
     // ===== 引用计数 =====
-    std::atomic<int> ref_count{1};
+    mutable std::atomic<int> ref_count{1};
 
-    void ref() {
+    void ref() const {
         ref_count.fetch_add(1, std::memory_order_relaxed);
     }
 
-    void unref() {
+    void unref() const {
         if (ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             delete this;
         }
     }
 
-    // ===== 深拷贝（分叉时每路各自一份）=====
+    // 为异步只读持有者创建共享引用，不复制 payload。
+    BufferRef share() const;
+
+    // ===== 显式深拷贝工具（正式分叉传输不调用）=====
     Buffer* clone() const;
 
     // ===== 工厂方法：从 FFmpeg 结构拷入数据 =====
@@ -116,7 +122,7 @@ private:
 // ===================================================================
 class BufferRef {
 public:
-    explicit BufferRef(Buffer* buf = nullptr) : buf_(buf) {}
+    explicit BufferRef(const Buffer* buf = nullptr) : buf_(buf) {}
 
     ~BufferRef() {
         if (buf_) buf_->unref();
@@ -151,17 +157,25 @@ public:
     }
 
     // 访问
-    Buffer* get() const { return buf_; }
-    Buffer* operator->() const { return buf_; }
+    const Buffer* get() const { return buf_; }
+    const Buffer* operator->() const { return buf_; }
     explicit operator bool() const { return buf_ != nullptr; }
 
-    // 深拷贝分叉
+    // 生产者完成构造、发布前的内部可写访问。发布后的消费接口只暴露 const Buffer。
+    Buffer* mutableGet() { return const_cast<Buffer*>(buf_); }
+
+    // 显式深拷贝工具
     BufferRef clone() const {
         return BufferRef(buf_ ? buf_->clone() : nullptr);
     }
 
 private:
-    Buffer* buf_;
+    const Buffer* buf_;
 };
+
+inline BufferRef Buffer::share() const {
+    ref();
+    return BufferRef(this);
+}
 
 } // namespace pipeline

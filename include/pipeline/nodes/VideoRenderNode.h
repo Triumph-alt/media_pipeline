@@ -43,18 +43,19 @@ public:
     void closeOnMainThread();
 
     const std::string& lastRenderError() const { return render_error_; }
+    int renderedFrames() const { return rendered_frames_; }
 
 protected:
     bool onReady() override { return true; }
     bool onStreamInfo() override;
-    void consume(Buffer* buf) override;
+    void consume(const Buffer* buf) override;
     void onStop() override;
 
 private:
     bool ensureMainThread(const char* operation);
     bool failRender(const std::string& message);
     bool ensureTexture(int width, int height);
-    void releasePendingFrame(Buffer* expected);
+    void releasePendingFrame(const Buffer* expected);
 
     int width_  = 0;
     int height_ = 0;

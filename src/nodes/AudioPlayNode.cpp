@@ -105,7 +105,7 @@ bool AudioPlayNode::onStreamInfo() {
 // 严格按设计文档 §9.3 的 AudioPlayNode::consume 逻辑。
 // SDL3 的 AudioStream 会自动处理设备格式差异。
 // ===================================================================
-void AudioPlayNode::consume(Buffer* buf) {
+void AudioPlayNode::consume(const Buffer* buf) {
     if (!buf || buf->size == 0) return;
 
     const uint8_t* data = buf->data;
