@@ -228,8 +228,8 @@ void BaseNode::postMessage(MessageType type, const std::string& text, int code) 
     if (pipeline_) {
         pipeline_->bus()->post({type, this, text, code});
     }
-    // ERROR 时设置自己退出
-    if (type == MessageType::ERROR) {
+    // ERROR 和 STOP_REQUESTED 都要求当前节点立即退出工作循环。
+    if (type == MessageType::ERROR || type == MessageType::STOP_REQUESTED) {
         stop_requested_.store(true);
     }
 }

@@ -67,7 +67,6 @@ bool VideoRenderNode::pollWindowCloseRequested() {
     while (SDL_PollEvent(&event)) {
         if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
             event.window.windowID == window_id) {
-            stop_requested_.store(true);
             return true;
         }
     }

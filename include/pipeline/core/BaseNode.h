@@ -28,8 +28,8 @@ class Graph;
 // BaseNode: 节点抽象基类
 //
 // 生命周期回调（由 Pipeline/Graph 调用）：
-//   onReady()      — Ready 阶段第一步，初始化自身资源
-//   onStreamInfo() — Ready 阶段第三步，发送/处理 CapsEvent
+//   onReady()      — 初始化自身资源
+//   onStreamInfo() — 发送/处理 CapsEvent
 //   onStop()       — 释放不要求节点工作线程亲和性的资源（join 线程后调用）
 //   runLoop()      — 工作线程主循环；线程亲和性资源可在退出前由所属节点线程释放
 //
@@ -42,10 +42,8 @@ class Graph;
 //
 // 节点生命周期由 stop_requested_ + MessageBus 表达，不维护独立的 NodeState：
 //   - 正常退出：Pipeline::stop() 置 stop_requested_，runLoop 循环退出
-//   - 出错退出：节点 postMessage(ERROR)（内部同步置 stop_requested_），
-//     Pipeline 从 MessageBus 侧收集 last_error_
-//   - 节点请求停止：VideoRenderNode 设置自身 stop_requested_ 并 postMessage(STOP_REQUESTED)，
-//     Pipeline 由 MessageBus 记录请求并唤醒 waitEOS
+//   - 出错退出：postMessage(ERROR) 同步置 stop_requested_，Pipeline 从 MessageBus 收集 last_error_
+//   - 节点请求停止：postMessage(STOP_REQUESTED) 同步置 stop_requested_，Pipeline 记录请求并唤醒 waitEOS
 // ===================================================================
 class BaseNode {
 public:
@@ -64,15 +62,13 @@ protected:
     // 所有子类必须在初始化列表里调用此构造函数
     // 不提供默认构造，忘记调用会编译报错，避免 name_ 为空
     explicit BaseNode(const std::string& name) : name_(name) {}
-    // ===== 生命周期回调 =====
 
-    // Ready 阶段第一步：初始化自身资源
-    // Source/DemuxNode：打开设备/文件，探测流信息，但不发送 CapsEvent
+    // 初始化自身资源，Source/Demux 可在此探测流，但不发送 CapsEvent
     // Transform/SinkNode：基础初始化（此时尚未收到 CapsEvent）
     // 返回 true 成功，false 失败
     virtual bool onReady() = 0;
 
-    // Ready 阶段第三步：发送/处理 CapsEvent（Queue 已就绪）
+    // 发送/处理 CapsEvent（Queue 已就绪）
     // Source/DemuxNode：构造并发送 CapsEvent
     // TransformNode：取出上游 CapsEvent → 初始化处理器 → 发送输出 CapsEvent
     // 普通 SinkNode：取出 CapsEvent → 初始化处理器
@@ -88,13 +84,11 @@ protected:
     // 工作线程主循环（由 Pipeline 创建的线程调用）
     virtual void runLoop() = 0;
 
-    // ===== 数据分发 =====
-
-    // 将一个 Buffer 发布到指定逻辑 Route。src_pad_name 为空时，节点必须只有一条逻辑输出 Route。
-    // Buffer 所有权在调用时转移给 Route；返回 false 表示未发布（取消/无订阅）。
+    // 将一个 Buffer 发布到指定逻辑 Route。src_pad_name 为空时，节点必须只有一条逻辑输出 Route
+    // Buffer 所有权在调用时转移给 Route；返回 false 表示未发布（取消/无订阅）
     bool pushToDownstream(Buffer* buf, const std::string& src_pad_name = "");
 
-    // 向每条不同的逻辑 Route publish 一次 EOS，不允许丢失。
+    // 向每条不同的逻辑 Route publish 一次 EOS，不允许丢失
     bool sendEOSDownstream();
 
     // 向指定 SrcPad 的下游发送 CapsEvent，阻塞 push，不允许丢失

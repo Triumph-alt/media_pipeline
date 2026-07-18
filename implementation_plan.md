@@ -282,4 +282,6 @@ FFmpeg 需额外开启 encoder 和 muxer（见第一阶段 1.3 配置）。
 | RTSP 推流 | RTSPPushNode |
 | 线程绑核 | pthread_setaffinity_np |
 | AV Sync 自适应 | 丢帧阈值动态调整 |
+| 媒体兼容性 | Packet side data、pkt_timebase、best_effort_timestamp、send/receive EAGAIN、非 YUV420P swscale、色彩空间/HDR 等按具体节点补全 |
+| VideoRender 事件轮询 | 当前只在取得视频帧并进入 `consume()` 时检查窗口关闭；上游无帧期间的及时响应待优化 |
 | 输出所有权类型化 | `TransformNode::process` 的 outputs 后续改为 `std::vector<BufferRef>`；输入已通过 const Buffer + RouteDelivery ack 收紧 |
