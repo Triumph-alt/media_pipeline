@@ -118,13 +118,14 @@ void Pipeline::stop() {
 }
 
 // ===================================================================
-// waitEOS: 阻塞等待所有 Sink 收到 EOS 或发生错误
+// waitEOS: 阻塞等待所有 Sink 正常 EOS、节点错误或节点 STOP_REQUESTED
 // ===================================================================
 void Pipeline::waitEOS() {
     std::unique_lock lock(eos_mutex_);
     eos_cv_.wait(lock, [this] {
         return active_sink_count_.load() == 0
             || error_occurred_.load()
+            || stop_requested_by_node_.load()
             || state_.load() != PipelineState::RUNNING;  // 外部 stop() 已执行
     });
     lock.unlock();
@@ -134,7 +135,8 @@ void Pipeline::waitEOS() {
 }
 
 // ===================================================================
-// messageBusLoop: MessageBus 监听线程主循环
+// messageBusLoop: MessageBus 监听线程主循环。
+// STOP_REQUESTED 只设置状态并唤醒 waitEOS，由 waitEOS 所在线程执行 stop。
 // ===================================================================
 void Pipeline::messageBusLoop() {
     while (true) {
@@ -154,6 +156,11 @@ void Pipeline::messageBusLoop() {
                     std::lock_guard lock(error_mutex_);
                     last_error_ = msg->text;
                 }
+                eos_cv_.notify_all();
+                break;
+
+            case MessageType::STOP_REQUESTED:
+                stop_requested_by_node_.store(true);
                 eos_cv_.notify_all();
                 break;
 

@@ -3,64 +3,42 @@
 #include "pipeline/core/BaseNode.h"
 
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
-#include <mutex>
 #include <string>
 
 namespace pipeline {
 
-enum class VideoRenderEvent {
-    NONE,
-    QUIT,
-    ERROR,
-};
-
-enum class VideoPresentResult {
-    NO_FRAME,
-    WAITING,
-    PRESENTED,
-    ERROR,
-};
-
 // ===================================================================
 // VideoRenderNode: SDL3 视频渲染节点（SinkNode 子类）
 //
-// Pipeline 工作线程中的 consume() 只把帧投递到容量为 1 的 mailbox，
-// 并等待主线程完成该帧呈现，以此向 Decode/Demux 传递可靠背压。
-//
-// SDL 视频 API 有主线程约束，因此窗口、事件泵、纹理上传、Present 和
-// 资源销毁全部由宿主 main 线程通过 *OnMainThread() 接口驱动。
+// SDL VIDEO、Window、Renderer 和 Texture 全部由节点工作线程创建、使用和
+// 销毁；节点只处理自身窗口的关闭请求，其他 SDL 输入事件暂不属于本节点范围。
 // ===================================================================
 class VideoRenderNode final : public SinkNode {
 public:
     explicit VideoRenderNode(const std::string& name);
 
-    bool openOnMainThread();
-    VideoRenderEvent pollEventOnMainThread();
-    VideoPresentResult presentOnMainThread();
-    void cancelMailbox();
-    void closeOnMainThread();
-
-    const std::string& lastRenderError() const { return render_error_; }
     int renderedFrames() const { return rendered_frames_; }
 
 protected:
     bool onReady() override { return true; }
     bool onStreamInfo() override;
+    void runLoop() override;
     void consume(const Buffer* buf) override;
     void onStop() override;
 
 private:
-    bool ensureMainThread(const char* operation);
-    bool failRender(const std::string& message);
+    bool openRenderer();
+    void closeRenderer();
     bool ensureTexture(int width, int height);
-    void releasePendingFrame(const Buffer* expected);
+    bool failRender(const std::string& message);
+    bool pollWindowCloseRequested();
+    bool waitForPresentationTime(int64_t pts_us);
 
     int width_  = 0;
     int height_ = 0;
 
-    // SDL 资源只允许由 main 线程访问。
+    // 只允许节点工作线程访问；窗口关闭请求也在该线程轮询处理。
     void* window_   = nullptr;
     void* renderer_ = nullptr;
     void* texture_  = nullptr;
@@ -68,19 +46,12 @@ private:
     int texture_height_ = 0;
     bool sdl_video_initialized_ = false;
 
-    // 容量为 1 的同步 mailbox。工作线程投递后等待 main 线程呈现完成。
-    std::mutex mailbox_mutex_;
-    std::condition_variable mailbox_cv_;
-    BufferRef pending_frame_;
-    bool mailbox_cancelled_ = false;
-
     // 纯视频阶段以首帧 PTS 为零点，按 steady clock 实时呈现。
     bool timing_started_ = false;
     int64_t first_pts_us_ = 0;
     std::chrono::steady_clock::time_point timing_start_;
 
     int rendered_frames_ = 0;
-    std::string render_error_;
 };
 
 } // namespace pipeline

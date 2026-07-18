@@ -25,13 +25,13 @@
 | ALSA (libasound) | 音频采集 |
 | CMake 3.16+ | 构建系统 |
 
-### 1.4 第一阶段不做的事情
+### 1.4 当前阶段不做的事情
 
 - 不支持硬件编解码加速（VAAPI / V4L2 M2M）
 - 不支持 DMA-BUF 零拷贝（Buffer 第一阶段全部拷贝）
 - 不支持动态插件加载（.so）
 - 不支持运行时格式变化（CapsEvent 只在 Ready 阶段传递一次）
-- 不支持 Windows / macOS
+- 不支持 Windows / macOS，VideoRenderNode 的 SDL 视频线程模型只面向 Linux / 嵌入式 Linux
 
 ### 1.5 典型链路示例
 
@@ -73,6 +73,8 @@ Pipeline
 ├── MessageBus（节点向 Pipeline 上报消息）
 └── 线程表（每个 Node 对应一个 std::thread）
 ```
+
+Pipeline 统一创建和管理每个 Node 的工作线程，但是具有线程亲和性的资源（如 SDL 视频相关资源）仍由所属节点线程持有完整生命周期，使用和销毁均在该节点工作线程内完成，不套用“Ready 创建、join 后 onStop 释放”的普通资源生命周期
 
 ### 2.2 数据流模型
 
@@ -570,6 +572,41 @@ protected:
     }
 };
 ```
+
+#### 5.3.1 VideoRenderNode
+
+`VideoRenderNode` 是 `SinkNode` 的具体 SDL3 视频渲染实现。它仍由 Pipeline 为其创建独立工作线程，但 SDL 视频资源具有线程亲和性，其完整生命周期必须在该工作线程内完成
+
+进程级约束：
++ **当前进程只支持一个 VideoRenderNode，且该节点必须是进程中首次真正初始化 SDL 视频子系统的拥有者**
++ 应用或其他模块不得在 VideoRenderNode 之前初始化 SDL 视频子系统
++ 不支持多个 Pipeline 在同一进程内各自拥有 VideoRenderNode
++ SDL AUDIO / EVENTS 可以提前初始化，但不改变上述 SDL VIDEO 的线程归属约束
++ 本方案依赖 SDL3 在非 Apple 平台将首次调用 SDL_Init(SDL_INIT_VIDEO) 的线程视为 SDL 视频主线程，macOS 暂不适用；未来若支持 Apple 平台，需改用符合平台主线程约束的执行模型
+
+生命周期:
++ Ready 阶段只接收并保存上游 `CapsEvent`，不初始化 SDL 视频子系统，也不创建 Window、Renderer 或 Texture
++ 进入 Running 后，工作线程按如下顺序完成资源管理与渲染(SDL_InitSubSystem(SDL_INIT_VIDEO)):
+    + SDL_Window / SDL_Renderer 创建
+    + 消费 VIDEO_RAW Buffer，创建或更新 SDL_Texture
+    + Update / Clear / Render / Present
+    + 线程退出前销毁 Texture / Renderer / Window
+    + SDL_QuitSubSystem(SDL_INIT_VIDEO)
+
+线程退出前完成线程亲和资源的清理，Pipeline 通过 join 等待其结束
+
+SDL 事件处理：
++ VideoRenderNode 当前只消费并处理自己窗口的 `SDL_EVENT_WINDOW_CLOSE_REQUESTED`，通过窗口 ID 过滤其他窗口事件
++ 键盘、鼠标、手柄、触摸、剪贴板、拖放、音频设备、相机、
+`SDL_EVENT_QUIT`、窗口大小变化和其他窗口事件暂不属于本节点功能范围
++ 使用 VideoRenderNode 时，SDL 事件队列由其工作线程消费，应用层不应再调用
+`SDL_PollEvent()`、`SDL_WaitEvent()` 或 `SDL_PumpEvents()`
+
+停止请求：
++ 捕获自身窗口关闭请求后，节点设置本地 `stop_requested_` 结束当前消费循环，并通过
+`MessageType::STOP_REQUESTED` 向 Pipeline 请求停止
++ 该消息不是 EOS，也不是后端 ERROR
++ VideoRenderNode 仍在线程退出前清理 SDL 资源，Pipeline 的 MessageBus、`waitEOS()` 和 `stop()` 分别按各自章节的合同处理该停止请求
 
 ### 5.4 TransformNode
 
@@ -1145,30 +1182,30 @@ NULL_STATE ──(build)──→ BUILT ──(play)──→ RUNNING ──(sto
 
 ### 7.3 用户输入到 stop() 的链路
 
-框架不内置任何输入监听。用户在自己的 main 函数里自由决定触发方式（SDL 事件、getchar、信号处理、网络命令等），然后调用 `pipeline.stop()`。
+Pipeline 对外保留两种生命周期用法：`waitEOS()` 用于由框架等待自然结束或节点停止请求，
+手动模式则由应用自行调用 `pipeline.stop()`。框架不提供通用应用输入监听
 
-用户侧暴露两个接口：
+VideoRenderNode 对其自身窗口关闭请求的处理是具体节点职责，不等同于框架提供通用 SDL 输入系统
 
 ```cpp
 if (!pipeline.play()) {
     fprintf(stderr, "pipeline play failed: %s\n", pipeline.lastError().c_str());
     return -1;
 }
-pipeline.waitEOS();   // 阻塞等待自然结束或出错，内部自动调 stop()
+pipeline.waitEOS();   // 等待自然 EOS、ERROR 或节点 STOP_REQUESTED，内部自动调 stop()
 
 // 或者
 if (!pipeline.play()) {
     fprintf(stderr, "pipeline play failed: %s\n", pipeline.lastError().c_str());
     return -1;
 }
-// ... 用户自己的事件循环 ...
+// ... 用户自己的生命周期逻辑 ...
 pipeline.stop();      // 用户主动停止
 ```
 
 **waitEOS() 流程**：
 1. 阻塞在 `eos_cv_` 上
-2. 条件：`active_sink_count_ == 0`（所有 Sink 正常 EOS）、`error_occurred_`（有节点报错），
-   或者 `state_` 已经不是 `RUNNING`（说明已经被外部 `stop()` 打断）
+2. 条件：`active_sink_count_ == 0`（所有 Sink 正常 EOS）、`error_occurred_`（有节点报错）、`stop_requested_by_node_`（有节点请求 Pipeline 停止），或者 `state_` 已经不是 `RUNNING`（说明已经被外部 `stop()` 打断）
 3. 唤醒后调用 `stop()`（已经停止过的情况下，`stop()` 内部 CAS 直接返回，不会重复执行）
 
 **stop() 流程**：
@@ -1183,8 +1220,8 @@ pipeline.stop();      // 用户主动停止
 这两种用法也可以同时使用——比如主线程调用 `waitEOS()` 阻塞等待，另一条监听路径（信号处理、另一个线程的事件循环等）检测到退出意图后调用 `stop()`。这两条路径谁先触发不确定，**`stop()`内部的 CAS 保护保证不管谁先到，只有一次真正的清理会被执行，另一次安全地什么都不做**
 
 **节点侧责任分工**：
-- `runLoop` 退出前：数据层面收尾（flush 编解码器缓冲区，把未处理完的数据推出去）
-- `onStop()`：资源层面释放（`avcodec_free_context`、`SDL_DestroyRenderer`、关闭文件句柄等）
+- `runLoop` 退出前：数据层面收尾（flush 编解码器缓冲区，把未处理完的数据推出去）；具有线程亲和性的资源由所属节点工作线程在退出前释放
+- `onStop()`：释放不要求节点工作线程亲和性的资源（`avcodec_free_context`、文件句柄等）；VideoRenderNode 的 SDL 视频资源不在此处释放
 
 ### 7.4 Pipeline 实现骨架
 
@@ -1228,6 +1265,7 @@ private:
     // EOS / Error 状态
     std::atomic<int>                                active_sink_count_{0};
     std::atomic<bool>                               error_occurred_{false};
+    std::atomic<bool>                               stop_requested_by_node_{false};
     std::mutex                                      error_mutex_;       // 保护 last_error_
     std::string                                     last_error_;
     std::mutex                                      eos_mutex_;
@@ -1329,7 +1367,8 @@ void Pipeline::stop() {
     bus_.notify();
     if (bus_thread_.joinable()) bus_thread_.join();
 
-    // 5. 按拓扑逆序调用 onStop()（资源层面释放）
+    // 5. 按拓扑逆序调用 onStop() 释放不要求工作线程亲和性的资源。
+    //    VideoRenderNode 的 SDL 视频资源已在线程退出前由其工作线程释放。
     auto& order = graph_.topoOrder();
     for (auto it = order.rbegin(); it != order.rend(); ++it)
         (*it)->onStop();
@@ -1347,6 +1386,7 @@ void Pipeline::waitEOS() {
     eos_cv_.wait(lock, [this] {
         return active_sink_count_.load() == 0      // 所有 Sink 正常 EOS
             || error_occurred_.load()              // 有节点报错
+            || stop_requested_by_node_.load()      // 有节点请求 Pipeline 停止
             || state_.load() != PipelineState::RUNNING;  // 已被外部 stop() 打断
     });
     lock.unlock();
@@ -1376,6 +1416,11 @@ void Pipeline::messageBusLoop() {
                     std::lock_guard lock(error_mutex_);
                     last_error_ = msg->text;
                 }
+                eos_cv_.notify_all();
+                break;
+
+            case MessageType::STOP_REQUESTED:
+                stop_requested_by_node_.store(true);
                 eos_cv_.notify_all();
                 break;
 
@@ -1492,10 +1537,11 @@ Ready 阶段的 CapsEvent 传递按拓扑顺序逐节点完成。每个节点只
 8. resize 自己的逻辑输出 Route 到 selectRouteCapacity(media_type)
 9. 最后 sendCapsEvent("out_0", out_caps) 向逻辑输出 Route publish 一次 CapsEvent
 
-再比如 VideoRenderNode，直接就是：
-1. 在 onStreamInfo() 中，从 SinkPad Subscription acquire 并 ack CapsEvent
-2. 用 width / height / pix_fmt 初始化 SDL 窗口和纹理
-3. 它没有下游，没有 SrcPad，不需要构造输出 CapsEvent
+再比如 VideoRenderNode，Ready 阶段只完成控制面 Caps 收取：
+1. 在 `onStreamInfo()` 中，从 SinkPad Subscription acquire/ack CapsEvent
+2. 保存 width / height / pix_fmt 等参数，不初始化 SDL 视频子系统，不创建窗口、Renderer 或 Texture
+3. 进入 Running 后由 VideoRender 工作线程初始化 SDL VIDEO 并管理全部视频资源
+4. 它没有下游，没有 SrcPad，不需要构造输出 CapsEvent
 
 **BaseNode 的两个 CapsEvent helper**：
 - `bool sendCapsEvent(src_pad_name, caps)`：定位 SrcPad 所属 Route，校验共享该 Route 的所有 Pad TemplateCaps，设置 actualType 后可靠 publish 一次。
@@ -1660,12 +1706,12 @@ void VideoRenderNode::consume(Buffer* buf) {
 
 ## 10. MessageBus
 
-所有节点通过统一的 `postMessage()` 接口上报消息，Pipeline 内部运行独立的 MessageBus 监听线程处理所有消息类型。
+所有节点通过统一的 `postMessage()` 接口上报消息，Pipeline 内部运行独立的 MessageBus 监听线程处理所有消息类型
 
 ### 10.1 MessageBus 类
 
 ```cpp
-enum class MessageType { EOS, ERROR, WARNING, INFO };
+enum class MessageType { EOS, ERROR, STOP_REQUESTED, WARNING, INFO };
 
 class MessageBus {
 public:
@@ -1725,6 +1771,7 @@ void BaseNode::postMessage(MessageType type, const std::string& text, int code) 
 ```cpp
 postMessage(MessageType::EOS, "");
 postMessage(MessageType::ERROR, "avcodec_open2 failed", -1);
+postMessage(MessageType::STOP_REQUESTED, "window close requested");
 postMessage(MessageType::WARNING, "queue full, dropping frame");
 postMessage(MessageType::INFO, "decoder initialized");
 ```
@@ -1737,6 +1784,7 @@ Pipeline 内部的 `messageBusLoop()` 统一处理所有消息类型：
 |---------|---------|
 | EOS | `active_sink_count_--`，为 0 则 `eos_cv_.notify_all()` |
 | ERROR | `error_occurred_ = true`，记录 `last_error_`，`eos_cv_.notify_all()` |
+| STOP_REQUESTED | `stop_requested_by_node_ = true`，`eos_cv_.notify_all()`；不在 MessageBus 线程中调用 `Pipeline::stop()` |
 | WARNING | 透传给用户观测回调 |
 | INFO | 透传给用户观测回调 |
 

@@ -30,8 +30,8 @@ class Graph;
 // 生命周期回调（由 Pipeline/Graph 调用）：
 //   onReady()      — Ready 阶段第一步，初始化自身资源
 //   onStreamInfo() — Ready 阶段第三步，发送/处理 CapsEvent
-//   onStop()       — 资源释放（join 线程后调用）
-//   runLoop()      — 工作线程主循环
+//   onStop()       — 释放不要求节点工作线程亲和性的资源（join 线程后调用）
+//   runLoop()      — 工作线程主循环；线程亲和性资源可在退出前由所属节点线程释放
 //
 // 数据分发（子类调用，不感知下游数量）：
 //   pushToDownstream()   — 向一个逻辑 OutputRoute 可靠发布一次 Buffer
@@ -44,6 +44,8 @@ class Graph;
 //   - 正常退出：Pipeline::stop() 置 stop_requested_，runLoop 循环退出
 //   - 出错退出：节点 postMessage(ERROR)（内部同步置 stop_requested_），
 //     Pipeline 从 MessageBus 侧收集 last_error_
+//   - 节点请求停止：VideoRenderNode 设置自身 stop_requested_ 并 postMessage(STOP_REQUESTED)，
+//     Pipeline 由 MessageBus 记录请求并唤醒 waitEOS
 // ===================================================================
 class BaseNode {
 public:
@@ -73,11 +75,14 @@ protected:
     // Ready 阶段第三步：发送/处理 CapsEvent（Queue 已就绪）
     // Source/DemuxNode：构造并发送 CapsEvent
     // TransformNode：取出上游 CapsEvent → 初始化处理器 → 发送输出 CapsEvent
-    // SinkNode：取出 CapsEvent → 初始化渲染/播放资源
+    // 普通 SinkNode：取出 CapsEvent → 初始化处理器
+    // 具有线程亲和性资源的具体 Sink（如 VideoRenderNode）可只保存 Caps，
+    // 将资源初始化延迟到自身 runLoop() 所在线程
     // 默认实现返回 true（Sink 节点无需发送）
     virtual bool onStreamInfo() { return true; }
 
-    // 资源释放（Pipeline join 完线程后按拓扑逆序调用）
+    // 释放不要求节点工作线程亲和性的资源（Pipeline join 完线程后按拓扑逆序调用）
+    // 线程亲和性资源由具体节点在 runLoop() 退出前释放
     virtual void onStop() = 0;
 
     // 工作线程主循环（由 Pipeline 创建的线程调用）

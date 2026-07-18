@@ -198,7 +198,7 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 
 ## 第三阶段：Demo 跑通 — 本地播放器
 
-**目标**：实现 DemuxNode、DecodeNode、VideoRenderNode、AudioPlayNode，组装出完整播放器管线。
+目标：实现 DemuxNode、DecodeNode、VideoRenderNode、AudioPlayNode，组装出完整播放器管线。
 
 ### 任务
 
@@ -206,7 +206,7 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 |------|---------|
 | DemuxNode | av_read_frame、时间戳转微秒、多路分发、EOF 发 EOS |
 | DecodeNode | onStreamInfo 打开解码器（输出参数从 ctx 读取，不透传输入）、send/receive、EOS flush |
-| VideoRenderNode | onStreamInfo 初始化 SDL、A/V 同步（超前 100ms sleep / 落后 50ms 丢帧）、sws_scale |
+| VideoRenderNode | `onStreamInfo` 只接收并保存 Caps；SDL VIDEO、Window、Renderer、Texture 在 VideoRender 工作线程中初始化、使用和销毁；按帧处理自身窗口关闭请求并通过 `STOP_REQUESTED` 请求 Pipeline 停止；sws_scale 与视频同步 |
 | AudioPlayNode | onStreamInfo 初始化 SDL 音频、swr_convert、推进 Clock |
 | Demo | player.cpp：Demux → Decode×2 → VideoRender + AudioPlay |
 
@@ -217,6 +217,10 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 - [ ] 纯音频 / 纯视频文件不崩溃
 - [ ] EOS 后正常退出，无线程泄漏
 - [ ] Ctrl+C 中断后正常退出
+- [ ] 当前进程仅使用一个 VideoRenderNode，且无其他模块提前初始化 SDL VIDEO
+- [ ] VideoRender 只处理自身窗口的 `SDL_EVENT_WINDOW_CLOSE_REQUESTED`，其他 SDL 输入事件暂不纳入范围
+- [ ] 窗口关闭后通过 `STOP_REQUESTED` 唤醒 `waitEOS()` 并正常完成 Pipeline 停止
+- [ ] ASAN 下自然 EOS、SIGINT 和窗口关闭路径无内存错误
 - [ ] x86_64 通过
 
 ---

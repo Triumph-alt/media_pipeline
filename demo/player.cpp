@@ -54,15 +54,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // SDL 窗口、Renderer、Texture 和事件泵全部由真正的 main 线程驱动。
-    if (!vrender->openOnMainThread()) {
-        fprintf(stderr, "%s\n", vrender->lastRenderError().c_str());
-        vrender->cancelMailbox();
-        pipeline.stop();
-        vrender->closeOnMainThread();
-        return 1;
-    }
-
     std::atomic<bool> playback_done{false};
     std::thread eos_thread([&pipeline, &playback_done]() {
         pipeline.waitEOS();
@@ -70,55 +61,18 @@ int main(int argc, char* argv[]) {
     });
 
     bool user_requested_stop = false;
-    bool render_failed = false;
-
     while (!playback_done.load()) {
         if (g_interrupted != 0) {
             fprintf(stderr, "interrupted\n");
             user_requested_stop = true;
+            pipeline.stop();
             break;
         }
-
-        pipeline::VideoRenderEvent event = vrender->pollEventOnMainThread();
-        if (event == pipeline::VideoRenderEvent::QUIT) {
-            fprintf(stderr, "window closed\n");
-            user_requested_stop = true;
-            break;
-        }
-        if (event == pipeline::VideoRenderEvent::ERROR) {
-            fprintf(stderr, "%s\n", vrender->lastRenderError().c_str());
-            render_failed = true;
-            break;
-        }
-
-        pipeline::VideoPresentResult result = vrender->presentOnMainThread();
-        if (result == pipeline::VideoPresentResult::ERROR) {
-            fprintf(stderr, "%s\n", vrender->lastRenderError().c_str());
-            render_failed = true;
-            break;
-        }
-
-        // 事件和 PTS 等待都由 main loop 轮询；1ms 睡眠避免空转占满 CPU。
-        if (result != pipeline::VideoPresentResult::PRESENTED) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
-
-    if (user_requested_stop || render_failed) {
-        // 自定义 mailbox 不属于 Graph Edge，必须在 stop()/join 前先取消。
-        vrender->cancelMailbox();
-        pipeline.stop();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     if (eos_thread.joinable()) {
         eos_thread.join();
-    }
-
-    // SDL 资源的销毁也必须留在 main 线程。
-    vrender->closeOnMainThread();
-
-    if (render_failed) {
-        return 1;
     }
 
     std::string pipeline_error = pipeline.lastError();
