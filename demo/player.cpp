@@ -2,6 +2,7 @@
 #include "pipeline/nodes/AVDemuxNode.h"
 #include "pipeline/nodes/DecodeNode.h"
 #include "pipeline/nodes/VideoRenderNode.h"
+#include "pipeline/nodes/AudioPlayNode.h"
 
 #include <atomic>
 #include <chrono>
@@ -32,7 +33,9 @@ int main(int argc, char* argv[]) {
 
     auto* demux   = pipeline.addNode<pipeline::AVDemuxNode>("demux", argv[1]);
     auto* vdecode = pipeline.addNode<pipeline::DecodeNode>("vdecode");
+    auto* adecode = pipeline.addNode<pipeline::DecodeNode>("adecode");
     auto* vrender = pipeline.addNode<pipeline::VideoRenderNode>("vrender");
+    auto* aplay   = pipeline.addNode<pipeline::AudioPlayNode>("aplay");
 
     if (!pipeline.link(demux, "video_0", vdecode, "in",
                        pipeline::MediaType::VIDEO_ENCODED)) {
@@ -42,6 +45,16 @@ int main(int argc, char* argv[]) {
     if (!pipeline.link(vdecode, "out_0", vrender, "in",
                        pipeline::MediaType::VIDEO_RAW)) {
         fprintf(stderr, "link(vdecode out_0 -> vrender) failed\n");
+        return 1;
+    }
+    if (!pipeline.link(demux, "audio_0", adecode, "in",
+                       pipeline::MediaType::AUDIO_ENCODED)) {
+        fprintf(stderr, "link(demux audio_0 -> adecode) failed\n");
+        return 1;
+    }
+    if (!pipeline.link(adecode, "out_0", aplay, "in",
+                       pipeline::MediaType::AUDIO_RAW)) {
+        fprintf(stderr, "link(adecode out_0 -> aplay) failed\n");
         return 1;
     }
 

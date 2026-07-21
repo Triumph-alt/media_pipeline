@@ -185,6 +185,10 @@ protected:
     // 子类实现：消费一帧数据
     virtual void consume(const Buffer* buf) = 0;
 
+    // 输出侧 drain，默认空实现，子类（如 VideoRenderNode）可重写
+    // 收到上游 EOS 之后，上报最终 EOS 前调用，用于等待输出真正完成（如 AudioPlayNode 要等 SDL 设备播完尾音）
+    virtual void onDrain() {}
+
     // 子类可重写：处理事件（默认收到 EOS 时上报 Pipeline）
     virtual void onEvent(const Event& event);
 };

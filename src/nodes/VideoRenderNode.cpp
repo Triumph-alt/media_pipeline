@@ -1,5 +1,7 @@
 #include "pipeline/nodes/VideoRenderNode.h"
 #include "pipeline/core/Buffer.h"
+#include "pipeline/core/Clock.h"
+#include "pipeline/core/Pipeline.h"
 
 extern "C" {
 #include <SDL3/SDL.h>
@@ -74,7 +76,6 @@ bool VideoRenderNode::pollWindowCloseRequested() {
 }
 
 bool VideoRenderNode::openRenderer() {
-    timing_started_ = false;
     rendered_frames_ = 0;
 
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
@@ -165,34 +166,54 @@ bool VideoRenderNode::ensureTexture(int width, int height) {
     return true;
 }
 
+// ===================================================================
+// waitForPresentationTime: 以主时钟为参照控制呈现节奏
+//
+// 主时钟语义（§9）：已锚定时返回"当前估计已到达可听输出端的媒体时间位置"
+// 有音频由 AudioPlayNode 用真实消费进度驱动；无音频由本节点首帧一次性锚定
+//   - 未锚定：立即呈现不同步；无音频时本帧锚定墙钟回退，有音频则等音频锚定
+//   - 已锚定：超前则取消感知地等到呈现时刻；落后则立即呈现追帧
+//   - 丢帧策略本轮不实现，留到接音频接线阶段单独定阈值
+// ===================================================================
 bool VideoRenderNode::waitForPresentationTime(int64_t pts_us) {
+    // 视频帧没有 PTS，无法与音频比较，立即呈现
     if (pts_us == AV_NOPTS_VALUE) {
         return true;
     }
 
-    if (!timing_started_) {
-        timing_started_ = true;
-        first_pts_us_ = pts_us;
-        timing_start_ = std::chrono::steady_clock::now();
+    // 查询当前主时钟，有音频时 pos 就是 AudioPlayNode 估算的当前音频播放位置
+    Clock* clock = pipeline_->clock();
+    int64_t pos = clock->getPositionUs();
+
+    // 如果 Clock 还没锚定
+    if (pos == Clock::kUnanchored) {
+        if (!clock->hasAudio()) {
+            // 纯视频，没有音频提供主时钟，使用首个视频帧的 PTS 锚定，视频按墙钟节奏播放
+            clock->anchorOnce(pts_us);
+        }
+        // 有音频，但音频尚未锚定，立即显示
         return true;
     }
 
-    const int64_t relative_pts_us = pts_us - first_pts_us_;
-    while (!stop_requested_.load()) {
-        const auto now = std::chrono::steady_clock::now();
-        const int64_t elapsed_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                now - timing_start_).count();
-        const int64_t remaining_us = relative_pts_us - elapsed_us;
-        if (remaining_us <= 0) {
-            return true;
-        }
+    // 计算视频帧领先还是落后
+    int64_t remaining_us = pts_us - pos;
 
+    // 只要视频仍然超前，就继续等待
+    while (remaining_us > 0 && !stop_requested_.load()) {
+        // 每次最多睡 1ms
         const int64_t sleep_us = std::min<int64_t>(remaining_us, 1000);
         std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+
+        // 每次醒来重新读取 Audio Clock
+        pos = clock->getPositionUs();
+        if (pos == Clock::kUnanchored) {
+            // 防御：时钟被重置，直接呈现
+            return true;
+        }
+        remaining_us = pts_us - pos;
     }
 
-    return false;
+    return !stop_requested_.load();
 }
 
 // ===================================================================

@@ -46,11 +46,6 @@ private:
     int texture_height_ = 0;
     bool sdl_video_initialized_ = false;
 
-    // 纯视频阶段以首帧 PTS 为零点，按 steady clock 实时呈现。
-    bool timing_started_ = false;
-    int64_t first_pts_us_ = 0;
-    std::chrono::steady_clock::time_point timing_start_;
-
     int rendered_frames_ = 0;
 };
 

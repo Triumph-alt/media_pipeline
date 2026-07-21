@@ -257,7 +257,9 @@ void SourceNode::runLoop() {
 // ===================================================================
 
 void SinkNode::runLoop() {
+    // 找到唯一的输入 Pad
     auto* sink_pad = sink_pads_[0].get();
+
     while (!stop_requested_.load()) {
         // 从输入 Route 中阻塞获取下一项待处理数据
         auto delivery = sink_pad->acquireBlocking();
@@ -281,13 +283,23 @@ void SinkNode::runLoop() {
         }
 
         // 如果不是 Buffer，那就是控制事件，理论上 Running 阶段接到的 Event 只有 EOS
-        // ack 会释放 Delivery 内的 QueueItem；复制 Event，使事件生命周期跨过提交点。
+        // ack 会释放 Delivery 内的 QueueItem；复制 Event，使事件生命周期跨过提交点
         Event event = std::get<Event>(item);
         if (std::holds_alternative<EOSEvent>(event)) {
-            // 先 ack EOS
+            // 先 ack EOS（释放上游 Route，输出侧 drain 期间不占背压窗口）
             if (!delivery->ack()) {
                 break;
             }
+
+            // 输出侧 drain，默认空实现；主动 stop 时具体实现内部应立即返回
+            onDrain();
+
+            // drain 被 stop 打断、或 drain 内部出错（postMessage(ERROR) 会置 stop_requested_）时，
+            // 不再上报"自然 EOS"，直接退出循环
+            if (stop_requested_.load()) {
+                break;
+            }
+
             // 再报告 Sink 完成，Pipeline 以全部 Sink 的 EOS 汇总决定自然 stop
             onEvent(event);
             continue;

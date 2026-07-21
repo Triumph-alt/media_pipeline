@@ -72,3 +72,108 @@ VideoRender 工作线程消费 SDL 事件队列，但当前只处理属于自身
 
 VideoRenderNode 检测到自身窗口关闭后调用 `postMessage(MessageType::STOP_REQUESTED, ...)`；
 `postMessage()` 统一设置该节点的 `stop_requested_`，结束消费循环。Pipeline MessageBus 线程收到消息后只设置 `stop_requested_by_node_` 并唤醒 `eos_cv_`
+
+---
+
+## 音频三件事：时钟、背压、EOS drain
+
+### 设计锚点
+
+音频问题的核心不是"找一个更好的 SDL API"，而是定义清楚"音频播放进度"的语义：
+
+- **权威**：SDL 设备真实消费进度是主时钟的唯一来源，不是写入量、不是 `SDL_GetAudioStreamAvailable`、也不是墙钟。
+- **锚定**：主时钟锚定首个有效音频 Buffer 的 PTS；无音频时退化为视频首帧一次性锚定墙钟。
+- **偏移**：音频路径含一段不可观测、有界恒定的硬件缓冲领先；已知不精确，接受不校准。
+- **速率**：两次采样之间用墙钟插值；背压阻塞期间插值继续走，因为设备仍在按消费速率前进。
+
+### 音频 Clock：用 `SDL_GetAudioStreamQueued` 而非 `Available`
+
+`SDL_GetAudioStreamAvailable` 是输出侧（设备格式）可读字节数，与提交账本量纲不一致；一旦 SDL 内部重采样，相减就失真。`SDL_GetAudioStreamQueued` 返回输入侧尚未被设备读取的字节数。
+
+音频播放保留完整的输出提交账本，并显式保存首个有效 PTS 的提交基线：
+
+```text
+submitted_frames_
+    所有成功提交给 SDL 的输出 PCM 总帧数
+frames_before_anchor_
+    首个有效 PTS 所在 Buffer 提交前，已经提交的输出帧数
+anchor_pts_us_
+    首个有效 PTS
+```
+
+锚定后统一按以下公式计算：
+
+```text
+queued_frames = SDL_GetAudioStreamQueued() / bytes_per_sample
+consumed_from_anchor =
+    submitted_frames - frames_before_anchor - queued_frames
+audible = max(0, consumed_from_anchor - 一个设备周期)
+clock = anchor_pts_us + audible / sample_rate
+```
+
+- 锚定前的 NOPTS Buffer 照常提交并计入 `submitted_frames_`，但不更新 Clock；
+- `consumed_from_anchor < 0` 表示设备尚未消费到锚定帧，Clock 保持未锚定，前缀窗口内允许短暂不同步；
+- `consumed_from_anchor >= 0` 后才允许更新 Clock；
+- 锚定后的 NOPTS 继续计数，后续有效 PTS 不重新锚定；
+- 整条音频流没有有效 PTS 时，Audio Clock 保持未锚定；
+- `onDrain()` 等待 `queued_frames` 清空期间也持续刷新 Clock，覆盖负值转为非负值的边界；
+- 正常 `consume()` 与 swr drain 尾部统一经过同一个 SDL 提交/记账入口，避免账本分叉。
+
+当 `consumed_from_anchor` 位于 `[0, device_period]` 时，采样点上的 `audible` 被钳为 0，位置不早于 `anchor_pts_us`；两次采样之间仍按墙钟插值，这是设备周期补偿造成的正常启动行为，不是卡顿。
+
+该公式假设 swr 不改变采样率，输出帧与媒体 PTS 的映射为 1:1；真正重采样时必须重新定义帧数映射。
+
+### 音频 Clock：无条件重锚
+
+Clock 的 `setAudioPosition` 无条件重锚（`base_pts = pts; base_wall = now; anchored = true`），不靠"拒绝落后样本"换取单调。因为：
+
+- 正常播放时 `consumed` 样本本身单调且与墙钟同速；
+- 欠载时设备真实停播，样本如实停滞；若用"只向前"门槛，会把墙钟外推当权威，反而在欠载时让时钟虚构前进。
+
+`anchorOnce` 仅用于无音频场景，由 VideoRenderNode 首帧调用一次。
+
+### 提交背压：双阈值迟滞闸门
+
+SDL AudioStream 内部缓冲对 App 无界；AudioPlayNode 在每次 `SDL_PutAudioStreamData` 之前检查 `SDL_GetAudioStreamQueued`，若超过高水位则取消感知地轮询到低水位再放行。阈值以"设备周期 P"为单位推导：
+
+```
+P    = sample_frames / device_freq (SDL_GetAudioDeviceFormat 查询，失败按 10ms 兜底)
+LOW  = N_low  × P  (N_low=3，小周期设备加 ms 下限兜底)
+HIGH = LOW + N_band × P (N_band=8)
+```
+
+这样常量变成自适配的，不再是脱离硬件的魔法毫秒。迟滞带 N_band 保证每次开闸成批提交，避免"等-put-等-put"的逐块抖动。
+
+背压闸门位于 `consume()` 内、ack 之前，因此"晚 ack"把背压沿 OutputRoute 逐级传导到上游。被 `stop_requested_` 打断时直接返回，不 put、不更新时钟。
+
+### EOS drain：SinkNode 生命周期钩子
+
+普通 `SinkNode::runLoop` 收到 EOS 后直接 `postMessage(EOS)`，把"输入耗尽"当作"完成"。这对 AudioPlayNode 不够：输入 EOS 只说明没有新 Buffer，不说明设备已播完此前提交的 PCM。
+
+新流程：
+
+```
+ack(EOS) → onDrain() → postMessage(EOS)
+```
+
+- `ack` 先释放上游 Route，drain 等待期间不占用背压窗口；
+- `onDrain()` 默认空实现，VideoRenderNode 不受影响；
+- AudioPlayNode 的 `onDrain()` 依次：
+  1. swr 尾部排空（按 `swr_get_delay` + `av_rescale_rnd` 算输出容量）；
+  2. `SDL_FlushAudioStream` 把 SDL 内部残留转换出来；
+  3. 取消感知等待 `SDL_GetAudioStreamQueued() == 0`；
+  4. 再等 3 个设备周期覆盖后端缓冲尾音（(c) 不可观测，按上界等待）。
+- `onDrain()` 内任一 SDL/swr API 失败或 `stop_requested_` 置位，立即返回，且不再上报 EOS。
+
+### 视频消费侧切换
+
+VideoRenderNode 不再保留私有 steady_clock 路径，统一读 `pipeline_->clock()->getPositionUs()`：
+
+- 未锚定：立即呈现；无音频时 `anchorOnce(frame_pts)` 锚定。
+- 已锚定：超前等待、落后立即追帧。丢帧策略本轮不实现。
+
+这样纯视频路径的首帧 PTS 锚定被收进了 Clock，视频节点不再持有独立计时器。
+
+### 启动时序不对称（暂缓）
+
+当前两个呈现 Sink 的首次输出延迟不对称：音频设备在 Ready 阶段即 resume，视频窗口创建需要数秒。这导致 A/V 文件起播时音频先响、视频追帧。完整修复需要启动栅栏（start barrier）：所有共享主时钟的呈现型 Sink 都备好首份输出后再同时释放。该设计已讨论但暂缓，待后续实现；吞吐型 Sink（FileSink、RTSPPush 等）不参与栅栏，因为它们不锚定主时钟。
