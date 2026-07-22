@@ -74,7 +74,9 @@ Pipeline
 └── 线程表（每个 Node 对应一个 std::thread）
 ```
 
-Pipeline 统一创建和管理每个 Node 的工作线程，但是具有线程亲和性的资源（如 SDL 视频相关资源）仍由所属节点线程持有完整生命周期，使用和销毁均在该节点工作线程内完成，不套用“Ready 创建、join 后 onStop 释放”的普通资源生命周期
+Pipeline 统一创建和管理每个 Node 的工作线程，但是具有线程亲和性的资源（如 SDL 视频相关资源）仍由所属节点线程持有完整生命周期，使用和销毁均在该节点工作线程内完成，不套用“Ready 创建、join 后 onStop 释放”的普通资源生命周期。
+
+**进程约束**：同一进程同一时刻至多允许一个存活的 `Pipeline` 实例。`Pipeline` 构造/析构直接管理 SDL 基础设施的 `SDL_Init(0)` / `SDL_Quit()`；不支持两个 Pipeline 并存。节点只管理各自 VIDEO/AUDIO 等具体子系统，不改变此约束。
 
 ### 2.2 数据流模型
 
@@ -433,7 +435,7 @@ protected:
     virtual void runLoop() = 0;
 
     // === 基类统一的数据分发（子类调用，不感知下游数量）===
-    bool pushToDownstream(Buffer* buf, const std::string& src_pad_name = "");
+    bool pushToDownstream(BufferRef&& buf, const std::string& src_pad_name = "");
 
     // 每条不同的逻辑 Route 只 publish 一次 EOS；同一 Route 的所有订阅者各自 acquire/ack
     void sendEOSDownstream();
@@ -480,15 +482,16 @@ protected:
 2. 子类的 onReady 函数具体实现取决于自身需要，比如 Source/DemuxNode 就是打开设备/文件，探测流信息，但不发送 CapsEvent；Transform/SinkNode 只做基础初始化，因为此时尚未收到 CapsEvent，还无法确定具体的参数
 3. 子类的 onStreamInfo 函数具体实现也是取决于自身需要，比如 Source/DemuxNode 就是构造并发送 CapsEvent；Transform/SinkNode 收到上游 CapsEvent 后初始化处理器，再发出自己的 CapsEvent；默认实现返回 true；Sink 节点无需发送
 4. `pushToDownstream` 向一个逻辑 OutputRoute 可靠 publish 一次；同源多个 SrcPad 共享 Route，因此节点不再逐 Pad 分发，也不存在“单路阻塞、多路 tryPush”的分支。不同逻辑流（例如 Demux video/audio）必须显式选择各自 Route。
-5. `pushToDownstream` 调用时转移新建 Buffer 的初始所有权给 `BufferRef`/Route。Route Entry 只保存一份共享只读 BufferRef；每个订阅者 acquire 时复制句柄、引用计数加一，不复制 payload。所有订阅者 ack 后 Entry 才回收，最后一个 BufferRef 析构后底层 Buffer 才释放。
-6. `sendCapsEvent` 与 `receiveCapsEvent` 是 Ready 阶段 CapsEvent 收发的标准封装：发送端校验同一 Route 上所有 Pad 的 TemplateCaps、设置 actualType 并只 publish 一次；接收端 acquire、校验、存入 negotiated_caps_ 后 ack。校验失败会 postMessage(ERROR)，未完成 Delivery 不推进游标，Ready 回滚随后 cancel 全部 Route。
+5. `pushToDownstream(BufferRef&&)` 是唯一 Buffer 发布入口：调用方必须显式 `std::move`，入口立即接管该引用。publish 成功时引用进入 Route Entry；Route 缺失、输出歧义、无订阅或 cancel 等失败路径同样由入口内 RAII 释放。框架不保留拥有型 `Buffer*` 发布重载。
+6. Route Entry 只保存一份共享只读 BufferRef；每个订阅者 acquire 时复制句柄、引用计数加一，不复制 payload。所有订阅者 ack 后 Entry 才回收，最后一个 BufferRef 析构后底层 Buffer 才释放。
+7. `sendCapsEvent` 与 `receiveCapsEvent` 是 Ready 阶段 CapsEvent 收发的标准封装：发送端校验同一 Route 上所有 Pad 的 TemplateCaps、设置 actualType 并只 publish 一次；接收端 acquire、校验、存入 negotiated_caps_ 后 ack。校验失败会 postMessage(ERROR)，未完成 Delivery 不推进游标，Ready 回滚随后 cancel 全部 Route。
     + 同一逻辑 Route 的多个 SrcPad 共享一条 Caps 序列，`sendCapsEvent` 通过任一该 Route 的 src_pad_name 定位后只 publish 一次；接收方分别通过各自 Subscription acquire/ack
     + `receiveCapsEvent` 失败场景包括 Route cancel、取得的不是 CapsEvent、或 caps.media_type 不属于 SinkPad.templateCaps
-7. 动态请求 Pad 只在 link 时，目标 Pad 不存在时调用，节点构造时已声明的固定 Pad（比如 TransformNode 的 "in"）不走这条路，link 会优先查找已存在的 Pad，只有当 Pad 不存在时，才调用这两个方法，由节点自己决定是否允许动态创建、创建出来的 Pad 应该是什么类型。**需要支持分叉的节点（Source/Transform 的多路输出）和多路输入的节点（DemuxNode、MuxNode）一定需要重写对应的方法**。requestPad 有两种不同的语义模型，各自对应不同的 TemplateCaps 处理方式：
+8. 动态请求 Pad 只在 link 时，目标 Pad 不存在时调用，节点构造时已声明的固定 Pad（比如 TransformNode 的 "in"）不走这条路，link 会优先查找已存在的 Pad，只有当 Pad 不存在时，才调用这两个方法，由节点自己决定是否允许动态创建、创建出来的 Pad 应该是什么类型。**需要支持分叉的节点（Source/Transform 的多路输出）和多路输入的节点（DemuxNode、MuxNode）一定需要重写对应的方法**。requestPad 有两种不同的语义模型，各自对应不同的 TemplateCaps 处理方式：
     + Source / Transform 分叉：属于再多一路同源输出，新 pad 的 TemplateCaps 必须和已经存在的 pad 的 TemplateCaps 一致，其最终的 ActualType 自然也落在已有 pad 的能力集合内，因为这种情况本质是同一份处理结果的多路拷贝，所以一个 SourceNode/TransformNode 内所有 SrcPad 的能力声明应当一致，所有 SinkPad 的能力声明应当一致
     + Demux / Mux 多路：属于开一路服务 hint_type 的具体流端口，新 pad 的 TemplateCaps 就是 `{hint_type}`，一个 pad 服务一种流身份。因为在 Demux/Mux 这种节点中，每个 SinkPad 对应容器里一路流，各 pad 天然可能会承载不同类型
-8. requestPad 中的 hint_type **只用于 Ready 之前的能力校验与决定新 pad 的 TemplateCaps，不代表"实际类型 actual_type"**。实际类型由 Ready 阶段的 CapsEvent 敲定，requestPad 不应调用 `setActualType` 直接设置 actual_type，哪怕传入的 hint_type 和事后敲定的最终类型一致
-9. requestPad 会立即把新 Pad 加入节点，因此 `Graph::link` 后续任一步失败都需要调用 `releaseSrcPad` / `releaseSinkPad` 撤销本次新建 Pad，如果有附属状态的节点必须同步清理，例如 DemuxNode release SrcPad 时同时删除 `pad_to_type_` 项
+9. requestPad 中的 hint_type **只用于 Ready 之前的能力校验与决定新 pad 的 TemplateCaps，不代表"实际类型 actual_type"**。实际类型由 Ready 阶段的 CapsEvent 敲定，requestPad 不应调用 `setActualType` 直接设置 actual_type，哪怕传入的 hint_type 和事后敲定的最终类型一致
+10. requestPad 会立即把新 Pad 加入节点，因此 `Graph::link` 后续任一步失败都需要调用 `releaseSrcPad` / `releaseSinkPad` 撤销本次新建 Pad，如果有附属状态的节点必须同步清理，例如 DemuxNode release SrcPad 时同时删除 `pad_to_type_` 项
 
 
 ### 5.2 SourceNode
@@ -590,10 +593,11 @@ Buffer 必须在处理完成后才 ack；停止或处理失败时不 ack 当前 
 `VideoRenderNode` 是 `SinkNode` 的具体 SDL3 视频渲染实现。它仍由 Pipeline 为其创建独立工作线程，但 SDL 视频资源具有线程亲和性，其完整生命周期必须在该工作线程内完成。其余进程级约束、Ready/Running 生命周期、SDL 事件范围和停止请求语义如下：
 
 - **当前进程只支持一个 VideoRenderNode，且该节点必须是进程中首次真正初始化 SDL 视频子系统的拥有者**
-- 应用或其他模块不得在 VideoRenderNode 之前初始化 SDL 视频子系统
+- Pipeline 构造函数调用 `SDL_Init(0)` 建立 SDL 基础设施生命周期，但不带 VIDEO/AUDIO 等子系统 flag；这不会设置 SDL 视频主线程身份
+- **同一进程同一时刻至多一个 Pipeline 存活**；Pipeline 直接一一管理 `SDL_Init(0)` / `SDL_Quit()`，不支持并存 Pipeline
 - 不支持多个 Pipeline 在同一进程内各自拥有 VideoRenderNode
 - SDL AUDIO / EVENTS 可以提前初始化，但不改变上述 SDL VIDEO 的线程归属约束
-- 本方案依赖 SDL3 在非 Apple 平台将首次调用 SDL_Init(SDL_INIT_VIDEO) 的线程视为 SDL 视频主线程，macOS 暂不适用；未来若支持 Apple 平台，需改用符合平台主线程约束的执行模型
+- 本方案依赖 SDL3 在非 Apple 平台将首次调用 SDL_InitSubSystem(SDL_INIT_VIDEO) 的线程视为 SDL 视频主线程，macOS 暂不适用；未来若支持 Apple 平台，需改用符合平台主线程约束的执行模型
 
 生命周期：
 - Ready 阶段只接收并保存上游 `CapsEvent`，不初始化 SDL 视频子系统，也不创建 Window、Renderer 或 Texture
@@ -604,8 +608,13 @@ Buffer 必须在处理完成后才 ack；停止或处理失败时不 ack 当前 
   - Update / Clear / Render / Present
   - 线程退出前销毁 Texture / Renderer / Window
   - SDL_QuitSubSystem(SDL_INIT_VIDEO)
+  - SDL_CleanupTLS()（Pipeline 的 `std::thread` 调用过 SDL API 后清理其线程局部状态）
 
-线程退出前完成线程亲和资源的清理，Pipeline 通过 join 等待其结束
+进程级 SDL 基础设施生命周期由 `Pipeline` 管理：构造时调用 `SDL_Init(0)`，但不初始化任何具体子系统；析构时先完成 `stop()` 的 worker join 与节点资源释放，再调用一次 `SDL_Quit()`。节点仍只负责各自的 `SDL_InitSubSystem` / `SDL_QuitSubSystem`，Pipeline 不触碰 VIDEO/AUDIO 等子系统 flag。
+
+AudioPlay 保持当前资源生命周期：Ready 调用线程初始化 AUDIO/AudioStream，音频 worker 消费和 drain，join 后 `onStop()` 销毁 AudioStream 并退出 AUDIO 子系统；但该 worker 在线程退出前同样调用 `SDL_CleanupTLS()`。
+
+线程退出前完成线程亲和资源和 SDL TLS 的清理，Pipeline 通过 join 等待其结束。
 
 SDL 事件处理：
 - VideoRenderNode 当前只消费并处理自己窗口的 `SDL_EVENT_WINDOW_CLOSE_REQUESTED`，通过窗口 ID 过滤其他窗口事件
@@ -632,28 +641,39 @@ protected:
     explicit TransformNode(const std::string& name) : BaseNode(name) {}
     void runLoop() override {
         auto* sink_pad = sink_pads_[0].get();
-        std::vector<Buffer*> outputs;   // 复用，避免每次循环构造新 vector
+        std::vector<BufferRef> outputs;   // 复用容量；元素负责持有尚未发布的输出
         while (!stop_requested_.load()) {
-            auto item = sink_pad->popBlocking();
-            if (!item) break;
+            auto delivery = sink_pad->acquireBlocking();
+            if (!delivery) break;
 
-            if (std::holds_alternative<BufferRef>(*item)) {
-                outputs.clear();    // 清空复用，不释放已分配内存
-                process(std::get<BufferRef>(*item).get(), outputs);
-                for (auto* out : outputs) {
-                    pushToDownstream(out);
+            const QueueItem& item = delivery->item();
+            if (std::holds_alternative<BufferRef>(item)) {
+                outputs.clear();
+                process(std::get<BufferRef>(item).get(), outputs);
+                if (stop_requested_.load()) break;
+
+                bool outputs_published = true;
+                for (auto& out : outputs) {
+                    if (!pushToDownstream(std::move(out))) {
+                        outputs_published = false;
+                        break;
+                    }
                 }
-            } else if (std::holds_alternative<Event>(*item)) {
-                onEvent(std::get<Event>(*item));
+                if (!outputs_published) break;
+            } else if (std::holds_alternative<Event>(item)) {
+                onEvent(std::get<Event>(item));
+                if (stop_requested_.load()) break;
             }
+
+            if (!delivery->ack()) break;
         }
     }
 
-    // 子类实现：一个输入，产出 0 到 N 个输出，结果写入 outputs
-    // 调用前 outputs 已被 clear()，子类直接 push_back 即可
+    // 子类实现：一个输入，产出 0 到 N 个由 BufferRef 持有的待发布输出
+    // 调用前 outputs 已 clear；子类得到新 Buffer 后立即 emplace 到 outputs
     // DecodeNode：一个 packet → 0 到 N 帧
     // EncodeNode：一帧 → 0 到 1 个 packet
-    virtual void process(Buffer* input, std::vector<Buffer*>& outputs) = 0;
+    virtual void process(const Buffer* input, std::vector<BufferRef>& outputs) = 0;
 
     virtual void onEvent(const Event& event) {
         if (std::holds_alternative<EOSEvent>(event)) {
@@ -2006,17 +2026,17 @@ Pipeline::waitEOS
 1. **Route 容量与内存预算**：当前 Route 先按条目数硬限，`VIDEO_RAW=4`、`VIDEO_ENCODED=32`、`AUDIO_RAW=50`、`AUDIO_ENCODED=32`、`CONTAINER=32`。ENCODED 已从旧 tryPush 时代的 128 下调到 32；RAW audio 和 CONTAINER 要等 AudioPlay/Mux 的设备缓冲与实际输出块大小确定后再调。后续增加 payload 字节上限、节点级总内存预算和高低水位监控。
 2. **分叉可靠传输已完成，但端到端零拷贝未完成**：同源分叉已共享只读 BufferRef，Route Entry 只保存一份 payload；FFmpeg AVPacket/AVFrame 与框架 Buffer、以及未来 V4L2/硬件 surface 之间仍会复制。后续需要 DMA-BUF/硬件帧等外部存储模型。
 3. **有损订阅策略暂不支持**：当前所有静态订阅者都可靠。未来实时预览、统计等确需丢帧时，应在 EdgePolicy 中显式表达 `LATEST_ONLY`/drop 策略；Caps、EOS、格式变化等控制事件仍必须可靠。
-4. **Buffer/输出所有权类型化**：输入已经通过 `const Buffer*` 和 RouteDelivery ack 收紧；`TransformNode::process` 的 `std::vector<Buffer*>` 输出仍依赖调用约定，后续可改为 `std::vector<BufferRef>`。
-5. **Route 通知回调限制**：当前只在 Ready/onStreamInfo 阶段注册，用于唤醒 Mux 多输入调度；若未来需要运行期变更，必须定义通知列表的线程安全边界。
-6. **link/build 错误报告**：核心库当前只返回 bool，不直接 fprintf，也不适合走运行期 MessageBus；详细错误报告机制仍需独立设计。
-7. **Caps/动态格式变化**：Decoder 首帧前可能不知道真实 pix_fmt；当前两阶段 Caps 一次性协商不足以覆盖运行期分辨率/格式变化，需单独设计 preroll 或 generation Caps。
-8. 音视频同步丢帧阈值（落后多少丢帧）待定；完整 channel layout 传递待补。
-9. **媒体兼容性**：Packet side data、`pkt_timebase`、`best_effort_timestamp`、send/receive EAGAIN、非 YUV420P swscale、色彩空间/HDR 等仍需按具体节点补全。
-10. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
-11. **Demux/Mux 边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`，虽 Route 已支持可靠多订阅者输出，但动态 Mux 输出 Pad、最终交织策略、阻塞网络 I/O interrupt callback 和具体 AVMuxNode 仍待实现。
-12. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4；需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
-13. **启动时序对齐（栅栏，暂缓）**：当前多呈现 Sink 启动时首次输出延迟不对称（如音频设备在 Ready 阶段即出声，而视频窗口创建需数秒），造成 A/V 起跑不齐。完整的启动栅栏设计需让共享主时钟的呈现型 Sink 在全部就绪后才同时出首份输出；已讨论但暂缓，待后续实现。
-14. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
+4. **Route 通知回调限制**：当前只在 Ready/onStreamInfo 阶段注册，用于唤醒 Mux 多输入调度；若未来需要运行期变更，必须定义通知列表的线程安全边界。
+5. **link/build 错误报告**：核心库当前只返回 bool，不直接 fprintf，也不适合走运行期 MessageBus；详细错误报告机制仍需独立设计。
+6. **Caps/动态格式变化**：Decoder 首帧前可能不知道真实 pix_fmt；当前两阶段 Caps 一次性协商不足以覆盖运行期分辨率/格式变化，需单独设计 preroll 或 generation Caps。
+7. 音视频同步丢帧阈值（落后多少丢帧）待定；完整 channel layout 传递待补。
+8. **媒体兼容性**：Packet side data、`pkt_timebase`、`best_effort_timestamp`、send/receive EAGAIN、非 YUV420P swscale、色彩空间/HDR 等仍需按具体节点补全。
+9. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
+10. **Demux/Mux 边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`，虽 Route 已支持可靠多订阅者输出，但动态 Mux 输出 Pad、最终交织策略、阻塞网络 I/O interrupt callback 和具体 AVMuxNode 仍待实现。
+11. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4；需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
+12. **启动时序对齐（栅栏，暂缓）**：当前多呈现 Sink 启动时首次输出延迟不对称（如音频设备在 Ready 阶段即出声，而视频窗口创建需数秒），造成 A/V 起跑不齐。完整的启动栅栏设计需让共享主时钟的呈现型 Sink 在全部就绪后才同时出首份输出；已讨论但暂缓，待后续实现。
+13. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
+14. **第三方 GUI LeakSanitizer 基线**：当前 Linux/X11 环境的 SDL3 2D software renderer 在 window surface 呈现时会内部尝试 GPU texture framebuffer，加载 Mesa/GLX；即使独立最小程序完整销毁 Texture、Renderer、Window，退出 VIDEO 并调用 `SDL_Quit()`，LeakSanitizer 仍报告 Mesa/GLX 约 1464B/16 allocations。强制直接 X11 framebuffer 可避免 Mesa 报告，但会出现约 33066B/572 allocations 的 X11/XKB 报告。两者均可由独立 SDL 最小程序复现，不属于 Pipeline、Buffer、Route 或节点资源泄漏；不为消除报告而改 renderer/backend。player 的 LeakSanitizer 验证应将该 Mesa/GLX 基线与项目自身泄漏区分，框架单测仍无 suppression 严格运行。
 
 ---
 

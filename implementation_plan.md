@@ -180,7 +180,7 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 ### 验收标准
 
 - [x] TemplateCaps 兼容性检查测试通过
-- [x] Buffer + BufferRef 生命周期测试通过，消费接口发布后只读
+- [x] Buffer + BufferRef 生命周期测试通过，消费接口发布后只读，Transform 待发布输出和发布入口使用移动 RAII 所有权
 - [x] OutputRoute 共享 BufferRef、独立订阅游标、处理后 ack、最慢订阅者背压、取消唤醒和事件顺序测试通过
 - [x] Pad/Edge 通过共享 Route 和独立 Subscription 正确传递数据
 - [x] 同源分叉对每项只 publish 一次，全部可靠订阅者收到完整序列且不深拷贝 payload
@@ -206,9 +206,9 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 |------|---------|
 | DemuxNode | av_read_frame、时间戳转微秒、多路分发、EOF 发 EOS |
 | DecodeNode | onStreamInfo 打开解码器（输出参数从 ctx 读取，不透传输入）、send/receive、EOS flush |
-| VideoRenderNode | `onStreamInfo` 只接收并保存 Caps；SDL VIDEO、Window、Renderer、Texture 在 VideoRender 工作线程中初始化、使用和销毁；按帧处理自身窗口关闭请求并通过 `STOP_REQUESTED` 请求 Pipeline 停止；sws_scale 与视频同步 |
-| AudioPlayNode | onStreamInfo 初始化 SDL 音频、swr_convert、推进 Clock |
-| Demo | player.cpp：Demux → Decode×2 → VideoRender + AudioPlay |
+| VideoRenderNode | `onStreamInfo` 只接收并保存 Caps；SDL VIDEO、Window、Renderer、Texture 在 VideoRender 工作线程中初始化、使用和销毁；worker 退出前清理 SDL TLS；按帧处理自身窗口关闭请求并通过 `STOP_REQUESTED` 请求 Pipeline 停止；sws_scale 与视频同步 |
+| AudioPlayNode | onStreamInfo 初始化 SDL 音频、swr_convert、推进 Clock；音频 worker 退出前清理 SDL TLS，不改变既有资源生命周期 |
+| Demo | Pipeline 内部管理 SDL 基础设施生命周期（同一进程同一时刻至多一个 Pipeline 存活）+ Demux → Decode×2 → VideoRender + AudioPlay |
 
 ### 验收标准
 
@@ -220,7 +220,7 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 - [ ] 当前进程仅使用一个 VideoRenderNode，且无其他模块提前初始化 SDL VIDEO
 - [ ] VideoRender 只处理自身窗口的 `SDL_EVENT_WINDOW_CLOSE_REQUESTED`，其他 SDL 输入事件暂不纳入范围
 - [ ] 窗口关闭后通过 `STOP_REQUESTED` 唤醒 `waitEOS()` 并正常完成 Pipeline 停止
-- [ ] ASAN 下自然 EOS、SIGINT 和窗口关闭路径无内存错误
+- [ ] ASAN 下自然 EOS、SIGINT 和窗口关闭路径无项目自身内存错误；已隔离的 SDL/Mesa GUI LeakSanitizer 基线单独记录
 - [ ] x86_64 通过
 
 ---
@@ -284,4 +284,3 @@ FFmpeg 需额外开启 encoder 和 muxer（见第一阶段 1.3 配置）。
 | AV Sync 自适应 | 丢帧阈值动态调整 |
 | 媒体兼容性 | Packet side data、pkt_timebase、best_effort_timestamp、send/receive EAGAIN、非 YUV420P swscale、色彩空间/HDR 等按具体节点补全 |
 | VideoRender 事件轮询 | 当前只在取得视频帧并进入 `consume()` 时检查窗口关闭；上游无帧期间的及时响应待优化 |
-| 输出所有权类型化 | `TransformNode::process` 的 outputs 后续改为 `std::vector<BufferRef>`；输入已通过 const Buffer + RouteDelivery ack 收紧 |

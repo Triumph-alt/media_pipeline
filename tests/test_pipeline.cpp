@@ -4,9 +4,13 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <thread>
+#include <vector>
 
 using namespace pipeline;
 
@@ -52,7 +56,7 @@ protected:
     bool onReady() override { return true; }
     void onStop() override {}
 
-    void process(const Buffer* input, std::vector<Buffer*>& outputs) override {
+    void process(const Buffer* input, std::vector<BufferRef>& outputs) override {
         count_++;
         auto* out = new Buffer();
         out->data = new uint8_t[input->size];
@@ -60,7 +64,7 @@ protected:
         out->size = input->size;
         out->media_type = input->media_type;
         out->pts = input->pts;
-        outputs.push_back(out);
+        outputs.emplace_back(out);
     }
 
 private:
@@ -148,14 +152,14 @@ protected:
         return true;
     }
 
-    void process(const Buffer* input, std::vector<Buffer*>& outputs) override {
+    void process(const Buffer* input, std::vector<BufferRef>& outputs) override {
         count_++;
         auto* out = new Buffer();
         out->data = new uint8_t[input->size];
         memcpy(out->data, input->data, input->size);
         out->size = input->size;
         out->media_type = MediaType::VIDEO_RAW;
-        outputs.push_back(out);
+        outputs.emplace_back(out);
     }
 
 private:
@@ -228,7 +232,7 @@ protected:
         return receiveCapsEvent("in");   // AUDIO_ENCODED ∉ {VIDEO_ENCODED} → false
     }
 
-    void process(const Buffer*, std::vector<Buffer*>&) override {}
+    void process(const Buffer*, std::vector<BufferRef>&) override {}
 };
 
 // ===================================================================
@@ -319,6 +323,172 @@ protected:
     }
     void onStop() override {}
     void consume(const Buffer* buf) override {}
+};
+
+// ===================================================================
+// StopAfterProduceTransform: process 产出后等待 Pipeline stop。
+// 用观察引用验证 Transform 的本地 outputs 在“process 后 stop”路径释放发布引用。
+// ===================================================================
+class StopAfterProduceTransform : public TransformNode {
+public:
+    explicit StopAfterProduceTransform(const std::string& name) : TransformNode(name) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+
+    bool waitUntilOutputsReady() {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(2), [this] { return outputs_ready_; });
+    }
+
+    bool observersAreSoleOwners() {
+        std::lock_guard lock(mutex_);
+        for (const auto& observer : observers_) {
+            if (observer->ref_count.load() != 1) {
+                return false;
+            }
+        }
+        return observers_.size() == 3;
+    }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+
+    void process(const Buffer*, std::vector<BufferRef>& outputs) override {
+        for (uint8_t value = 1; value <= 3; ++value) {
+            auto* output = new Buffer();
+            output->data = new uint8_t[1]{value};
+            output->size = 1;
+            output->media_type = MediaType::VIDEO_RAW;
+
+            // outputs 持有待发布引用，observers_ 只为测试保留一份独立观察引用。
+            outputs.emplace_back(output);
+            std::lock_guard lock(mutex_);
+            observers_.push_back(outputs.back());
+        }
+
+        {
+            std::lock_guard lock(mutex_);
+            outputs_ready_ = true;
+        }
+        cv_.notify_one();
+
+        // 让测试线程确定性地在 process 已产出、尚未返回发布循环时触发 stop。
+        while (!stop_requested_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<BufferRef> observers_;
+    bool outputs_ready_ = false;
+};
+
+// ===================================================================
+// BurstTransform + BlockingSink: 一次产出超过 VIDEO_RAW Route 容量的输出，
+// Sink 保持首个 Delivery 未 ack，使 Transform 在部分发布后阻塞并由 cancel 打断。
+// ===================================================================
+class BurstTransform : public TransformNode {
+public:
+    explicit BurstTransform(const std::string& name) : TransformNode(name) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+
+    bool waitUntilOutputsReady() {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(2), [this] { return outputs_ready_; });
+    }
+
+    bool waitUntilOutputRouteFull() {
+        SrcPad* output_pad = getSrcPad("out");
+        if (!output_pad || !output_pad->route()) {
+            return false;
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (output_pad->route()->retainedItems() == output_pad->route()->capacity()) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    }
+
+    bool observersAreSoleOwners() {
+        std::lock_guard lock(mutex_);
+        for (const auto& observer : observers_) {
+            if (observer->ref_count.load() != 1) {
+                return false;
+            }
+        }
+        return observers_.size() == 12;
+    }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+
+    void process(const Buffer*, std::vector<BufferRef>& outputs) override {
+        for (uint8_t value = 1; value <= 12; ++value) {
+            auto* output = new Buffer();
+            output->data = new uint8_t[1]{value};
+            output->size = 1;
+            output->media_type = MediaType::VIDEO_RAW;
+
+            outputs.emplace_back(output);
+            std::lock_guard lock(mutex_);
+            observers_.push_back(outputs.back());
+        }
+
+        {
+            std::lock_guard lock(mutex_);
+            outputs_ready_ = true;
+        }
+        cv_.notify_one();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<BufferRef> observers_;
+    bool outputs_ready_ = false;
+};
+
+class BlockingSink : public SinkNode {
+public:
+    explicit BlockingSink(const std::string& name) : SinkNode(name) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+
+    bool waitUntilConsuming() {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(2), [this] { return consuming_; });
+    }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+
+    void consume(const Buffer*) override {
+        {
+            std::lock_guard lock(mutex_);
+            consuming_ = true;
+        }
+        cv_.notify_one();
+
+        // 保持首个 Delivery 未 ack，直到 Pipeline stop/cancel 唤醒整个链路。
+        while (!stop_requested_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool consuming_ = false;
 };
 
 // ===================================================================
@@ -953,6 +1123,58 @@ static void test_pipeline_wait_eos_and_stop() {
 }
 
 // ===================================================================
+// Transform process 产出后收到 stop：全部输出尚未发布，必须由 outputs RAII 释放。
+// ===================================================================
+static void test_transform_stop_releases_unpublished_outputs() {
+    printf("  test_transform_stop_releases_unpublished_outputs...");
+    fflush(stdout);
+
+    Pipeline pipeline;
+    auto* src = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
+    auto* transform = pipeline.addNode<StopAfterProduceTransform>("transform");
+    auto* sink = pipeline.addNode<MockSink>("sink");
+
+    assert(pipeline.link(src, "out", transform, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.link(transform, "out", sink, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+    assert(pipeline.play());
+    assert(transform->waitUntilOutputsReady());
+
+    pipeline.stop();
+
+    // stop/join 后，每个输出只允许剩下测试观察引用，证明 Transform 发布引用已释放。
+    assert(transform->observersAreSoleOwners());
+    printf(" OK\n");
+}
+
+// ===================================================================
+// Transform 部分发布后 Route 满并被 cancel：已发布、当前失败和未遍历输出均须释放。
+// ===================================================================
+static void test_transform_cancel_releases_partial_outputs() {
+    printf("  test_transform_cancel_releases_partial_outputs...");
+    fflush(stdout);
+
+    Pipeline pipeline;
+    auto* src = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
+    auto* transform = pipeline.addNode<BurstTransform>("transform");
+    auto* sink = pipeline.addNode<BlockingSink>("sink");
+
+    assert(pipeline.link(src, "out", transform, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.link(transform, "out", sink, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+    assert(pipeline.play());
+    assert(transform->waitUntilOutputsReady());
+    assert(sink->waitUntilConsuming());
+    assert(transform->waitUntilOutputRouteFull());
+
+    pipeline.stop();
+
+    // Route cancel 清已发布项，失败参数和 outputs 尾部由 BufferRef RAII 自动释放。
+    assert(transform->observersAreSoleOwners());
+    printf(" OK\n");
+}
+
+// ===================================================================
 // 分叉路径：Source 一路输出 fork 给两个 Sink
 // 覆盖同一逻辑 Route 的两个静态可靠订阅者。
 // 两路共享底层 BufferRef，并且都必须收到全部帧。
@@ -1191,6 +1413,8 @@ int main() {
     test_pipeline_caps_propagation();
     test_pipeline_concurrent_stop();
     test_pipeline_wait_eos_and_stop();
+    test_transform_stop_releases_unpublished_outputs();
+    test_transform_cancel_releases_partial_outputs();
     test_pipeline_forked_broadcast();
     test_pipeline_forked_backpressure_no_uaf();
 

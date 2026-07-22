@@ -37,6 +37,17 @@ AudioPlayNode::AudioPlayNode(const std::string& name)
 }
 
 // ===================================================================
+// runLoop: 保持既有音频资源生命周期，只补 std::thread 的 SDL TLS 合同
+// ===================================================================
+void AudioPlayNode::runLoop() {
+    SinkNode::runLoop();
+
+    // Pipeline 节点线程由 std::thread 创建；调用过 SDL API 的外部线程必须在退出前清理 TLS。
+    // AudioStream 和 AUDIO 子系统仍按既有设计在 join 后的 onStop() 中释放，不在此迁移。
+    SDL_CleanupTLS();
+}
+
+// ===================================================================
 // onStreamInfo: 初始化 SDL 音频流，查询设备周期并设置背压水位，必要时建 swr
 //
 // 目标格式：S16（SDL3 广泛支持的格式）。输入格式从 CapsEvent 获取，非 S16 走 swr。

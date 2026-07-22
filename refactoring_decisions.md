@@ -177,3 +177,83 @@ VideoRenderNode 不再保留私有 steady_clock 路径，统一读 `pipeline_->c
 ### 启动时序不对称（暂缓）
 
 当前两个呈现 Sink 的首次输出延迟不对称：音频设备在 Ready 阶段即 resume，视频窗口创建需要数秒。这导致 A/V 文件起播时音频先响、视频追帧。完整修复需要启动栅栏（start barrier）：所有共享主时钟的呈现型 Sink 都备好首份输出后再同时释放。该设计已讨论但暂缓，待后续实现；吞吐型 Sink（FileSink、RTSPPush 等）不参与栅栏，因为它们不锚定主时钟。
+
+---
+
+## Transform 输出所有权类型化
+
+### 问题背景
+
+`TransformNode::process` 原先通过 `std::vector<Buffer*>` 返回 0 到 N 个新输出。裸指针容器只靠调用约定表示“这些 Buffer 尚未发布且由 Transform 持有”，无法自动覆盖提前退出：
+
+- `process()` 产出后若 `stop_requested_` 已置位，runLoop 直接退出，全部输出尚未进入发布入口；
+- 多输出发布到一半时若 Route 被 cancel，当前发布失败后 runLoop 退出，尚未遍历的尾部输出仍留在裸指针容器中。
+
+这两条停止/取消路径都会泄漏未发布的输出 Buffer；输入侧 `RouteDelivery` 与已经进入 `pushToDownstream()` 的输出本身没有问题。
+
+### 正式所有权合同
+
+`TransformNode::process` 输出改为：
+
+```cpp
+process(const Buffer* input, std::vector<BufferRef>& outputs);
+```
+
+- 子类创建新 Buffer 后立即放入 `BufferRef`，不再把拥有型裸指针跨控制流保存在 outputs 中；
+- `outputs` 持有全部尚未发布的输出，process 后 stop/error 时由 vector 析构统一释放；
+- 正常发布后对应元素被 move 为空，复用 vector 容量不保留 payload 所有权。
+
+唯一 Buffer 发布入口改为：
+
+```cpp
+pushToDownstream(BufferRef&& buffer);
+```
+
+- 调用方必须显式 `std::move`，表示无条件交出当前发布引用；
+- 入口立即移动接管引用，不保留 `Buffer*` 重载；
+- publish 成功时引用进入 Route Entry；Route 缺失、输出歧义、无订阅或 cancel 时也由入口内 RAII 释放；
+- 部分发布后 cancel 时，已发布项由 Route cancel 释放，当前失败项由发布入口释放，未遍历尾部仍由 outputs 释放。
+
+Source、Mux 和 Decode EOS flush 等其他 Buffer 生产路径同步改为先用 `BufferRef` 接住新 Buffer，再显式移动到同一个发布入口。
+
+---
+
+## SDL 外部线程 TLS 与进程级生命周期 owner
+
+### 问题背景
+
+Pipeline 通过 `std::thread` 创建 VideoRender 和 AudioPlay worker。SDL3 要求非 SDL 创建的线程在调用 SDL API 后、线程退出前调用 `SDL_CleanupTLS()`；此前两个 worker 都没有执行该清理。与此同时，节点仅调用 `SDL_QuitSubSystem()`，但 SDL3 明确要求应用在整个进程生命周期末尾仍调用一次 `SDL_Quit()` 清理基础设施和进程级状态。
+
+### 线程 TLS 合同
+
+- VideoRender worker 在所有 SDL VIDEO 资源销毁、`SDL_QuitSubSystem(SDL_INIT_VIDEO)` 后调用 `SDL_CleanupTLS()`；初始化失败、EOS、ERROR、窗口关闭和 stop 都经由同一 runLoop 尾部。
+- AudioPlay 保持既有资源生命周期不变：Ready 调用线程初始化 AUDIO/AudioStream，worker 负责消费和 drain，join 后 `onStop()` 销毁 AudioStream 并退出 AUDIO 子系统。仅在音频 worker 的 `SinkNode::runLoop()` 返回后调用 `SDL_CleanupTLS()`。
+- 不把 Audio 的 init/use/destroy 线程归属重构混入本轮。
+
+### 进程级 owner 合同
+
+`Pipeline` 构造时调用：
+
+```cpp
+SDL_Init(0);
+```
+
+它只建立 SDL 基础设施生命周期，不带 VIDEO/AUDIO 等子系统 flag，不持有或管理任何具体子系统。`Pipeline` 析构时先调用 `stop()`，完成 worker join 与节点 `onStop()`，随后调用一次 `SDL_Quit()`：
+
+```text
+Pipeline stop → worker join → node onStop → SDL_Quit()
+```
+
+因此节点仍独占各自的 `SDL_InitSubSystem` / `SDL_QuitSubSystem`：VideoRender worker 首次调用 `SDL_InitSubSystem(SDL_INIT_VIDEO)`，该线程仍被 SDL 认定为视频主线程；AudioPlay 继续管理 AUDIO 子系统。Pipeline 永不触碰 VIDEO/AUDIO flag。
+
+### 验证与第三方基线
+
+真实 ASAN player 在 `SDL_Init(0)` 后，VideoRender worker 仍报告 `SDL_IsMainThread() == true`。SIGINT 中断后项目侧 Buffer/Route/Transform/SDL TLS 泄漏均消失。
+
+Linux/X11 下 SDL3 software renderer 的 window surface 会内部启用 GL texture framebuffer，最小独立程序完整销毁 SDL 资源并调用 `SDL_Quit()` 后仍报告 Mesa/GLX 1464B/16 allocations；强制直接 X11 framebuffer 则产生 X11/XKB 33066B/572 allocations。两者是第三方 GUI 基线，不为压低 LSAN 数字而更换 renderer/backend。框架单测保持无 suppression 严格运行，player 报告将这组基线与项目自身泄漏区分。
+
+### 单进程单存活 Pipeline 约束
+
+`Pipeline` 是一条实例级媒体管线，持有自己的 Graph、节点工作线程、Clock 和 MessageBus；但当前它的构造/析构直接管理 SDL 全局基础设施的 `SDL_Init(0)` / `SDL_Quit()`。`SDL_Quit()` 是强制全局拆除，若允许两个 Pipeline 并存，先析构的一方会在另一方仍可能使用 SDL 时拆除全局运行时。
+
+因此当前正式限制为：**同一进程同一时刻至多允许一个存活的 Pipeline 实例**。顺序创建、销毁多个 Pipeline 是允许的；两个 Pipeline 重叠存活不受支持。当前不为未实现的多 Pipeline 模型引入进程级引用计数、lease 或 Pipeline manager。

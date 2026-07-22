@@ -25,7 +25,7 @@ protected:
     bool onReady() override { return true; }
     void onStop() override;
     bool onStreamInfo() override;
-    void process(const Buffer* input, std::vector<Buffer*>& outputs) override;
+    void process(const Buffer* input, std::vector<BufferRef>& outputs) override;
     void onEvent(const Event& event) override;
 
 private:

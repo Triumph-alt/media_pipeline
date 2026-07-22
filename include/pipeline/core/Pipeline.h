@@ -44,12 +44,15 @@ enum class PipelineState {
 // stop() 内部用 CAS 保证只有一个线程执行清理，可安全重复调用。
 // Pipeline 不提供通用应用输入监听；VideoRenderNode 的窗口关闭请求通过 MessageBus
 // 唤醒 waitEOS()，最终仍由 waitEOS() 所在线程调用 stop()。
+//
+// 进程约束：同一进程同一时刻至多允许一个存活的 Pipeline 实例。Pipeline 构造/析构
+// 直接管理进程全局 SDL 基础设施的 SDL_Init(0)/SDL_Quit()，不支持并存 Pipeline。
 // ===================================================================
 
 class Pipeline {
 public:
-    Pipeline() = default;
-    ~Pipeline() { stop(); }  // CAS 自动处理所有状态，不需要额外判断
+    Pipeline();
+    ~Pipeline();
 
     // 禁止拷贝/移动
     Pipeline(const Pipeline&) = delete;

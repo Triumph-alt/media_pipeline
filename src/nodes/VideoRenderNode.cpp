@@ -47,13 +47,14 @@ bool VideoRenderNode::onStreamInfo() {
 // runLoop: SDL 视频资源的完整生命周期都属于节点工作线程
 // ===================================================================
 void VideoRenderNode::runLoop() {
-    if (!openRenderer()) {
-        closeRenderer();
-        return;
+    if (openRenderer()) {
+        SinkNode::runLoop();
     }
 
-    SinkNode::runLoop();
+    // 无论初始化失败、自然 EOS、ERROR、窗口关闭还是主动 stop，
+    // 都从这个统一尾部释放线程亲和资源，再清理 std::thread 上的 SDL TLS。
     closeRenderer();
+    SDL_CleanupTLS();
 }
 
 bool VideoRenderNode::failRender(const std::string& message) {

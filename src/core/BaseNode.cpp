@@ -3,6 +3,7 @@
 #include "pipeline/core/Pipeline.h"
 
 #include <algorithm>
+#include <utility>
 
 namespace pipeline {
 
@@ -87,12 +88,12 @@ bool BaseNode::releaseSinkPad(SinkPad* pad) {
 // ===================================================================
 // BaseNode: 数据分发
 // ===================================================================
-bool BaseNode::pushToDownstream(Buffer* buf, const std::string& src_pad_name) {
-    if (!buf) {
+bool BaseNode::pushToDownstream(BufferRef&& buf, const std::string& src_pad_name) {
+    // 发布入口立即接管调用方显式 move 进来的引用；后续任一失败路径都由 RAII 释放。
+    BufferRef primary(std::move(buf));
+    if (!primary) {
         return false;
     }
-    // 入口接管新建 Buffer 的初始所有权；publish 成功后 Route 持有该唯一 Entry
-    BufferRef primary(buf);
 
     std::shared_ptr<OutputRoute> route;
     if (!src_pad_name.empty()) {
@@ -240,13 +241,14 @@ void BaseNode::postMessage(MessageType type, const std::string& text, int code) 
 
 void SourceNode::runLoop() {
     while (!stop_requested_.load()) {
-        auto* buf = capture();
+        // capture() 返回的新建 Buffer 立即进入 RAII，不能跨控制流保存拥有型裸指针。
+        BufferRef buf(capture());
         if (!buf) {
             // EOF：发送 EOS 给下游，SinkNode 收到后才上报 Pipeline
             sendEOSDownstream();
             break;
         }
-        if (!pushToDownstream(buf)) {
+        if (!pushToDownstream(std::move(buf))) {
             break;
         }
     }
@@ -330,7 +332,7 @@ void SinkNode::onEvent(const Event& event) {
 
 void TransformNode::runLoop() {
     auto* sink_pad = sink_pads_[0].get();
-    std::vector<Buffer*> outputs;
+    std::vector<BufferRef> outputs;
     while (!stop_requested_.load()) {
         // 从 RouteSubscription 获取下一项
         auto delivery = sink_pad->acquireBlocking();
@@ -341,22 +343,26 @@ void TransformNode::runLoop() {
         // 输入 Delivery 直到 process 和所有输出 Route publish 都成功后才 ack，形成逐级背压
         const QueueItem& item = delivery->item();
         if (std::holds_alternative<BufferRef>(item)) {
+            // clear 会释放上轮任何尚未移交的输出；正常路径中这些元素已经 move 为空。
             outputs.clear();
 
-            // 一个输入 Buffer 产生 0 到 N 个新的输出 Buffer
+            // 一个输入 Buffer 产生 0 到 N 个由 BufferRef 持有的新输出 Buffer。
             process(std::get<BufferRef>(item).get(), outputs);
             if (stop_requested_.load()) {
+                // process 后发生 stop/error 时，outputs 析构会释放全部尚未发布的输出。
                 break;
             }
 
             bool outputs_published = true;
-            for (auto* out : outputs) {
-                if (!pushToDownstream(out)) {
+            for (auto& out : outputs) {
+                // 发布入口无条件接管当前引用；成功进入 Route，失败也在入口内释放。
+                if (!pushToDownstream(std::move(out))) {
                     outputs_published = false;
                     break;
                 }
             }
             if (!outputs_published) {
+                // 已发布元素已经为空，未遍历元素仍由 outputs 持有并在退出时自动释放。
                 break;
             }
         } else {
@@ -594,8 +600,9 @@ void MuxNode::flushPendingOutput() {
     output->media_type = MediaType::CONTAINER;
     pending_output_.clear();
 
-    // MuxNode 当前固定单输出；向 CONTAINER Route 可靠 publish，容器字节不丢失。
-    if (!pushToDownstream(output, "out_0")) {
+    // MuxNode 当前固定单输出；显式 move，把 CONTAINER Buffer 的发布引用交给下游入口。
+    BufferRef output_ref(output);
+    if (!pushToDownstream(std::move(output_ref), "out_0")) {
         postMessage(MessageType::ERROR, "MuxNode: failed to publish container output");
     }
 }

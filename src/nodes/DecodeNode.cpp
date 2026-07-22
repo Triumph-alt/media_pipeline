@@ -10,6 +10,7 @@ extern "C" {
 }
 
 #include <climits>
+#include <utility>
 
 namespace pipeline {
 
@@ -117,7 +118,7 @@ bool DecodeNode::onStreamInfo() {
 // ===================================================================
 // process: send_packet → receive_frame 循环
 // ===================================================================
-void DecodeNode::process(const Buffer* input, std::vector<Buffer*>& outputs) {
+void DecodeNode::process(const Buffer* input, std::vector<BufferRef>& outputs) {
     AVPacket* pkt = toAVPacket(input);
     if (!pkt) {
         postMessage(MessageType::ERROR, "DecodeNode: toAVPacket failed");
@@ -161,7 +162,8 @@ void DecodeNode::process(const Buffer* input, std::vector<Buffer*>& outputs) {
             postMessage(MessageType::ERROR, "DecodeNode: Buffer::fromAVFrame failed");
             break;
         }
-        outputs.push_back(buf);
+        // 新解码帧离开工厂后立即由 BufferRef 持有，停止或发布失败时由 Transform RAII 清理。
+        outputs.emplace_back(buf);
     }
 }
 
@@ -179,7 +181,9 @@ void DecodeNode::onEvent(const Event& event) {
             // 循环接收缓冲区中剩余的帧
             while (true) {
                 AVFrame* frame = av_frame_alloc();
-                if (!frame) break;
+                if (!frame) {
+                    break;
+                }
 
                 int ret = avcodec_receive_frame(ctx_, frame);
                 if (ret < 0) {
@@ -188,11 +192,17 @@ void DecodeNode::onEvent(const Event& event) {
                 }
 
                 MediaType type = is_video_ ? MediaType::VIDEO_RAW : MediaType::AUDIO_RAW;
-                Buffer* buf = Buffer::fromAVFrame(frame, type, {1, 1000000}, framerate_);
+                BufferRef output(Buffer::fromAVFrame(
+                    frame, type, {1, 1000000}, framerate_));
                 av_frame_free(&frame);
 
-                if (!buf) break;
-                pushToDownstream(buf);
+                if (!output) {
+                    break;
+                }
+                // EOS flush 产出的帧也使用同一移动所有权发布边界。
+                if (!pushToDownstream(std::move(output))) {
+                    return;
+                }
             }
         }
 

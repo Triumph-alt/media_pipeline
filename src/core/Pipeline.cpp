@@ -1,6 +1,26 @@
 #include "pipeline/core/Pipeline.h"
 
+extern "C" {
+#include <SDL3/SDL.h>
+}
+
 namespace pipeline {
+
+// ===================================================================
+// Pipeline: 进程内 SDL 基础设施生命周期
+// ===================================================================
+Pipeline::Pipeline() {
+    // 不带任何子系统 flag：不初始化 VIDEO/AUDIO，也不抢占 SDL 视频主线程归属。
+    // 具体节点仍分别负责 SDL_InitSubSystem / SDL_QuitSubSystem。
+    SDL_Init(0);
+}
+
+Pipeline::~Pipeline() {
+    // stop() 负责 cancel、worker join 与各节点 onStop；析构时才统一关闭 SDL 基础设施。
+    stop();
+    SDL_Quit();
+}
+
 
 // ===================================================================
 // link: 声明连接，委托给 Graph

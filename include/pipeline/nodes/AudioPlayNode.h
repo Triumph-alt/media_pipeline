@@ -28,6 +28,7 @@ public:
 protected:
     bool onReady() override { return true; }
     bool onStreamInfo() override;
+    void runLoop() override;
     void consume(const Buffer* buf) override;
     void onDrain() override;
     void onStop() override;

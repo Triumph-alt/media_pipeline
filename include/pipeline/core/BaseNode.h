@@ -85,8 +85,8 @@ protected:
     virtual void runLoop() = 0;
 
     // 将一个 Buffer 发布到指定逻辑 Route。src_pad_name 为空时，节点必须只有一条逻辑输出 Route
-    // Buffer 所有权在调用时转移给 Route；返回 false 表示未发布（取消/无订阅）
-    bool pushToDownstream(Buffer* buf, const std::string& src_pad_name = "");
+    // 调用方必须显式 move；函数无条件接管这份 BufferRef，返回 false 时同样负责释放
+    bool pushToDownstream(BufferRef&& buf, const std::string& src_pad_name = "");
 
     // 向每条不同的逻辑 Route publish 一次 EOS，不允许丢失
     bool sendEOSDownstream();
@@ -209,10 +209,10 @@ protected:
 protected:
     void runLoop() override;
 
-    // 子类实现：一个输入，产出 0 到 N 个输出
+    // 子类实现：一个输入，产出 0 到 N 个由 BufferRef 唯一持有的待发布输出
     // DecodeNode：一个 packet → 0 到 N 帧
     // EncodeNode：一帧 → 0 到 1 个 packet
-    virtual void process(const Buffer* input, std::vector<Buffer*>& outputs) = 0;
+    virtual void process(const Buffer* input, std::vector<BufferRef>& outputs) = 0;
 
     // 子类可重写：处理事件（默认透传给下游）
     virtual void onEvent(const Event& event);
