@@ -95,8 +95,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (!user_requested_stop) {
-        fprintf(stderr, "playback finished: rendered %d frames\n",
-                vrender->renderedFrames());
+        fprintf(stderr, "playback finished: rendered %d frames, dropped %d late frames\n",
+                vrender->renderedFrames(), vrender->droppedFrames());
     }
     return 0;
 }

@@ -24,6 +24,15 @@ VideoRenderNode::VideoRenderNode(const std::string& name)
     addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
 }
 
+bool VideoRenderNode::onReady() {
+    if (!pipeline_->clock()->registerStartupParticipant()) {
+        return failRender("VideoRenderNode: failed to register startup participant");
+    }
+    startup_barrier_arrived_ = false;
+    startup_barrier_withdrawn_ = false;
+    return true;
+}
+
 // ===================================================================
 // onCaps: 在 Running Route 中应用完整视频格式边界
 // ===================================================================
@@ -86,6 +95,7 @@ bool VideoRenderNode::pollWindowCloseRequested() {
 
 bool VideoRenderNode::openRenderer() {
     rendered_frames_ = 0;
+    dropped_frames_ = 0;
 
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
         return failRender(std::string("VideoRenderNode: SDL_InitSubSystem failed: ") +
@@ -177,52 +187,71 @@ bool VideoRenderNode::ensureTexture(int width, int height) {
 
 // ===================================================================
 // waitForPresentationTime: 以主时钟为参照控制呈现节奏
-//
-// 主时钟语义（§9）：已锚定时返回"当前估计已到达可听输出端的媒体时间位置"
-// 有音频由 AudioPlayNode 用真实消费进度驱动；无音频由本节点首帧一次性锚定
-//   - 未锚定：立即呈现不同步；无音频时本帧锚定墙钟回退，有音频则等音频锚定
-//   - 已锚定：超前则取消感知地等到呈现时刻；落后则立即呈现追帧
-//   - 丢帧策略本轮不实现，留到接音频接线阶段单独定阈值
 // ===================================================================
-bool VideoRenderNode::waitForPresentationTime(int64_t pts_us) {
-    // 视频帧没有 PTS，无法与音频比较，立即呈现
+bool VideoRenderNode::waitForPresentationTime(int64_t pts_us, int64_t duration_us) {
+    // 视频帧没有 PTS，无法与主时钟比较，立即呈现。
     if (pts_us == AV_NOPTS_VALUE) {
         return true;
     }
 
-    // 查询当前主时钟，有音频时 pos 就是 AudioPlayNode 估算的当前音频播放位置
     Clock* clock = pipeline_->clock();
     int64_t pos = clock->getPositionUs();
 
-    // 如果 Clock 还没锚定
     if (pos == Clock::kUnanchored) {
+        // 纯视频由首帧建立墙钟回退；有音频但尚未锚定时保持现有立即呈现策略。
         if (!clock->hasAudio()) {
-            // 纯视频，没有音频提供主时钟，使用首个视频帧的 PTS 锚定，视频按墙钟节奏播放
             clock->anchorOnce(pts_us);
         }
-        // 有音频，但音频尚未锚定，立即显示
         return true;
     }
 
-    // 计算视频帧领先还是落后
     int64_t remaining_us = pts_us - pos;
-
-    // 只要视频仍然超前，就继续等待
     while (remaining_us > 0 && !stop_requested_.load()) {
-        // 每次最多睡 1ms
         const int64_t sleep_us = std::min<int64_t>(remaining_us, 1000);
         std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
 
-        // 每次醒来重新读取 Audio Clock
         pos = clock->getPositionUs();
         if (pos == Clock::kUnanchored) {
-            // 防御：时钟被重置，直接呈现
             return true;
         }
         remaining_us = pts_us - pos;
     }
 
-    return !stop_requested_.load();
+    if (stop_requested_.load()) {
+        return false;
+    }
+
+    // duration 未知时退化为 40ms；低帧率使用更大的帧时长，避免在展示区间仍有效时过早丢帧。
+    const int64_t late_threshold_us = std::max<int64_t>(duration_us > 0 ? duration_us : 0, 40000);
+    if (remaining_us < -late_threshold_us) {
+        ++dropped_frames_;
+        return false;
+    }
+
+    return true;
+}
+
+bool VideoRenderNode::waitForStartupBarrier() {
+    Clock* clock = pipeline_->clock();
+    while (!stop_requested_.load()) {
+        const Clock::StartupBarrierWaitResult result = clock->arriveAndWaitForStartupFor(
+            std::chrono::milliseconds(10), startup_barrier_arrived_);
+        if (result == Clock::StartupBarrierWaitResult::RELEASED) {
+            return true;
+        }
+        if (result == Clock::StartupBarrierWaitResult::CANCELLED) {
+            return false;
+        }
+
+        // 栅栏尚未凑齐时仍维持 VideoRender 现有的窗口关闭响应：不能因为等待音频首段
+        // PCM 而停止轮询 SDL 事件，否则用户在起播前关闭窗口会失去 STOP_REQUESTED 通道。
+        if (pollWindowCloseRequested()) {
+            postMessage(MessageType::STOP_REQUESTED,
+                        "VideoRenderNode: window close requested");
+            return false;
+        }
+    }
+    return false;
 }
 
 // ===================================================================
@@ -264,7 +293,7 @@ void VideoRenderNode::consume(const Buffer* buf) {
         return;
     }
 
-    if (!waitForPresentationTime(buf->pts)) {
+    if (!waitForPresentationTime(buf->pts, buf->duration)) {
         return;
     }
     if (!ensureTexture(width, height)) {
@@ -285,6 +314,12 @@ void VideoRenderNode::consume(const Buffer* buf) {
         return;
     }
 
+    // 首帧已完成内部资源准备和 Texture 上传，但尚未产生可见输出；在首次 Present 前与
+    // AudioPlay 的首次 SDL 提交汇合，释放后仍按原有渲染路径执行。
+    if (!startup_barrier_arrived_ && !waitForStartupBarrier()) {
+        return;
+    }
+
     if (!SDL_SetRenderDrawColor(static_cast<SDL_Renderer*>(renderer_), 0, 0, 0, 255) ||
         !SDL_RenderClear(static_cast<SDL_Renderer*>(renderer_)) ||
         !SDL_RenderTexture(static_cast<SDL_Renderer*>(renderer_),
@@ -298,6 +333,14 @@ void VideoRenderNode::consume(const Buffer* buf) {
     if (rendered_frames_ % 100 == 1) {
         fprintf(stderr, "[%s] rendered %d frames\n",
                 name_.c_str(), rendered_frames_);
+    }
+}
+
+void VideoRenderNode::onDrain() {
+    // 若视频流在首帧可呈现前自然结束，它不再阻塞 AudioPlay 的共同起跑
+    if (!startup_barrier_arrived_ && !startup_barrier_withdrawn_) {
+        pipeline_->clock()->withdrawStartupParticipant();
+        startup_barrier_withdrawn_ = true;
     }
 }
 

@@ -69,12 +69,26 @@ bool Pipeline::play() {
 
     // Ready 阶段：三步穿插初始化
     if (!graph_.ready()) {
+        // Ready 失败时即使尚无 worker，也终止本轮可能已登记的启动栅栏状态
+        clock_.cancelStartupBarrier();
         // Ready 失败：先把 bus 收干净，保证 Ready 期间的 ERROR 消息全部落入 last_error_，
         // 然后再置 ERROR 返回。bus_running_ 翻为 false 后 notify()，
         // waitMessage 的“队列非空优先返回消息”语义保证 pending 消息不会丢。
         bus_running_ = false;
         bus_.notify();
         if (bus_thread_.joinable()) bus_thread_.join();
+        state_ = PipelineState::ERROR;
+        return false;
+    }
+
+    // 所有 Ready 回调已完成登记后才封闭本轮启动参与者集合，随后 worker 才可能到达栅栏。
+    if (!clock_.sealStartupParticipants()) {
+        clock_.cancelStartupBarrier();
+        bus_running_ = false;
+        bus_.notify();
+        if (bus_thread_.joinable()) {
+            bus_thread_.join();
+        }
         state_ = PipelineState::ERROR;
         return false;
     }
@@ -106,7 +120,9 @@ void Pipeline::stop() {
         return;
     }
 
-    // 1. 设置所有节点退出标志
+    // 1. 先解除启动 rendezvous，再设置节点退出标志。这样卡在首次 SDL 提交/Present 前的
+    // worker 会立刻醒来，随后与其他 Route 等待者一起走统一 stop 路径。
+    clock_.cancelStartupBarrier();
     for (auto& [node, _] : threads_) {
         node->stop_requested_.store(true);
     }
@@ -171,6 +187,9 @@ void Pipeline::messageBusLoop() {
                 break;
 
             case MessageType::ERROR:
+                // ERROR 可能发生在另一参与者到达首次呈现栅栏之前；立即解除等待，
+                // 不能只依赖应用线程稍后进入 waitEOS()->stop()。
+                clock_.cancelStartupBarrier();
                 error_occurred_ = true;
                 {
                     std::lock_guard lock(error_mutex_);
@@ -180,6 +199,9 @@ void Pipeline::messageBusLoop() {
                 break;
 
             case MessageType::STOP_REQUESTED:
+                // 窗口关闭等节点停止请求也必须立即解除启动栅栏，保留现有由 waitEOS
+                // 所在线程执行 Pipeline::stop() 的收尾归属。
+                clock_.cancelStartupBarrier();
                 stop_requested_by_node_.store(true);
                 eos_cv_.notify_all();
                 break;

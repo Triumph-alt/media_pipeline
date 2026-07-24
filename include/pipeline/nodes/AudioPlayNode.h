@@ -66,6 +66,11 @@ private:
     int low_watermark_frames_ = 0;
     int high_watermark_frames_ = 0;
 
+    // 本轮只在首段 canonical PCM 真正提交给 SDL 前参加一次共同起跑栅栏
+    // 自然 EOS 前未产生可提交 PCM 时撤销登记席位，避免另一呈现端永久等待
+    bool startup_barrier_arrived_ = false;   // AudioPlay 是否已经作为参与者到启动栅栏报到过
+    bool startup_barrier_withdrawn_ = false; // AudioPlay 是否已经撤销过自己在栅栏中的登记席位
+
     void* audio_stream_ = nullptr;
     SwrContext* swr_ctx_ = nullptr;
     uint8_t* swr_buffer_ = nullptr;

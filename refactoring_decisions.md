@@ -305,3 +305,39 @@ Linux/X11 下 SDL3 software renderer 的 window surface 会内部启用 GL textu
 - VIDEO_RAW Caps 不携带 framerate；后续帧的实际时序由 Buffer 自己的 `pts` 与 `duration` 表达。
 - `hasSameFormat()` 的 VIDEO_RAW 只比较 width/height/pix_fmt，VIDEO_ENCODED 只比较 codec_id/width/height/extradata；framerate 单独变化不产生 Caps 配置边界。
 - 将来若某个消费者确实需要感知 nominal framerate 更新，应设计独立 timing property update 语义，不能复用 payload 格式 Caps 或令渲染资源重配。
+
+---
+
+## 启动 rendezvous 与动态视频丢帧
+
+### 决策背景
+
+音频和视频首个外部输出的准备延迟不对称：AudioPlay 可先获得 canonical PCM，而 VideoRender 仍可能在创建窗口、Texture 或上传首帧。若音频先 `SDL_PutAudioStreamData()`，Audio Clock 已经推进后视频才首次 Present，会造成视频天生落后。栅栏只应解决共同起跑，不能混入 NOPTS、Clock 锚定或释放后的 A/V 同步状态机。
+
+### 启动 rendezvous 合同
+
+- 当前一个 Pipeline 的唯一 `Clock` 即唯一同步域；本轮不提前建设多 Clock、多窗口或多音频 master 模型。
+- 参与者在 Ready 成功时向 Clock 登记；Pipeline 在 `graph_.ready()` 成功后、启动任一 worker 前封闭人数。状态机为 `REGISTERING → WAITING → RELEASED`，任意阶段可被 `CANCELLED` 覆盖。
+- AudioPlay 在首段 canonical PCM、首次 `SDL_PutAudioStreamData()` 前到达；VideoRender 在首帧完成 Texture 创建及上传、首次 `SDL_RenderPresent()` 前到达。栅栏不预填 SDL、不等待有效 PTS，也不改变既有 NOPTS 账本。
+- 最后到达者释放全部等待者；单参与者到达即释放；无参与者在封闭时直接释放。首帧前自然 EOS 的已登记参与者在 `onDrain()` withdraw，自身不再成为其他参与者的启动前提。AudioPlay withdraw 后仍按既有 swr/SDL drain 收尾；若该尾部首次产生 canonical PCM，它面对已释放栅栏提交，当前不把该罕见尾部路径提升为第二轮 rendezvous。
+- `stop()`、ERROR、STOP_REQUESTED 和 Ready/封闭失败均取消栅栏并唤醒等待者。取消是等待者的门闩，不是对已从 arrival 调用返回的 worker 与紧随其后的 SDL 外部调用的事务性撤销。
+- 需要回到自身事件循环的参与者使用限时 arrival：`TIMEOUT` 只是一次等待结果，Clock 持久状态仍为 `WAITING`；调用者保留 `bool& arrived`，重试绝不重复计数。当前 VideoRender 每 10ms 轮询一次自身窗口关闭请求。
+
+### 动态晚帧丢弃合同
+
+VideoRender 统一以 Pipeline Clock 评价已锚定视频帧。`waitForPresentationTime(pts, duration)` 保持 bool 返回：`false` 在 `consume()` 中统一跳过渲染；SinkNode 通过 `stop_requested_` 决定是停止时不 ack，还是正常丢帧后 ack 并继续。
+
+```text
+remaining = frame_pts - clock_pos
+threshold = max(Buffer.duration, 40ms)
+
+remaining < -threshold
+    → 当前帧过期，跳过 Texture 上传和 Present，dropped_frames++
+remaining >= -threshold
+    → 立即追帧呈现
+```
+
+- 无 PTS 或 Clock 未锚定时不丢帧；无音频时首帧仍 `anchorOnce()`，随后按同一 Clock 规则运行。
+- `Buffer.duration == 0` 时阈值为 40ms；当前 duration 来自 encoded nominal framerate hint，尚不等于完整逐帧 VFR 时长模型。
+- 不复刻 ffplay 的“确认后面还有下一帧才丢当前帧” lookahead，因为当前 Subscription 在持有 in-flight Delivery 时不能窥视后项；改变 Route in-flight/peek 合同不应混入本轮。
+- 记录 rendered/dropped 计数但不逐帧输出日志；真实 MV 自然 EOS 验证为 `5703 rendered + 3 dropped = 5706` 解码帧。

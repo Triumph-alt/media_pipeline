@@ -309,6 +309,52 @@ private:
     bool consuming_ = false;
 };
 
+class StartupBarrierSink final : public SinkNode {
+public:
+    StartupBarrierSink(const std::string& name, bool arrive)
+        : SinkNode(name), arrive_(arrive) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+
+    bool waitUntilBarrierReached() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(2), [this] { return barrier_reached_; });
+    }
+
+    bool released() const { return released_.load(); }
+
+protected:
+    bool onReady() override {
+        return pipeline_->clock()->registerStartupParticipant();
+    }
+    void onStop() override {}
+    void consume(const Buffer*) override {}
+
+    void runLoop() override {
+        if (!arrive_) {
+            // 保留已登记但尚未到达的第二席位，直到 Pipeline::stop() 取消整轮 rendezvous。
+            while (!stop_requested_.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            barrier_reached_ = true;
+        }
+        cv_.notify_one();
+        released_ = pipeline_->clock()->arriveAndWaitForStartup();
+    }
+
+private:
+    const bool arrive_;
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    bool barrier_reached_ = false;
+    std::atomic<bool> released_{true};
+};
+
 class BurstTransform final : public TransformNode {
 public:
     explicit BurstTransform(const std::string& name) : TransformNode(name) {
@@ -681,6 +727,116 @@ void test_output_route_event_order() {
     printf(" OK\n");
 }
 
+void test_clock_startup_barrier_two_participants() {
+    printf("  test_clock_startup_barrier_two_participants...");
+    fflush(stdout);
+
+    Clock clock;
+    clock.reset();
+    assert(clock.registerStartupParticipant());
+    assert(clock.registerStartupParticipant());
+    assert(clock.sealStartupParticipants());
+
+    std::atomic<bool> first_started{false};
+    std::atomic<bool> first_released{false};
+    std::thread first([&] {
+        first_started = true;
+        first_released = clock.arriveAndWaitForStartup();
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!first_started.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(first_started.load());
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(!first_released.load());
+
+    assert(clock.arriveAndWaitForStartup());
+    first.join();
+    assert(first_released.load());
+    printf(" OK\n");
+}
+
+void test_clock_startup_barrier_single_participant() {
+    printf("  test_clock_startup_barrier_single_participant...");
+    fflush(stdout);
+
+    Clock clock;
+    clock.reset();
+    assert(clock.registerStartupParticipant());
+    assert(clock.sealStartupParticipants());
+    assert(clock.arriveAndWaitForStartup());
+    printf(" OK\n");
+}
+
+void test_clock_startup_barrier_cancel_wakes_waiter() {
+    printf("  test_clock_startup_barrier_cancel_wakes_waiter...");
+    fflush(stdout);
+
+    Clock clock;
+    clock.reset();
+    assert(clock.registerStartupParticipant());
+    assert(clock.registerStartupParticipant());
+    assert(clock.sealStartupParticipants());
+
+    std::atomic<bool> first_started{false};
+    std::atomic<bool> first_released{true};
+    std::thread first([&] {
+        first_started = true;
+        first_released = clock.arriveAndWaitForStartup();
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!first_started.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(first_started.load());
+    clock.cancelStartupBarrier();
+    first.join();
+    assert(!first_released.load());
+    printf(" OK\n");
+}
+
+void test_clock_startup_barrier_withdraw_releases_arrival() {
+    printf("  test_clock_startup_barrier_withdraw_releases_arrival...");
+    fflush(stdout);
+
+    Clock clock;
+    clock.reset();
+    assert(clock.registerStartupParticipant());
+    assert(clock.registerStartupParticipant());
+    assert(clock.sealStartupParticipants());
+
+    bool arrived = false;
+    assert(clock.arriveAndWaitForStartupFor(std::chrono::milliseconds(1), arrived) ==
+           Clock::StartupBarrierWaitResult::TIMEOUT);
+    assert(arrived);
+    clock.withdrawStartupParticipant();
+    assert(clock.arriveAndWaitForStartupFor(std::chrono::microseconds(0), arrived) ==
+           Clock::StartupBarrierWaitResult::RELEASED);
+    printf(" OK\n");
+}
+
+void test_pipeline_stop_cancels_startup_barrier() {
+    printf("  test_pipeline_stop_cancels_startup_barrier...");
+    fflush(stdout);
+
+    Pipeline pipeline;
+    auto* source = pipeline.addNode<CapsScriptSource>("source", std::vector<QueueItem>{});
+    auto* waiting = pipeline.addNode<StartupBarrierSink>("waiting", true);
+    auto* absent = pipeline.addNode<StartupBarrierSink>("absent", false);
+    assert(pipeline.link(source, "out", waiting, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.link(source, "out2", absent, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+    assert(pipeline.play());
+    assert(waiting->waitUntilBarrierReached());
+
+    pipeline.stop();
+    assert(!waiting->released());
+    printf(" OK\n");
+}
+
 void test_pipeline_running_caps_and_dynamic_boundary() {
     printf("  test_pipeline_running_caps_and_dynamic_boundary...");
     fflush(stdout);
@@ -950,6 +1106,10 @@ int main() {
     test_output_route_delivery_abandon_retries();
     test_output_route_cancel_wakes_publisher();
     test_output_route_event_order();
+    test_clock_startup_barrier_two_participants();
+    test_clock_startup_barrier_single_participant();
+    test_clock_startup_barrier_cancel_wakes_waiter();
+    test_clock_startup_barrier_withdraw_releases_arrival();
 
     printf("\n[Pipeline Caps Tests]\n");
     test_pipeline_running_caps_and_dynamic_boundary();
@@ -959,6 +1119,7 @@ int main() {
     test_transform_stop_releases_unpublished_outputs();
     test_transform_cancel_releases_partial_outputs();
     test_pipeline_concurrent_stop();
+    test_pipeline_stop_cancels_startup_barrier();
     test_pipeline_forked_backpressure();
     test_mux_waits_for_all_initial_caps();
     test_pipeline_ready_failure_rolls_back();

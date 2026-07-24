@@ -206,22 +206,22 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 |------|---------|
 | DemuxNode | av_read_frame、时间戳转微秒、多路分发、worker 在每条 Route 首个 Packet 前发布 encoded Caps、EOF 发 EOS |
 | DecodeNode | Running encoded Caps 驱动 decoder 配置；真实 AVFrame 前发布 RAW Caps；重配前 drain、send/receive、EOS flush |
-| VideoRenderNode | Running Caps 应用格式边界；仅支持紧密 YUV420P/YUVJ420P；SDL VIDEO、Window、Renderer、Texture 在 VideoRender 工作线程中初始化、使用和销毁；worker 退出前清理 SDL TLS；按帧处理自身窗口关闭请求并通过 `STOP_REQUESTED` 请求 Pipeline 停止；视频同步 |
+| VideoRenderNode | Running Caps 应用格式边界；仅支持紧密 YUV420P/YUVJ420P；SDL VIDEO、Window、Renderer、Texture 在 VideoRender 工作线程中初始化、使用和销毁；worker 退出前清理 SDL TLS；按帧处理自身窗口关闭请求并通过 `STOP_REQUESTED` 请求 Pipeline 停止；Clock 启动 rendezvous 与基于 `max(Buffer.duration, 40ms)` 的动态晚帧丢弃 |
 | AudioPlayNode | Ready 建固定 canonical SDL 提交端；Running AudioRaw Caps 重建 input→canonical swr；canonical Clock、背压、EOS drain；音频 worker 退出前清理 SDL TLS |
 | Demo | Pipeline 内部管理 SDL 基础设施生命周期（同一进程同一时刻至多一个 Pipeline 存活）+ Demux → Decode×2 → VideoRender + AudioPlay |
 
 ### 验收标准
 
-- [ ] 播放 H.264/AAC 的 mp4 文件正常（画面 + 声音）
-- [ ] 音视频同步误差 ±40ms 以内
+- [x] 播放 H.264/AAC 的 mp4 文件正常（画面 + 声音；《那天下雨了原版MV.mp4》自然 EOS：5703 rendered + 3 dropped = 5706）
+- [ ] 音视频同步误差 ±40ms 以内（已有音频主时钟、启动 rendezvous 与动态晚帧丢弃；尚缺可量化测量）
 - [ ] 纯音频 / 纯视频文件不崩溃
-- [ ] EOS 后正常退出，无线程泄漏
-- [ ] Ctrl+C 中断后正常退出
-- [ ] 当前进程仅使用一个 VideoRenderNode，且无其他模块提前初始化 SDL VIDEO
-- [ ] VideoRender 只处理自身窗口的 `SDL_EVENT_WINDOW_CLOSE_REQUESTED`，其他 SDL 输入事件暂不纳入范围
-- [ ] 窗口关闭后通过 `STOP_REQUESTED` 唤醒 `waitEOS()` 并正常完成 Pipeline 停止
+- [ ] EOS 后正常退出，无线程泄漏（普通回归与真实自然 EOS 通过；仍需本轮最终 ASAN player 覆盖）
+- [ ] Ctrl+C 中断后正常退出（普通路径已验证；仍需本轮最终 ASAN player 覆盖）
+- [x] 当前进程仅使用一个 VideoRenderNode，且无其他模块提前初始化 SDL VIDEO
+- [x] VideoRender 只处理自身的 `SDL_EVENT_WINDOW_CLOSE_REQUESTED`，其他 SDL 输入事件暂不纳入范围
+- [x] 窗口关闭后通过 `STOP_REQUESTED` 唤醒 `waitEOS()` 并正常完成 Pipeline 停止
 - [ ] ASAN 下自然 EOS、SIGINT 和窗口关闭路径无项目自身内存错误；已隔离的 SDL/Mesa GUI LeakSanitizer 基线单独记录
-- [ ] x86_64 通过
+- [x] x86_64 通过
 
 ---
 

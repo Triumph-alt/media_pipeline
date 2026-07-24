@@ -140,7 +140,16 @@ bool AudioPlayNode::openCanonicalStream() {
 }
 
 bool AudioPlayNode::onReady() {
-    return openCanonicalStream();
+    if (!openCanonicalStream()) {
+        return false;
+    }
+    if (!pipeline_->clock()->registerStartupParticipant()) {
+        postMessage(MessageType::ERROR, "AudioPlayNode: failed to register startup participant");
+        return false;
+    }
+    startup_barrier_arrived_ = false;
+    startup_barrier_withdrawn_ = false;
+    return true;
 }
 
 bool AudioPlayNode::ensureSwrBuffer(int output_frames) {
@@ -355,6 +364,16 @@ bool AudioPlayNode::submitAndTrack(SDL_AudioStream* stream, const uint8_t* data,
         postMessage(MessageType::ERROR, "AudioPlayNode: invalid canonical PCM submission");
         return false;
     }
+
+    // 第一段 canonical PCM 尚未交给 SDL 前先与其他呈现参与者汇合；栅栏只统一起跑，
+    // 放行后仍完全复用既有 NOPTS、提交账本和 Audio Clock 刷新逻辑。
+    if (!startup_barrier_arrived_) {
+        if (!pipeline_->clock()->arriveAndWaitForStartup()) {
+            return false;
+        }
+        startup_barrier_arrived_ = true;
+    }
+
     if (!SDL_PutAudioStreamData(stream, data, size)) {
         postMessage(MessageType::ERROR,
                     std::string("AudioPlayNode: SDL_PutAudioStreamData failed: ") + SDL_GetError());
@@ -461,6 +480,13 @@ void AudioPlayNode::consume(const Buffer* buf) {
 }
 
 void AudioPlayNode::onDrain() {
+    // 若音频在首段 canonical PCM 前自然耗尽，它不再是本轮共同起跑的前置条件。
+    // 撤销席位后可让已在栅栏等待的 VideoRender 退化为单参与者并继续起播。
+    if (!startup_barrier_arrived_ && !startup_barrier_withdrawn_) {
+        pipeline_->clock()->withdrawStartupParticipant();
+        startup_barrier_withdrawn_ = true;
+    }
+
     // SinkNode 已先 ack 输入 EOS
     // 此处只负责把输出侧完整播完，成功返回后 SinkNode 才向 Pipeline 报告自然 EOS
     if (stop_requested_.load()) {

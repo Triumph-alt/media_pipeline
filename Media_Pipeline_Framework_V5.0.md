@@ -543,7 +543,7 @@ EOSEvent
 
 `consume()` 因而只会收到已被最近成功应用的 active Caps 完整解释的 Buffer。格式字段是否足够由该 Sink 的 `onCaps()` 判断；例如 VideoRender 要求 YUV420P/YUVJ420P 的 width/height/pix_fmt，AudioPlay 要求完整且受支持的 AUDIO_RAW 参数。Caps 应用失败或 Buffer 违反顺序/类型合同都不 ack 当前 Delivery，由 RAII 撤销 in-flight 状态，随后通过 ERROR/stop 统一取消。
 
-`onDrain()` 默认为空；AudioPlay 重写它以等待 swr/SDL/设备尾音，VideoRender 保持默认实现。
+`onDrain()` 默认为空；AudioPlay 重写它以等待 swr/SDL/设备尾音；VideoRender 仅在首帧前自然 EOS 时撤销启动 rendezvous 席位，其他情况保持空收尾。
 
 Buffer 必须在处理完成后才 ack；停止或处理失败时不 ack 当前 Delivery，由 Delivery 的 RAII 析构撤销 in-flight 状态。EOS 在 ack 后才上报 Sink 完成，Route cancel 负责唤醒阻塞中的 `acquireBlocking()`
 
@@ -1079,7 +1079,7 @@ Ready 按拓扑顺序只执行 `node->onReady()`，建立不依赖上游格式�
 
 ### 6.5 stop/cancel
 
-Pipeline stop 先设置所有节点的 `stop_requested_`，随后 `Graph::cancelAllRoutes()`。cancel 清空未完成日志并唤醒全部 publisher、subscriber 及 Mux 外部等待，节点线程再被 join。cancel 是强制停止语义，不代替正常 EOS。
+Pipeline stop 先调用 `Clock::cancelStartupBarrier()`，解除首次 SDL 提交/Present 前可能阻塞的呈现 worker；随后设置所有节点的 `stop_requested_`，再 `Graph::cancelAllRoutes()`。cancel 清空未完成日志并唤醒全部 publisher、subscriber 及 Mux 外部等待，节点线程再被 join。cancel 是强制停止语义，不代替正常 EOS。
 
 ---
 
@@ -1255,9 +1255,21 @@ bool Pipeline::play() {
 
     // Ready 阶段：只初始化格式无关资源；Caps/Buffer/EOS 从 worker 启动后才在 Route 中传递。
     if (!graph_.ready()) {
+        // Ready 失败时即使尚无 worker，也终止本轮可能已登记的启动栅栏状态。
+        clock_.cancelStartupBarrier();
         // Ready 失败：先把 bus 收干净，保证 Ready 期间的 ERROR 消息全部落入 last_error_，
         // 然后再置 ERROR 返回。bus_running_ 翻为 false 后 notify()，
         // waitMessage 的“队列非空优先返回消息”语义保证 pending 消息不会丢。
+        bus_running_ = false;
+        bus_.notify();
+        if (bus_thread_.joinable()) bus_thread_.join();
+        state_ = PipelineState::ERROR;
+        return false;
+    }
+
+    // 所有 Ready 回调已完成登记后才封闭本轮启动参与者集合，随后 worker 才可能到达栅栏。
+    if (!clock_.sealStartupParticipants()) {
+        clock_.cancelStartupBarrier();
         bus_running_ = false;
         bus_.notify();
         if (bus_thread_.joinable()) bus_thread_.join();
@@ -1295,23 +1307,26 @@ void Pipeline::stop() {
         return;   // 已经停止/正在停止/从未运行，直接返回
     }
 
-    // 1. 设置所有节点退出标志
+    // 1. 先解除首次外部输出 rendezvous；已被唤醒或尚未到达的 worker 均不应继续首帧输出。
+    clock_.cancelStartupBarrier();
+
+    // 2. 设置所有节点退出标志
     for (auto& [node, _] : threads_)
         node->stop_requested_.store(true);
 
-    // 2. cancel 所有 OutputRoute，唤醒阻塞中的 publish/acquire
+    // 3. cancel 所有 OutputRoute，唤醒阻塞中的 publish/acquire
     graph_.cancelAllRoutes();
 
-    // 3. join 所有节点线程（join 遍历顺序不承诺；线程退出已由 stop_requested_ + queue flush 触发）
+    // 4. join 所有节点线程（join 遍历顺序不承诺；线程退出已由 stop_requested_ + queue flush 触发）
     for (auto& [node, thread] : threads_)
         if (thread.joinable()) thread.join();
 
-    // 4. 停止 MessageBus 监听线程
+    // 5. 停止 MessageBus 监听线程
     bus_running_ = false;
     bus_.notify();
     if (bus_thread_.joinable()) bus_thread_.join();
 
-    // 5. 按拓扑逆序调用 onStop() 释放不要求工作线程亲和性的资源。
+    // 6. 按拓扑逆序调用 onStop() 释放不要求工作线程亲和性的资源。
     //    VideoRenderNode 的 SDL 视频资源已在线程退出前由其工作线程释放。
     auto& order = graph_.topoOrder();
     for (auto it = order.rbegin(); it != order.rend(); ++it)
@@ -1355,6 +1370,7 @@ void Pipeline::messageBusLoop() {
                 break;
 
             case MessageType::ERROR:
+                clock_.cancelStartupBarrier();
                 error_occurred_ = true;
                 {
                     std::lock_guard lock(error_mutex_);
@@ -1364,6 +1380,7 @@ void Pipeline::messageBusLoop() {
                 break;
 
             case MessageType::STOP_REQUESTED:
+                clock_.cancelStartupBarrier();
                 stop_requested_by_node_.store(true);
                 eos_cv_.notify_all();
                 break;
@@ -1381,17 +1398,19 @@ void Pipeline::messageBusLoop() {
 
 **启动顺序**（play）：
 1. **MessageBus 监听线程**（最先启动，早于 `graph_.ready()`，Ready 阶段节点 `postMessage(ERROR/WARNING/INFO)` 才有人接收）
-2. `graph_.ready()` 若失败：`bus_running_=false → notify → join` drain 所有 Ready 期消息后置 ERROR 返回
-3. SinkNode 线程
-4. TransformNode 线程
-5. SourceNode 线程（最后启动）
+2. `graph_.ready()` 若失败：取消启动栅栏，`bus_running_=false → notify → join` drain 所有 Ready 期消息后置 ERROR 返回
+3. `Clock::sealStartupParticipants()`：Ready 成功的呈现型 Sink 已登记完成，固定共同起跑人数
+4. SinkNode 线程
+5. TransformNode 线程
+6. SourceNode 线程（最后启动）
 
 **停止顺序**（stop）：
-1. 所有节点 `stop_requested_.store(true)`
-2. cancel 所有 OutputRoute
-3. join 所有节点线程（join 遍历顺序不承诺并且无所谓，因为线程退出已由 `stop_requested_` + queue flush 触发）
-4. 停止 MessageBus 监听线程
-5. 按拓扑逆序调用 onStop()
+1. `Clock::cancelStartupBarrier()` 解除首次外部输出等待
+2. 所有节点 `stop_requested_.store(true)`
+3. cancel 所有 OutputRoute
+4. join 所有节点线程（join 遍历顺序不承诺并且无所谓，因为线程退出已由 `stop_requested_` + queue flush 触发）
+5. 停止 MessageBus 监听线程
+6. 按拓扑逆序调用 onStop()
 
 MessageBus 监听线程最后停止，保证节点退出过程中 postMessage 的消息（如 EOS、WARNING）仍能被处理。
 
@@ -1489,6 +1508,9 @@ AudioPlay worker
 ```cpp
 class Clock {
 public:
+    enum class StartupBarrierWaitResult { RELEASED, TIMEOUT, CANCELLED };
+    enum class StartupBarrierState { REGISTERING, WAITING, RELEASED, CANCELLED };
+
     // 未锚定时 getPositionUs() 返回的哨兵（与 AV_NOPTS_VALUE 同值）
     static constexpr int64_t kUnanchored = std::numeric_limits<int64_t>::min();
 
@@ -1519,18 +1541,38 @@ public:
     void setHasAudio(bool has) { has_audio_.store(has); }
     bool hasAudio() const { return has_audio_.load(); }
 
-    // play 时调用：清除锚定与基准，等待新一轮 Running 重新锚定。
+    // play 时调用：清除媒体时间锚定与本轮启动 rendezvous。
     void reset() {
         anchored_.store(false);
         base_pts_us_.store(0);
         base_wall_us_.store(0);
+        // registered = arrived = 0, state = REGISTERING
     }
 
+    // Ready 阶段登记参与同步起跑的呈现型 Sink；Pipeline 在启动 worker 前封闭人数。
+    bool registerStartupParticipant();
+    bool sealStartupParticipants();
+
+    // 首次外部输出前到达栅栏：无限等待版本适合不需要处理额外事务的参与者；
+    // 限时版本在 TIMEOUT 后让调用者回到自身事件循环，再以同一个 arrived 标记重试。
+    bool arriveAndWaitForStartup();
+    StartupBarrierWaitResult arriveAndWaitForStartupFor(
+        std::chrono::microseconds timeout, bool& arrived);
+
+    // 首帧前自然 EOS 可撤销已登记席位；stop/error/STOP_REQUESTED 取消并唤醒全部等待者。
+    void withdrawStartupParticipant();
+    void cancelStartupBarrier();
+
 private:
-    std::atomic<bool>    anchored_{false};
-    std::atomic<int64_t> base_pts_us_{0};
-    std::atomic<int64_t> base_wall_us_{0};
-    std::atomic<bool>    has_audio_{false};
+    // 原有媒体时间原子字段省略。
+
+    // 启动栅栏的持久状态：
+    // REGISTERING → WAITING → RELEASED；任一阶段均可 → CANCELLED。
+    std::mutex startup_mutex_;
+    std::condition_variable startup_cv_;
+    size_t registered_startup_participants_ = 0;
+    size_t arrived_startup_participants_ = 0;
+    StartupBarrierState startup_state_ = StartupBarrierState::REGISTERING;
 
     static int64_t nowUs() {
         return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1600,7 +1642,7 @@ SDL AudioStream 内部缓冲对 App 无界；AudioPlayNode 在每次 canonical P
 
 ### 9.5 EOS Drain
 
-SinkNode 收到输入 EOS 后，先 ack（释放上游 Route，不占背压窗口），再调用 `onDrain()`，最后才上报最终 EOS。`onDrain()` 默认空实现（VideoRenderNode 不受影响）。AudioPlayNode 的 `onDrain()`：
+SinkNode 收到输入 EOS 后，先 ack（释放上游 Route，不占背压窗口），再调用 `onDrain()`，最后才上报最终 EOS。`onDrain()` 默认空实现；AudioPlayNode 用它完成 swr/SDL/设备尾音 drain，VideoRenderNode 仅在首帧前自然 EOS 时撤销启动 rendezvous 席位：
 
 1. swr 尾部排空（最终 EOS，或新 AudioRaw Caps 到达前的旧输入格式）；
 2. 最终 EOS 时调用 `SDL_FlushAudioStream` 把 SDL 内部残留转换出来；运行期 Caps 重配不 flush SDL canonical 队列；
@@ -1608,27 +1650,58 @@ SinkNode 收到输入 EOS 后，先 ack（释放上游 Route，不占背压窗�
 4. 再等待 3 个设备周期，覆盖设备周期缓冲与后端硬件缓冲的尾音；
 5. `onDrain()` 内出错或被打断（`stop_requested_` 置位）时，不再上报 EOS。
 
-### 9.6 VideoRenderNode 同步逻辑
+### 9.6 启动 rendezvous
+
+当前一个 `Pipeline` 只持有一个 `Clock`，也就是一个同步域。Clock 除媒体时间外，还持有本轮一次性、可取消的启动 rendezvous；它只负责"首次外部输出能否共同起跑"，不参与 NOPTS、音频时间锚定或释放后的同步判断。
+
+1. Ready 阶段，参与同一同步域首次起跑的呈现型 Sink 调用 `registerStartupParticipant()`；`Pipeline::play()` 在 `graph.ready()` 全部成功后调用 `sealStartupParticipants()`，先固定参与人数，再启动 worker。
+2. AudioPlay 在第一段 canonical PCM、首次 `SDL_PutAudioStreamData()` 之前到达；VideoRender 在首帧已完成 Texture 创建和上传、首次 `SDL_RenderPresent()` 之前到达。栅栏只挡首次外部输出，不预填 SDL，也不等待 Clock 锚定。
+3. 最后到达者将 `StartupBarrierState` 从 `WAITING` 切到 `RELEASED` 并唤醒全部先到者。单参与者在自己到达时立即释放；无参与者在 seal 时直接进入 `RELEASED`。
+4. 若已登记参与者在首次输出前自然 EOS，Sink 的 `onDrain()` 调用 `withdrawStartupParticipant()` 撤销席位；当其余已到达人数等于剩余登记人数时正常释放。AudioPlay withdraw 后仍按既有 swr/SDL drain 收尾；若该尾部首次产生 canonical PCM，它面对已释放栅栏提交，当前不把该罕见尾部路径提升为第二轮 rendezvous。stop、ERROR、STOP_REQUESTED 以及 Ready/封闭失败均调用 `cancelStartupBarrier()`，状态进入 `CANCELLED` 并唤醒全部等待者。
+5. 有自身事件循环的参与者使用限时 `arriveAndWaitForStartupFor(timeout, bool& arrived)`：`TIMEOUT` 不改变 Clock 的持久 `WAITING` 状态，调用者可处理自己的事件后带同一 `arrived` 标记重试，绝不重复计入到达人数。当前 VideoRender 每 10ms 醒来轮询自身窗口关闭请求；普通无限等待版本适合不需要额外事务的参与者。
+
+栅栏释放后，既有规则完全不变：AudioPlay 仍按首个有效 PTS 与 NOPTS 前缀账本刷新 Audio Clock；VideoRender 在 Clock 未锚定时立即呈现，已锚定后再按本节以下的呈现节奏规则运行。
+
+### 9.7 VideoRenderNode 同步与晚帧丢弃
 
 VideoRenderNode 统一从 `pipeline_->clock()` 读取主时钟，不再保留私有的 steady_clock 路径：
 
-- 未锚定：立即呈现（不同步）；无音频时本帧调用 `anchorOnce(frame_pts)` 一次性锚定。
-- 已锚定：`diff = frame_pts − clock_pos`；超前则取消感知等待，落后则立即追帧。
-- 丢帧策略本轮不实现（待接音频接线阶段单独定阈值）。
+- `frame_pts == AV_NOPTS_VALUE`：没有可比较的媒体时间，立即呈现，不丢帧。
+- Clock 未锚定：立即呈现；无音频时本帧调用 `anchorOnce(frame_pts)` 一次性锚定。启动 rendezvous 已保证首个外部输出不会因另一呈现参与者尚未准备好而抢跑。
+- 已锚定且超前：`remaining = frame_pts − clock_pos > 0` 时取消感知地等待，每次最多 1ms，醒来重新读取 Clock。
+- 已锚定且落后：`remaining ≤ 0` 时使用 `threshold = max(Buffer.duration, 40ms)`。若 `remaining < -threshold`，当前帧已超过容忍的展示窗口，跳过 Texture 上传和 Present；否则立即呈现追帧。
+- `Buffer.duration == 0` 时阈值退化为 40ms；当前 duration 由 Decode 的 VIDEO_ENCODED nominal framerate hint 推导，不宣称已实现真实逐帧 VFR 时长模型。低帧率的较大 duration 会扩大容忍窗口，避免过早丢弃仍有展示价值的画面。
+- `waitForPresentationTime()` 返回 `false` 同时表达 stop 打断或正常晚帧跳过；两者在 `consume()` 中都不渲染。SinkNode 随后通过 `stop_requested_` 区分：正常丢帧仍 ack 当前 Delivery 并继续，停止则不 ack、退出并由 Pipeline cancel 收尾。
+- VideoRender 记录 `rendered_frames_` 与 `dropped_frames_`，不逐帧打印丢帧日志；player 在非 SIGINT 且没有 Pipeline ERROR 的收尾路径输出两项统计。
 
 ```cpp
-bool VideoRenderNode::waitForPresentationTime(int64_t pts_us) {
+bool VideoRenderNode::waitForPresentationTime(int64_t pts_us, int64_t duration_us) {
+    if (pts_us == AV_NOPTS_VALUE) return true;
+
     Clock* clock = pipeline_->clock();
     int64_t pos = clock->getPositionUs();
     if (pos == Clock::kUnanchored) {
         if (!clock->hasAudio()) clock->anchorOnce(pts_us);
         return true;
     }
-    while (pts_us - pos > 0 && !stop_requested_.load()) {
-        // 取消感知等待，10ms 或剩余较小者
+
+    int64_t remaining_us = pts_us - pos;
+    while (remaining_us > 0 && !stop_requested_.load()) {
+        std::this_thread::sleep_for(std::chrono::microseconds(
+            std::min<int64_t>(remaining_us, 1000)));
         pos = clock->getPositionUs();
+        if (pos == Clock::kUnanchored) return true;
+        remaining_us = pts_us - pos;
     }
-    return !stop_requested_.load();
+    if (stop_requested_.load()) return false;
+
+    const int64_t threshold_us = std::max<int64_t>(
+        duration_us > 0 ? duration_us : 0, 40000);
+    if (remaining_us < -threshold_us) {
+        ++dropped_frames_;
+        return false;
+    }
+    return true;
 }
 ```
 
@@ -1841,7 +1914,7 @@ TransformNode 的 runLoop 收到 EOS
 诸如 VideoRenderNode 和 AudioPlayNode 这些 SinkNode 收到 EOS，`SinkNode::runLoop` 会按以下顺序处理：
 
 1. **ack(EOS)**：先释放上游 Route 容量，让 drain 等待期间不占用背压窗口。
-2. **onDrain()**：输出侧 drain。VideoRenderNode 为空实现；AudioPlayNode 在此等 swr 排空、`SDL_FlushAudioStream`、设备队列吃空，再覆盖几个设备周期尾音。
+2. **onDrain()**：输出侧 drain。AudioPlayNode 在此等 swr 排空、`SDL_FlushAudioStream`、设备队列吃空，再覆盖几个设备周期尾音；VideoRenderNode 仅在首帧前自然 EOS 时撤销尚未到达的启动栅栏席位。
 3. **postMessage(EOS)**：drain 成功或被打断/出错后，才上报最终 EOS。
 
 `onDrain()` 内出错或 `stop_requested_` 置位时，不再上报 EOS；这保证"自然 EOS"只代表"输入耗尽且输出真正播完"。
@@ -1865,15 +1938,13 @@ Pipeline::waitEOS
 5. **link/build 错误报告**：核心库当前只返回 bool，不直接 fprintf，也不适合走运行期 MessageBus；详细错误报告机制仍需独立设计。
 6. **Caps 运行期边界的剩余限制**：Decoder 首帧真实格式定案、同一 Route 多份 Caps、VideoRender 尺寸变化和 AudioPlay 输入重配已支持；尚不支持 PTS discontinuity、Caps generation、非 YUV420P swscale。
 7. **采集 Source 的 Caps 生产模型**：默认 `SourceNode::capture() -> Buffer*` 不能表达 `Caps → Buffer* → Caps → Buffer*`。V4L2/AudioCapture 落地前必须先结合设备 open、协商、重配及运行期格式变化，设计有序 `QueueItem` 的 Source 生产接口；当前不得用该旧默认骨架接入要求 Running Caps 的新节点。
-8. 音视频同步丢帧阈值（落后多少丢帧）待定。
-9. **媒体兼容性**：Packet side data、`best_effort_timestamp`、send/receive EAGAIN、非 YUV420P swscale、色彩空间/HDR 等仍需按具体节点补全；`pkt_timebase` 已设置为框架微秒时间基，完整 channel layout 已以 Caps 的 `ChannelLayout` 值类型传递，但 AudioPlay 当前只承诺标准 native layout 到 stereo 的转换。
-10. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
-11. **Demux/Mux 边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`，虽 Route 已支持可靠多订阅者输出，但动态 Mux 输出 Pad、最终交织策略、阻塞网络 I/O interrupt callback 和具体 AVMuxNode 仍待实现。
-12. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4；需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
-13. **启动时序对齐（栅栏，暂缓）**：当前多呈现 Sink 启动时首次输出延迟不对称（如音频设备在 Ready 阶段即出声，而视频窗口创建需数秒），造成 A/V 起跑不齐。完整的启动栅栏设计需让共享主时钟的呈现型 Sink 在全部就绪后才同时出首份输出；已讨论但暂缓，待后续实现。
-14. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
-15. **第三方 GUI LeakSanitizer 基线**：当前 Linux/X11 环境的 SDL3 2D software renderer 在 window surface 呈现时会内部尝试 GPU texture framebuffer，加载 Mesa/GLX；即使独立最小程序完整销毁 Texture、Renderer、Window，退出 VIDEO 并调用 `SDL_Quit()`，LeakSanitizer 仍报告 Mesa/GLX 约 1464B/16 allocations。强制直接 X11 framebuffer 可避免 Mesa 报告，但会出现约 33066B/572 allocations 的 X11/XKB 报告。两者均可由独立 SDL 最小程序复现，不属于 Pipeline、Buffer、Route 或节点资源泄漏；不为消除报告而改 renderer/backend。player 的 LeakSanitizer 验证应将该 Mesa/GLX 基线与项目自身泄漏区分，框架单测仍无 suppression 严格运行。
-16. SDL_GetAudioDeviceFormat 查询已打开设备偶发返回空错误失败,而当前它被当硬 ERROR 直接毙掉整个 Ready。将来或可对这个查询加一次重试/容忍,但现在按硬失败处理也说得过去,先不动。
+8. **媒体兼容性**：Packet side data、`best_effort_timestamp`、send/receive EAGAIN、非 YUV420P swscale、色彩空间/HDR 等仍需按具体节点补全；`pkt_timebase` 已设置为框架微秒时间基，完整 channel layout 已以 Caps 的 `ChannelLayout` 值类型传递，但 AudioPlay 当前只承诺标准 native layout 到 stereo 的转换。
+9. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
+10. **Demux/Mux 边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`，虽 Route 已支持可靠多订阅者输出，但动态 Mux 输出 Pad、最终交织策略、阻塞网络 I/O interrupt callback 和具体 AVMuxNode 仍待实现。
+11. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4；需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
+12. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
+13. **第三方 GUI LeakSanitizer 基线**：当前 Linux/X11 环境的 SDL3 2D software renderer 在 window surface 呈现时会内部尝试 GPU texture framebuffer，加载 Mesa/GLX；即使独立最小程序完整销毁 Texture、Renderer、Window，退出 VIDEO 并调用 `SDL_Quit()`，LeakSanitizer 仍报告 Mesa/GLX 约 1464B/16 allocations。强制直接 X11 framebuffer 可避免 Mesa 报告，但会出现约 33066B/572 allocations 的 X11/XKB 报告。两者均可由独立 SDL 最小程序复现，不属于 Pipeline、Buffer、Route 或节点资源泄漏；不为消除报告而改 renderer/backend。player 的 LeakSanitizer 验证应将该 Mesa/GLX 基线与项目自身泄漏区分，框架单测仍无 suppression 严格运行。
+14. SDL_GetAudioDeviceFormat 查询已打开设备偶发返回空错误失败,而当前它被当硬 ERROR 直接毙掉整个 Ready。将来或可对这个查询加一次重试/容忍,但现在按硬失败处理也说得过去,先不动。
 
 ---
 
