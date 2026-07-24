@@ -64,9 +64,8 @@ Buffer* Buffer::fromAVPacket(const AVPacket* pkt, MediaType type, AVRational tim
 
     buf->media_type = type;
 
-    // 运行时格式变化再补充完整字段；flags 是逐 packet 元数据，当前直接保留
+    // flags 是逐 packet 元数据，当前直接保留；codec 与流格式由 active Caps 描述。
     EncodedMeta meta;
-    meta.codec_id = codec_id;
     meta.flags = pkt->flags;
     buf->meta = meta;
 
@@ -129,11 +128,8 @@ Buffer* Buffer::fromAVFrame(const AVFrame* frame, MediaType type,
         }
         buf->media_type = MediaType::VIDEO_RAW;
 
-        VideoRawMeta meta;
-        meta.width = width;
-        meta.height = height;
-        meta.pix_fmt = pix_fmt;
-        buf->meta = meta;
+        // 视频流格式由先于本帧发送的 CapsEvent 唯一描述；当前紧密连续存储没有逐帧 layout。
+        buf->meta = VideoRawMeta{};
         return buf;
     }
 
@@ -205,10 +201,8 @@ Buffer* Buffer::fromAVFrame(const AVFrame* frame, MediaType type,
         buf->media_type = MediaType::AUDIO_RAW;
 
         AudioRawMeta meta;
-        meta.sample_rate = sample_rate;
-        meta.channels = channels;
+        // sample_rate/sample_fmt/layout 属于 active AudioRaw Caps；nb_samples 是逐帧属性。
         meta.nb_samples = nb_samples;
-        meta.sample_fmt = sfmt;
         buf->meta = meta;
         return buf;
     }

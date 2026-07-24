@@ -2,17 +2,16 @@
 
 #include "pipeline/core/BaseNode.h"
 
-#include <chrono>
 #include <cstdint>
-#include <string>
 
 namespace pipeline {
 
 // ===================================================================
-// VideoRenderNode: SDL3 视频渲染节点（SinkNode 子类）
+// VideoRenderNode: SDL3 视频渲染 Sink
 //
-// SDL VIDEO、Window、Renderer 和 Texture 全部由节点工作线程创建、使用和
-// 销毁；节点只处理自身窗口的关闭请求，其他 SDL 输入事件暂不属于本节点范围。
+// SDL VIDEO、Window、Renderer、Texture 全部由节点 worker 创建、使用和销毁。
+// 视频格式由 Running Route 上的完整 CapsEvent 唯一描述；当前只接受紧密 YUV420P，
+// 非 YUV420P 的 swscale 路径作为后续独立工作。
 // ===================================================================
 class VideoRenderNode final : public SinkNode {
 public:
@@ -22,7 +21,8 @@ public:
 
 protected:
     bool onReady() override { return true; }
-    bool onStreamInfo() override;
+    bool onCaps(const std::string& sink_pad_name, const CapsEvent& caps,
+                std::vector<QueueItem>* outputs) override;
     void runLoop() override;
     void consume(const Buffer* buf) override;
     void onStop() override;
@@ -35,14 +35,14 @@ private:
     bool pollWindowCloseRequested();
     bool waitForPresentationTime(int64_t pts_us);
 
-    int width_  = 0;
+    int width_ = 0;
     int height_ = 0;
 
     // 只允许节点工作线程访问；窗口关闭请求也在该线程轮询处理。
-    void* window_   = nullptr;
+    void* window_ = nullptr;
     void* renderer_ = nullptr;
-    void* texture_  = nullptr;
-    int texture_width_  = 0;
+    void* texture_ = nullptr;
+    int texture_width_ = 0;
     int texture_height_ = 0;
     bool sdl_video_initialized_ = false;
 

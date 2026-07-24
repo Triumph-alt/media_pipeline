@@ -16,18 +16,21 @@ namespace pipeline {
 // Subscription 以各自游标 acquire，从而看到完全一致的数据/事件顺序。
 //
 // 当前只有两种事件：
-//   CapsEvent — Ready / onStreamInfo 阶段的流级格式协商事件。
-//               每条逻辑 Route 只 publish 一次，所有静态订阅者分别 acquire/ack。
-//   EOSEvent  — 运行期流结束事件。
-//               每条逻辑 Route 只 publish 一次，并等待全部订阅者 ack。
+//   CapsEvent：Running 阶段的完整流配置边界。每条逻辑 Route 可出现多次，
+//              每一份都必须先于受其管辖的 Buffer。
+//   EOSEvent：运行期流结束事件。
+//             每条逻辑 Route 只 publish 一次，并等待全部订阅者 ack。
 //
-// 错误处理不走队列：出错节点通过 MessageBus 上报 ERROR 后退出 runLoop，
-// Pipeline 收到 ERROR 消息后统一调用 stop() 清理。
+// 错误处理通过 MessageBus 上报 ERROR，Pipeline 收到 ERROR 后统一清理
 // ===================================================================
 struct EOSEvent {};
 
-// Event 是值类型，每个下游各自收到一份独立副本
+// Route 中的控制事件：Caps 是完整格式边界，EOS 是自然结束边界
 using Event = std::variant<CapsEvent, EOSEvent>;
+
+// QueueItem 同时是 OutputRoute 的实际传输类型和 Transform 的本地待发布序列元素。
+// 本地序列与 Route 使用完全相同的表示，因而 Caps、Buffer、EOS 可在一个拥有型
+// 序列中按唯一顺序发布：flush 输出 → EOS；BufferRef 在任何提前退出时仍由 RAII 释放。
 using QueueItem = std::variant<BufferRef, Event>;
 
 } // namespace pipeline

@@ -27,7 +27,7 @@ enum class PadDir {
 // 节点分叉仍通过多个 SrcPad 表达，但同一逻辑输出的 SrcPad 可共享一个 OutputRoute
 
 // template_caps_ 是静态的能力集合，声明"本 pad 允许承载的 MediaType" 的集合
-// actual_type_ 是运行时 Pad 承载的的类型，代表本 pad 实际承载的具体类型
+// actual_type_ 是首份 Caps 在运行时选定的具体类型，之后保持冻结。
 // ===================================================================
 class Pad {
 public:
@@ -54,6 +54,7 @@ protected:
     friend class Graph;
 
 private:
+    // BaseNode 仅在首份 Caps 选定实际类型时写入；之后该值冻结。
     void setActualType(MediaType t) { actual_type_ = t; }
 
     std::optional<MediaType> actual_type_;

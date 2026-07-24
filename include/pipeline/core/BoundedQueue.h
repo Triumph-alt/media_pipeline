@@ -61,7 +61,7 @@ public:
     // flush：唤醒所有阻塞的 push/pop，用于 stop 流程
     void flush();
 
-    // 调整队列容量，只在 onStreamInfo() 阶段调用
+    // 调整队列容量；旧独立 Queue 已不再用于 Route 数据面。
     // 此时队列里只有 CapsEvent，不会有数据溢出问题
     void resize(size_t new_capacity);
 

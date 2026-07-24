@@ -90,7 +90,11 @@ bool AVDemuxNode::probeStreams(DemuxProbeResult* result) {
             caps.media_type  = MediaType::AUDIO_ENCODED;
             caps.codec_id    = st->codecpar->codec_id;
             caps.sample_rate = st->codecpar->sample_rate;
-            caps.channels    = st->codecpar->ch_layout.nb_channels;
+            if (!ChannelLayout::fromAV(st->codecpar->ch_layout, &caps.channel_layout)) {
+                postMessage(MessageType::ERROR,
+                            "AVDemuxNode: invalid audio channel layout in stream parameters");
+                return false;
+            }
             copyExtradata(st->codecpar, caps.extradata);
             result->audio = std::move(caps);
             fprintf(stderr, "[%s] audio stream #%d: %dHz %dch codec=%d\n",

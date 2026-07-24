@@ -4,18 +4,17 @@
 
 struct AVCodec;
 struct AVCodecContext;
+struct AVFrame;
 struct AVPacket;
 
 namespace pipeline {
 
 // ===================================================================
-// DecodeNode: FFmpeg 解码节点（TransformNode 子类）
+// DecodeNode: 运行期 Caps 驱动的 FFmpeg 解码 Transform
 //
-// 接收 VIDEO_ENCODED / AUDIO_ENCODED，输出对应的 RAW 类型。
-// onStreamInfo 中用 receiveCapsEvent 取输入 Caps → 打开解码器 →
-// 从 ctx 读取输出参数 → sendCapsEvent 输出 Caps。
-// process 中 send_packet → receive_frame 循环产出 Buffer。
-// EOS 时 flush 解码器缓冲区。
+// 输入 encoded Caps 到达时打开或重开 decoder。真实 RAW 格式必须由 AVFrame 确定：
+// 首帧或格式变化帧之前先输出完整 RAW Caps，再输出对应 Buffer。EOS flush 复用同一
+// 有序 QueueItem 产出路径，避免绕开 BufferRef 所有权边界。
 // ===================================================================
 class DecodeNode final : public TransformNode {
 public:
@@ -24,19 +23,25 @@ public:
 protected:
     bool onReady() override { return true; }
     void onStop() override;
-    bool onStreamInfo() override;
-    void process(const Buffer* input, std::vector<BufferRef>& outputs) override;
-    void onEvent(const Event& event) override;
+    bool onCaps(const std::string& sink_pad_name, const CapsEvent& caps,
+                std::vector<QueueItem>* outputs) override;
+    void process(const Buffer* input, std::vector<QueueItem>& outputs) override;
+    void onEOS(std::vector<QueueItem>& outputs) override;
 
 private:
-    // 将 Buffer 数据转为 AVPacket（深拷贝 payload），用于 avcodec_send_packet
     AVPacket* toAVPacket(const Buffer* buf);
+    bool configureDecoder(const CapsEvent& caps);
+    bool drainDecoder(std::vector<QueueItem>& outputs);
+    bool appendFrame(AVFrame* frame, std::vector<QueueItem>& outputs);
+    bool appendOutputCapsForFrame(const AVFrame* frame, std::vector<QueueItem>& outputs);
 
-    AVCodecContext* ctx_       = nullptr;
-    const AVCodec*  codec_    = nullptr;
-    bool            is_video_ = false;
-    AVRational      framerate_ = {0, 1};
-    bool            flushed_  = false;
+    AVCodecContext* ctx_ = nullptr;
+    const AVCodec* codec_ = nullptr;
+    bool is_video_ = false;
+    // encoded 流的 nominal timing hint，仅用于推导输出视频 Buffer 的 duration。
+    AVRational framerate_ = {0, 1};
+    bool flushed_ = false;
+    std::optional<CapsEvent> output_caps_;
 };
 
 } // namespace pipeline

@@ -23,30 +23,23 @@ namespace pipeline {
 class BufferRef;
 
 // ===================================================================
-// BufferMeta: Buffer 的逐帧格式元信息（按数据类型分三种）
-// 部分基础格式字段与 CapsEvent 重复，但也携带 packet/frame 级属性
-// 同时此字段也为后续运行时格式变化（STREAM_INFO_CHANGED）准备
+// BufferMeta: Buffer 的逐帧属性与存储布局
+//
+// 流格式唯一由有序 CapsEvent 描述。Meta 只保留随 Buffer 变化的事实；未来接入
+// 非紧密平面、外部存储或硬件帧时，在对应 RAW Meta 中加入 layout/handle。
 // ===================================================================
-struct VideoRawMeta {
-    int width, height;
-    AVPixelFormat pix_fmt;
-};
+// 流格式属于 CapsEvent；VideoRaw 的当前紧密连续存储不需要逐帧附加属性。
+// 未来接入外部存储、非紧密 plane 或硬件帧时，可在这里加入逐帧 layout/handle。
+struct VideoRawMeta {};
 
 struct AudioRawMeta {
-    int sample_rate;
-    int channels;
-    int nb_samples;
-    AVSampleFormat sample_fmt;
+    // 每帧采样数随 Buffer 变化；sample_rate/sample_fmt/layout 由 active Caps 决定。
+    int nb_samples = 0;
 };
 
 struct EncodedMeta {
-    AVCodecID codec_id;
-    int width = 0;
-    int height = 0;
-    int sample_rate = 0;
-    int channels = 0;
+    // keyframe 等是逐 Packet 属性；codec/extradata/流参数由 active Caps 决定。
     int flags = 0;
-    std::vector<uint8_t> extradata;
 };
 
 using BufferMeta = std::variant<VideoRawMeta, AudioRawMeta, EncodedMeta>;

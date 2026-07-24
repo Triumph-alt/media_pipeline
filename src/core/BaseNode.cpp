@@ -86,24 +86,24 @@ bool BaseNode::releaseSinkPad(SinkPad* pad) {
 }
 
 // ===================================================================
-// BaseNode: 数据分发
+// BaseNode 唯一“向某条 OutputRoute 提交一个有序项目”的总闸门
 // ===================================================================
-bool BaseNode::pushToDownstream(BufferRef&& buf, const std::string& src_pad_name) {
-    // 发布入口立即接管调用方显式 move 进来的引用；后续任一失败路径都由 RAII 释放。
-    BufferRef primary(std::move(buf));
-    if (!primary) {
-        return false;
-    }
+bool BaseNode::publishOutputItem(QueueItem&& item, const std::string& src_pad_name) {
+    // 接管QueueItem所有权，保证控制流中的未发布 BufferRef 始终由 RAII 管理
+    QueueItem primary(std::move(item));
 
+    // 目标 Route
     std::shared_ptr<OutputRoute> route;
     if (!src_pad_name.empty()) {
+        // 如果指定了src_pad_name，直接找到该 SrcPad 所属 Route
         SrcPad* pad = getSrcPad(src_pad_name);
         if (!pad || !pad->isConnected()) {
+            // Pad 不存在或没连接就算失败
             return false;
         }
         route = pad->route();
     } else {
-        // 未指定 Pad 时只能有一条逻辑 Route；多 SrcPad 分叉应共享同一个 Route
+        // 未指定 name 则遍历所有已连接 SrcPad，这就要求它们共享同一条逻辑 Route(同源分叉)
         for (const auto& pad : src_pads_) {
             if (!pad->isConnected()) {
                 continue;
@@ -111,8 +111,9 @@ bool BaseNode::pushToDownstream(BufferRef&& buf, const std::string& src_pad_name
             if (!route) {
                 route = pad->route();
             } else if (route.get() != pad->route().get()) {
+                // 如果发现已连接 SrcPad 指向不同 Route，无法判断发给谁，直接报错
                 postMessage(MessageType::ERROR,
-                            "pushToDownstream: ambiguous logical output route");
+                            "publishOutputItem: ambiguous logical output route");
                 return false;
             }
         }
@@ -122,20 +123,75 @@ bool BaseNode::pushToDownstream(BufferRef&& buf, const std::string& src_pad_name
         return false;
     }
 
-    return route->publishBlocking(QueueItem{std::move(primary)}) ==
-           RoutePublishResult::PUBLISHED;
+    // 如果 QueueItem 是 Buffer，则发布 Buffer
+    if (std::holds_alternative<BufferRef>(primary)) {
+        // 先检查不是空引用
+        if (!std::get<BufferRef>(primary)) {
+            return false;
+        }
+        // 直接可靠发布
+        return route->publishBlocking(std::move(primary)) == RoutePublishResult::PUBLISHED;
+    }
+
+    // 不是 Buffer，那就是 Event
+    const Event& event = std::get<Event>(primary);
+
+    // 如果是 EOS Event，同样直接发布
+    if (std::holds_alternative<EOSEvent>(event)) {
+        return route->publishBlocking(std::move(primary)) == RoutePublishResult::PUBLISHED;
+    }
+
+    // 剩下的事件必然就是 CapsEvent
+    const CapsEvent& caps = std::get<CapsEvent>(event);
+
+    // 首份 Caps 用 TemplateCaps 选择并固定该逻辑 Route 的 MediaType；同类格式变化只比较
+    // 已固定的 actualType，不能把同一条 Route 在 Running 中改成另一种媒体类型。
+    bool is_firstcaps = false;
+    for (auto& sibling : src_pads_) {
+        if (!sibling->isConnected() || sibling->route().get() != route.get()) {
+            continue;
+        }
+
+        const auto actual_type = sibling->actualType();
+        if (actual_type) {
+            if (*actual_type != caps.media_type) {
+                postMessage(MessageType::ERROR,
+                            "publishOutputItem: CapsEvent changes fixed MediaType on shared output route");
+                return false;
+            }
+            continue;
+        }
+
+        if (!sibling->templateCaps().contains(caps.media_type)) {
+            postMessage(MessageType::ERROR,
+                        "publishOutputItem: caps.media_type not in shared route pad template caps");
+            return false;
+        }
+        is_firstcaps = true;
+        sibling->setActualType(caps.media_type);
+    }
+
+    // 首份 Caps 在写入其配置边界前确定该 Route 的条目硬容量。
+    // 后续同类格式变化不改变容量；跨 MediaType 变化已在上方拒绝。
+    if (is_firstcaps) {
+        route->resize(selectRouteCapacity(caps.media_type));
+    }
+    return route->publishBlocking(std::move(primary)) == RoutePublishResult::PUBLISHED;
+}
+
+bool BaseNode::pushToDownstream(BufferRef&& buf, const std::string& src_pad_name) {
+    return publishOutputItem(QueueItem{std::move(buf)}, src_pad_name);
 }
 
 bool BaseNode::sendEOSDownstream() {
-    // 同一 Route 的多个 SrcPad 只发布一次 EOS；每条 Subscription 按自身游标接收它。
+    // Each logical Route gets one EOS even when several SrcPads express a static same-stream branch.
     std::unordered_set<OutputRoute*> published;
     for (const auto& pad : src_pads_) {
         auto route = pad->route();
         if (!pad->isConnected() || !route || !published.insert(route.get()).second) {
             continue;
         }
-        if (route->publishBlocking(QueueItem{Event{EOSEvent{}}}) !=
-            RoutePublishResult::PUBLISHED) {
+        if (!publishOutputItem(QueueItem{Event{EOSEvent{}}}, pad->name())) {
             return false;
         }
     }
@@ -149,76 +205,43 @@ bool BaseNode::sendCapsEvent(const std::string& src_pad_name, const CapsEvent& c
                     "sendCapsEvent: src pad '" + src_pad_name + "' not found or not connected");
         return false;
     }
-
-    if (!pad->templateCaps().contains(caps.media_type)) {
-        postMessage(MessageType::ERROR,
-                    "sendCapsEvent: caps.media_type not in src pad '" + src_pad_name + "' template caps");
-        return false;
-    }
-
-    auto route = pad->route();
-    // Route 是同源 Pad 的共同格式边界：所有成员必须接受同一个实际 MediaType。
-    for (auto& sibling : src_pads_) {
-        if (sibling->isConnected() && sibling->route().get() == route.get()) {
-            if (!sibling->templateCaps().contains(caps.media_type)) {
-                postMessage(MessageType::ERROR,
-                            "sendCapsEvent: caps.media_type not in shared route pad template caps");
-                return false;
-            }
-            sibling->setActualType(caps.media_type);
-        }
-    }
-
-    if (route->publishBlocking(QueueItem{Event{caps}}) != RoutePublishResult::PUBLISHED) {
-        postMessage(MessageType::ERROR, "sendCapsEvent: route publish cancelled");
-        return false;
-    }
-    return true;
+    return publishOutputItem(QueueItem{Event{caps}}, src_pad_name);
 }
 
-bool BaseNode::receiveCapsEvent(const std::string& sink_pad_name) {
+bool BaseNode::applyCapsEvent(const std::string& sink_pad_name, const CapsEvent& caps,
+                                  std::vector<QueueItem>* outputs) {
     SinkPad* pad = getSinkPad(sink_pad_name);
     if (!pad || !pad->isConnected()) {
         postMessage(MessageType::ERROR,
-                    "receiveCapsEvent: sink pad '" + sink_pad_name + "' not found or not connected");
+                    "applyCapsEvent: sink pad '" + sink_pad_name + "' not found or not connected");
         return false;
     }
-
-    auto delivery = pad->acquireBlocking();
-    // Delivery 保持当前游标；只有成功校验并写入 negotiated_caps_ 后才 ack。
-    if (!delivery) {
+    // 首份 Caps 用 TemplateCaps 选择 SinkPad 的实际类型；后续 Caps 只能在已固定的
+    // MediaType 内重配格式，不能把同一条输入 Route 改成另一种媒体类型。
+    const auto actual_type = pad->actualType();
+    if (actual_type) {
+        if (*actual_type != caps.media_type) {
+            postMessage(MessageType::ERROR,
+                        "applyCapsEvent: CapsEvent changes fixed MediaType on sink pad '" +
+                            sink_pad_name + "'");
+            return false;
+        }
+    } else if (!pad->templateCaps().contains(caps.media_type)) {
         postMessage(MessageType::ERROR,
-                    "receiveCapsEvent: route cancelled, no CapsEvent on pad '" + sink_pad_name + "'");
+                    "applyCapsEvent: caps.media_type not in sink pad '" + sink_pad_name +
+                        "' template caps");
         return false;
     }
 
-    const QueueItem& item = delivery->item();
-    if (!std::holds_alternative<Event>(item)) {
-        postMessage(MessageType::ERROR,
-                    "receiveCapsEvent: expected CapsEvent on pad '" + sink_pad_name + "', got Buffer");
+    // 字段是否足够由具体消费者 onCaps 判断；成功前不更新 active_caps_，也不允许 ack。
+    if (!onCaps(sink_pad_name, caps, outputs)) {
         return false;
     }
 
-    const Event& event = std::get<Event>(item);
-    if (!std::holds_alternative<CapsEvent>(event)) {
-        postMessage(MessageType::ERROR,
-                    "receiveCapsEvent: expected CapsEvent on pad '" + sink_pad_name + "', got other Event");
-        return false;
+    if (!actual_type) {
+        pad->setActualType(caps.media_type);
     }
-
-    const CapsEvent& caps = std::get<CapsEvent>(event);
-    if (!pad->templateCaps().contains(caps.media_type)) {
-        postMessage(MessageType::ERROR,
-                    "receiveCapsEvent: caps.media_type not in sink pad '" + sink_pad_name + "' template caps");
-        return false;
-    }
-
-    pad->setActualType(caps.media_type);
-    negotiated_caps_[sink_pad_name] = caps;
-    if (!delivery->ack()) {
-        postMessage(MessageType::ERROR, "receiveCapsEvent: failed to acknowledge CapsEvent");
-        return false;
-    }
+    active_caps_[sink_pad_name] = caps;
     return true;
 }
 
@@ -259,133 +282,170 @@ void SourceNode::runLoop() {
 // ===================================================================
 
 void SinkNode::runLoop() {
-    // 找到唯一的输入 Pad
     auto* sink_pad = sink_pads_[0].get();
+    const std::string& sink_pad_name = sink_pad->name();
 
     while (!stop_requested_.load()) {
-        // 从输入 Route 中阻塞获取下一项待处理数据
         auto delivery = sink_pad->acquireBlocking();
         if (!delivery) {
             break;
         }
 
-        // 提取媒体数据或者控制事件，此时该项仍然属于 Route 的保留区
         const QueueItem& item = delivery->item();
-
-        // 如果是媒体数据
         if (std::holds_alternative<BufferRef>(item)) {
-            // consume 真正处理这帧
-            consume(std::get<BufferRef>(item).get());
+            // Buffer 没有 active Caps 就无法被完整解释；这是上游协议错误而非默认值回退。
+            const auto active = active_caps_.find(sink_pad_name);
+            if (active == active_caps_.end()) {
+                postMessage(MessageType::ERROR,
+                            "SinkNode: Buffer received before initial CapsEvent on pad '" +
+                                sink_pad_name + "'");
+                break;
+            }
+            if (std::get<BufferRef>(item)->media_type != active->second.media_type) {
+                postMessage(MessageType::ERROR,
+                            "SinkNode: Buffer media type does not match active CapsEvent on pad '" +
+                                sink_pad_name + "'");
+                break;
+            }
 
-            // ack 是本轮 consume/onEvent 成功完成的提交点，在这之前 Route 不会释放该订阅者的容量
+            consume(std::get<BufferRef>(item).get());
             if (stop_requested_.load() || !delivery->ack()) {
                 break;
             }
             continue;
         }
 
-        // 如果不是 Buffer，那就是控制事件，理论上 Running 阶段接到的 Event 只有 EOS
-        // ack 会释放 Delivery 内的 QueueItem；复制 Event，使事件生命周期跨过提交点
-        Event event = std::get<Event>(item);
-        if (std::holds_alternative<EOSEvent>(event)) {
-            // 先 ack EOS（释放上游 Route，输出侧 drain 期间不占背压窗口）
-            if (!delivery->ack()) {
+        const Event& event = std::get<Event>(item);
+        if (std::holds_alternative<CapsEvent>(event)) {
+            // 重配在当前 Route worker 内串行完成；只有 onCaps 成功后才能提交此格式边界。
+            if (!applyCapsEvent(sink_pad_name, std::get<CapsEvent>(event)) || !delivery->ack()) {
                 break;
             }
-
-            // 输出侧 drain，默认空实现；主动 stop 时具体实现内部应立即返回
-            onDrain();
-
-            // drain 被 stop 打断、或 drain 内部出错（postMessage(ERROR) 会置 stop_requested_）时，
-            // 不再上报"自然 EOS"，直接退出循环
-            if (stop_requested_.load()) {
-                break;
-            }
-
-            // 再报告 Sink 完成，Pipeline 以全部 Sink 的 EOS 汇总决定自然 stop
-            onEvent(event);
             continue;
         }
 
-        // 这里基本是防御性路径，onEvent 会 postMessage(ERROR) 设置 stop_requested_
-        // 所以此处先处理确认没有错误，再 ack
-        onEvent(event);
-        if (stop_requested_.load() || !delivery->ack()) {
+        // EOS 先释放输入 Route；输出侧 drain 期间不应占住可靠背压窗口。
+        if (!delivery->ack()) {
             break;
         }
-    }
-}
-
-void SinkNode::onEvent(const Event& event) {
-    if (std::holds_alternative<EOSEvent>(event)) {
+        onDrain();
+        if (stop_requested_.load()) {
+            break;
+        }
         postMessage(MessageType::EOS, "");
-        return;
     }
-
-    postMessage(MessageType::ERROR,
-                "CapsEvent received in runLoop; sink nodes must consume CapsEvent in onStreamInfo");
 }
 
 // ===================================================================
 // TransformNode: runLoop
 // ===================================================================
 
+bool TransformNode::onCaps(const std::string&, const CapsEvent& caps,
+                           std::vector<QueueItem>* outputs) {
+    // The generic Transform is format-preserving. Specialized transforms such as DecodeNode override this
+    // hook and emit their own output Caps at the exact Buffer boundary where their result format is known.
+    if (outputs) {
+        outputs->emplace_back(Event{caps});
+    }
+    return true;
+}
+
 void TransformNode::runLoop() {
     auto* sink_pad = sink_pads_[0].get();
-    std::vector<BufferRef> outputs;
+    const std::string& sink_pad_name = sink_pad->name();
+    std::vector<QueueItem> outputs;
+
     while (!stop_requested_.load()) {
-        // 从 RouteSubscription 获取下一项
+        // 从唯一输入 SinkPad 取得一个 RouteDelivery
         auto delivery = sink_pad->acquireBlocking();
         if (!delivery) {
             break;
         }
 
-        // 输入 Delivery 直到 process 和所有输出 Route publish 都成功后才 ack，形成逐级背压
         const QueueItem& item = delivery->item();
         if (std::holds_alternative<BufferRef>(item)) {
-            // clear 会释放上轮任何尚未移交的输出；正常路径中这些元素已经 move 为空。
-            outputs.clear();
+            // 必须先有 active Caps
+            const auto active = active_caps_.find(sink_pad_name);
+            if (active == active_caps_.end()) {
+                postMessage(MessageType::ERROR,
+                            "TransformNode: Buffer received before initial CapsEvent on pad '" +
+                                sink_pad_name + "'");
+                break;
+            }
 
-            // 一个输入 Buffer 产生 0 到 N 个由 BufferRef 持有的新输出 Buffer。
+            // Buffer 类型必须和 active Caps 一致
+            if (std::get<BufferRef>(item)->media_type != active->second.media_type) {
+                postMessage(MessageType::ERROR,
+                            "TransformNode: Buffer media type does not match active CapsEvent on pad '" +
+                                sink_pad_name + "'");
+                break;
+            }
+
+            outputs.clear();
             process(std::get<BufferRef>(item).get(), outputs);
+
+            // 如果 process 内部遇到错误 postMessage() 会置 stop_requested_
             if (stop_requested_.load()) {
-                // process 后发生 stop/error 时，outputs 析构会释放全部尚未发布的输出。
                 break;
             }
 
             bool outputs_published = true;
-            for (auto& out : outputs) {
-                // 发布入口无条件接管当前引用；成功进入 Route，失败也在入口内释放。
-                if (!pushToDownstream(std::move(out))) {
+            for (auto& output : outputs) {
+                // 同一个移动发布边界承载 Caps 和 Buffer；失败项及未遍历尾项仍受 vector RAII 管理
+                if (!publishOutputItem(std::move(output))) {
                     outputs_published = false;
                     break;
                 }
             }
-            if (!outputs_published) {
-                // 已发布元素已经为空，未遍历元素仍由 outputs 持有并在退出时自动释放。
+
+            // 确保输出完整发布后 ack 输入 Buffer
+            if (!outputs_published || !delivery->ack()) {
                 break;
             }
-        } else {
-            onEvent(std::get<Event>(item));
-            if (stop_requested_.load()) {
-                break;
-            }
+            continue;
         }
 
-        if (!delivery->ack()) {
+        const Event& event = std::get<Event>(item);
+        if (std::holds_alternative<CapsEvent>(event)) {
+            outputs.clear();
+            if (!applyCapsEvent(sink_pad_name, std::get<CapsEvent>(event), &outputs)) {
+                break;
+            }
+
+            bool outputs_published = true;
+            for (auto& output : outputs) {
+                if (!publishOutputItem(std::move(output))) {
+                    outputs_published = false;
+                    break;
+                }
+            }
+            if (!outputs_published || !delivery->ack()) {
+                break;
+            }
+            continue;
+        }
+
+        // onEOS may append delayed decoder Caps/Buffers but never EOS. The framework owns the terminator,
+        // so every Transform forwards exactly one EOSEvent even if a subclass has no context or was flushed.
+        outputs.clear();
+        onEOS(outputs);
+        if (stop_requested_.load()) {
             break;
         }
-    }
-}
+        outputs.emplace_back(Event{EOSEvent{}});
 
-void TransformNode::onEvent(const Event& event) {
-    if (std::holds_alternative<EOSEvent>(event)) {
-        sendEOSDownstream();
-        return;
+        bool outputs_published = true;
+        for (auto& output : outputs) {
+            if (!publishOutputItem(std::move(output))) {
+                outputs_published = false;
+                break;
+            }
+        }
+        if (!outputs_published || !delivery->ack()) {
+            break;
+        }
+        break;
     }
-
-    postMessage(MessageType::ERROR,
-                "CapsEvent received in runLoop; transform nodes must consume CapsEvent in onStreamInfo");
 }
 
 // ===================================================================
@@ -439,19 +499,22 @@ bool DemuxNode::onReady() {
         return false;
     }
 
-    // 具体类只负责探测；基类验证返回值后才写入正式状态
-    if (result.video && result.video->media_type != MediaType::VIDEO_ENCODED) {
+    // 具体类只负责探测；基类只校验它必须给全的东西：类型正确 + 能选出解码器的 codec_id。
+    // 尺寸/采样率等字段是否需要由具体消费者(解码器/Mux)各自判断。
+    if (result.video && (result.video->media_type != MediaType::VIDEO_ENCODED ||
+                         result.video->codec_id == AV_CODEC_ID_NONE)) {
         postMessage(MessageType::ERROR,
-                    "DemuxNode: probeStreams returned non-video caps as video result");
+                    "DemuxNode: probeStreams returned codec-less or non-video caps as video result");
         return false;
     }
-    if (result.audio && result.audio->media_type != MediaType::AUDIO_ENCODED) {
+    if (result.audio && (result.audio->media_type != MediaType::AUDIO_ENCODED ||
+                         result.audio->codec_id == AV_CODEC_ID_NONE)) {
         postMessage(MessageType::ERROR,
-                    "DemuxNode: probeStreams returned non-audio caps as audio result");
+                    "DemuxNode: probeStreams returned codec-less or non-audio caps as audio result");
         return false;
     }
 
-    // 校验用户请求：nullopt 表示探测成功，但输入确实没有该类型
+    // 校验用户请求：nullopt 表示探测成功，但输入确实没有该类型。
     for (const auto& [pad_name, type] : pad_to_type_) {
         const bool found =
             (type == MediaType::VIDEO_ENCODED && result.video.has_value()) ||
@@ -467,39 +530,30 @@ bool DemuxNode::onReady() {
     return true;
 }
 
-bool DemuxNode::onStreamInfo() {
+void DemuxNode::runLoop() {
     std::unordered_set<OutputRoute*> initialized;
-    // 多个同类型 Demux Pad 是同一 Track 分叉：每个 Route 只 resize/publish 一次 Caps
+    // Ready 只缓存探测结果；worker 启动后才把完整 encoded Caps 作为每条 Route 的首项发布。
     for (const auto& [pad_name, type] : pad_to_type_) {
         SrcPad* pad = getSrcPad(pad_name);
-        if (!pad || !pad->isConnected() || !pad->route()) {
+        if (!pad || !pad->isConnected() || !pad->route() ||
+            !initialized.insert(pad->route().get()).second) {
             continue;
         }
 
-        const CapsEvent* caps = nullptr;
-        if (type == MediaType::VIDEO_ENCODED && probe_result_.video) {
-            caps = &*probe_result_.video;
-        } else if (type == MediaType::AUDIO_ENCODED && probe_result_.audio) {
-            caps = &*probe_result_.audio;
-        }
+        const CapsEvent* caps = type == MediaType::VIDEO_ENCODED
+            ? (probe_result_.video ? &*probe_result_.video : nullptr)
+            : (probe_result_.audio ? &*probe_result_.audio : nullptr);
         if (!caps) {
             postMessage(MessageType::ERROR,
-                        "DemuxNode: missing probed caps for pad '" + pad_name + "'");
-            return false;
+                        "DemuxNode: missing cached caps for pad '" + pad_name + "'");
+            return;
         }
 
-        if (!initialized.insert(pad->route().get()).second) {
-            continue;
-        }
-        pad->route()->resize(selectRouteCapacity(type));
         if (!sendCapsEvent(pad_name, *caps)) {
-            return false;
+            return;
         }
     }
-    return true;
-}
 
-void DemuxNode::runLoop() {
     while (!stop_requested_.load()) {
         DemuxReadResult result = readFrame();
 
@@ -588,35 +642,30 @@ bool MuxNode::appendContainerBytes(const uint8_t* data, size_t size) {
     return true;
 }
 
-void MuxNode::flushPendingOutput() {
+bool MuxNode::flushPendingOutput() {
     if (pending_output_.empty()) {
-        return;
+        return true;
     }
 
     auto* output = new Buffer();
     output->data = new uint8_t[pending_output_.size()];
     output->size = pending_output_.size();
-    std::copy(pending_output_.begin(), pending_output_.end(), output->data);
     output->media_type = MediaType::CONTAINER;
+    std::copy(pending_output_.begin(), pending_output_.end(), output->data);
     pending_output_.clear();
 
-    // MuxNode 当前固定单输出；显式 move，把 CONTAINER Buffer 的发布引用交给下游入口。
+    // Header、packet、trailer 都经同一个 BufferRef 发布边界；失败时 output_ref 自动释放。
     BufferRef output_ref(output);
-    if (!pushToDownstream(std::move(output_ref), "out_0")) {
-        postMessage(MessageType::ERROR, "MuxNode: failed to publish container output");
-    }
+    return pushToDownstream(std::move(output_ref), "out_0");
 }
 
 bool MuxNode::onReady() {
-    return true;
-}
-
-bool MuxNode::onStreamInfo() {
     pending_output_.clear();
     pad_to_stream_.clear();
+    initial_caps_pads_.clear();
     eos_pads_.clear();
+    header_written_ = false;
 
-    // Mux 进一步在 Ready 阶段拒绝零输入或任何未连接 SinkPad，保证 Running 后所有输入都可用
     if (sink_pads_.empty()) {
         postMessage(MessageType::ERROR, "MuxNode: no input pad");
         return false;
@@ -627,60 +676,75 @@ bool MuxNode::onStreamInfo() {
                         "MuxNode: sink pad '" + pad->name() + "' is not connected");
             return false;
         }
-    }
-
-    if (!allocateContext(format_)) {
-        return false;   // 具体类负责上报格式后端错误
-    }
-
-    // 从每个 SinkPad 收取 CapsEvent，并添加输出流。
-    for (auto& pad : sink_pads_) {
-        if (!receiveCapsEvent(pad->name())) {
-            return false;   // receiveCapsEvent 已上报框架错误
-        }
-
-        const CapsEvent& caps = negotiated_caps_[pad->name()];
-        int stream_index = -1;
-        if (!addStream(caps, &stream_index)) {
-            return false;   // 具体类负责上报格式后端错误
-        }
-        pad_to_stream_[pad->name()] = stream_index;
-
-        // 任意一路 Route 有新数据或被取消时唤醒 mux_cv_。
+        // 任意一路 Route 新数据或 cancel 都唤醒 Mux 选择循环。
         pad->setRouteNotify([this]() {
             std::lock_guard<std::mutex> lock(mux_mutex_);
             mux_cv_.notify_one();
         });
     }
 
-    // 固定输出 Route 已由 Graph 建立静态订阅；先确定容量并发送 CONTAINER Caps。
     auto* output_pad = getSrcPad("out_0");
     if (!output_pad || !output_pad->isConnected() || !output_pad->route()) {
         postMessage(MessageType::ERROR, "MuxNode: output pad 'out_0' is not connected");
         return false;
     }
-    output_pad->route()->resize(selectRouteCapacity(MediaType::CONTAINER));
 
-    CapsEvent output_caps;
-    output_caps.media_type = MediaType::CONTAINER;
-    if (!sendCapsEvent("out_0", output_caps)) {
+    // Context 不依赖输入流格式，可在 Ready 建立；stream/header 留到 Running 的完整 Caps 到达后。
+    return allocateContext(format_);
+}
+
+bool MuxNode::configureInitialInput(const std::string& pad_name, const CapsEvent& caps) {
+    // Container headers must name every input stream before any packet bytes are written. This function
+    // consumes exactly one initial encoded Caps per linked Pad, creates the backend stream, and records the
+    // Pad → backend stream index mapping. A later Caps on that Pad is explicitly rejected by the caller.
+    // Mux 只要求能建流的 codec_id；容器特有字段(如尺寸)由具体后端 addStream 自行校验。
+    SinkPad* pad = getSinkPad(pad_name);
+    if (!pad || caps.codec_id == AV_CODEC_ID_NONE || !pad->templateCaps().contains(caps.media_type)) {
+        postMessage(MessageType::ERROR, "MuxNode: invalid initial CapsEvent on pad '" + pad_name + "'");
+        return false;
+    }
+    if (initial_caps_pads_.count(pad_name)) {
+        postMessage(MessageType::ERROR,
+                    "MuxNode: runtime encoded Caps changes are not supported after header setup");
         return false;
     }
 
-    // Header 在 Ready 阶段生成以保留初始化失败语义；
-    // AVIO callback 只能把字节追加到 pending_output_，真正的阻塞 push 延迟到 runLoop 开始后
-    if (!writeHeader()) {
-        pending_output_.clear();
-        return false;   // 具体类负责上报格式后端错误
+    if (!applyCapsEvent(pad_name, caps)) {
+        return false;
     }
 
+    int stream_index = -1;
+    if (!addStream(caps, &stream_index)) {
+        return false;
+    }
+    pad_to_stream_[pad_name] = stream_index;
+    initial_caps_pads_.insert(pad_name);
+    return true;
+}
+
+bool MuxNode::writeHeaderAfterAllInputsConfigured() {
+    if (header_written_ || initial_caps_pads_.size() != sink_pads_.size()) {
+        return true;
+    }
+
+    auto* output_pad = getSrcPad("out_0");
+    if (!output_pad || !output_pad->isConnected() || !output_pad->route()) {
+        postMessage(MessageType::ERROR, "MuxNode: output pad 'out_0' is not connected");
+        return false;
+    }
+
+    CapsEvent output_caps;
+    output_caps.media_type = MediaType::CONTAINER;
+    if (!sendCapsEvent("out_0", output_caps) || !writeHeader() || !flushPendingOutput()) {
+        pending_output_.clear();
+        return false;
+    }
+
+    header_written_ = true;
     return true;
 }
 
 void MuxNode::runLoop() {
-    // 下游线程此时已经启动，可以安全阻塞发送 Ready 阶段暂存的 Header 字节。
-    flushPendingOutput();
-
     while (!stop_requested_.load()) {
         SinkPad* ready_pad = waitAnyPadReady();
         if (!ready_pad) {
@@ -692,37 +756,51 @@ void MuxNode::runLoop() {
             continue;
         }
 
-        // 选中的输入在 writePacket/trailer 及其容器输出 publish 成功前保持 in-flight。
         const QueueItem& item = delivery->item();
+        const std::string& pad_name = ready_pad->name();
         if (std::holds_alternative<BufferRef>(item)) {
-            const Buffer* buf = std::get<BufferRef>(item).get();
-            auto it = pad_to_stream_.find(ready_pad->name());
-            if (it == pad_to_stream_.end()) {
+            const auto active = active_caps_.find(pad_name);
+            if (!header_written_ || active == active_caps_.end()) {
                 postMessage(MessageType::ERROR,
-                            "MuxNode: no output stream for pad '" + ready_pad->name() + "'");
+                            "MuxNode: Buffer received before all linked inputs supplied initial CapsEvent");
                 break;
             }
 
-            if (!writePacket(buf, it->second)) {
-                pending_output_.clear();
-                break;   // 具体类负责上报格式后端错误
+            const BufferRef& buffer = std::get<BufferRef>(item);
+            if (buffer->media_type != active->second.media_type) {
+                postMessage(MessageType::ERROR,
+                            "MuxNode: Buffer media type does not match active CapsEvent on pad '" +
+                                pad_name + "'");
+                break;
             }
-            flushPendingOutput();
-            if (stop_requested_.load() || !delivery->ack()) {
+
+            auto stream = pad_to_stream_.find(pad_name);
+            if (stream == pad_to_stream_.end() ||
+                !writePacket(buffer.get(), stream->second) ||
+                !flushPendingOutput() || stop_requested_.load() || !delivery->ack()) {
+                pending_output_.clear();
                 break;
             }
             continue;
         }
 
         const Event& event = std::get<Event>(item);
-        if (!std::holds_alternative<EOSEvent>(event)) {
+        if (std::holds_alternative<CapsEvent>(event)) {
+            if (!configureInitialInput(pad_name, std::get<CapsEvent>(event)) ||
+                !writeHeaderAfterAllInputsConfigured() || !delivery->ack()) {
+                break;
+            }
+            continue;
+        }
+
+        // 已 link 的 Mux 输入在初始 Caps 前 EOS 无法参与容器 header，是明确配置错误。
+        if (!initial_caps_pads_.count(pad_name)) {
             postMessage(MessageType::ERROR,
-                        "CapsEvent received in runLoop; mux nodes must consume CapsEvent in onStreamInfo");
+                        "MuxNode: linked input reached EOS before initial CapsEvent");
             break;
         }
 
-        eos_pads_.insert(ready_pad->name());
-        // 最后一路 EOS 的 ack 要等 trailer 和下游 EOS 都已可靠发布。
+        eos_pads_.insert(pad_name);
         const bool final_input_eos = eos_pads_.size() == sink_pads_.size();
         if (!final_input_eos) {
             if (!delivery->ack()) {
@@ -731,16 +809,8 @@ void MuxNode::runLoop() {
             continue;
         }
 
-        if (!writeTrailer()) {
+        if (!writeTrailer() || !flushPendingOutput() || !sendEOSDownstream() || !delivery->ack()) {
             pending_output_.clear();
-            break;   // 具体类负责上报格式后端错误
-        }
-        flushPendingOutput();
-        if (!sendEOSDownstream()) {
-            break;
-        }
-        if (!delivery->ack()) {
-            break;
         }
         break;
     }
@@ -752,15 +822,51 @@ SinkPad* MuxNode::waitAnyPadReady() {
         if (stop_requested_.load()) {
             return true;
         }
-        for (auto& pad : sink_pads_) {
-            if (pad->isConnected() && pad->peek().has_value()) {
-                return true;
+
+        for (const auto& pad : sink_pads_) {
+            if (!pad->isConnected()) {
+                continue;
             }
+            const auto top = pad->peek();
+            if (!top) {
+                continue;
+            }
+
+            // Mux cannot write a header until every linked input supplied initial Caps. While that
+            // condition is incomplete, only control Events may advance the setup state; an early
+            // Buffer on another input must remain retained instead of being mistaken for an error.
+            if (!header_written_) {
+                if (std::holds_alternative<Event>(*top) || !initial_caps_pads_.count(pad->name())) {
+                    return true;
+                }
+                // This input already supplied Caps, so its queued Buffer is valid but must wait for
+                // the other linked inputs to establish their header streams.
+                continue;
+            }
+            return true;
         }
         return false;
     });
 
     if (stop_requested_.load()) {
+        return nullptr;
+    }
+
+    if (!header_written_) {
+        // Prefer a missing input's first item (Caps or an invalid early Buffer) so the loop always
+        // makes progress or reports the precise protocol error instead of waiting indefinitely.
+        for (auto& pad : sink_pads_) {
+            const auto top = pad->peek();
+            if (top && !initial_caps_pads_.count(pad->name())) {
+                return pad.get();
+            }
+        }
+        for (auto& pad : sink_pads_) {
+            const auto top = pad->peek();
+            if (top && std::holds_alternative<Event>(*top)) {
+                return pad.get();
+            }
+        }
         return nullptr;
     }
 

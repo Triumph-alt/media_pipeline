@@ -1,6 +1,7 @@
 # ---- 核心框架源码 ----
 set(CORE_SOURCES
     core/Buffer.cpp
+    core/Caps.cpp
     core/OutputRoute.cpp
     core/Edge.cpp
     core/Pad.cpp

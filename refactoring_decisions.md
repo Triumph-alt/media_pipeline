@@ -257,3 +257,51 @@ Linux/X11 下 SDL3 software renderer 的 window surface 会内部启用 GL textu
 `Pipeline` 是一条实例级媒体管线，持有自己的 Graph、节点工作线程、Clock 和 MessageBus；但当前它的构造/析构直接管理 SDL 全局基础设施的 `SDL_Init(0)` / `SDL_Quit()`。`SDL_Quit()` 是强制全局拆除，若允许两个 Pipeline 并存，先析构的一方会在另一方仍可能使用 SDL 时拆除全局运行时。
 
 因此当前正式限制为：**同一进程同一时刻至多允许一个存活的 Pipeline 实例**。顺序创建、销毁多个 Pipeline 是允许的；两个 Pipeline 重叠存活不受支持。当前不为未实现的多 Pipeline 模型引入进程级引用计数、lease 或 Pipeline manager。
+
+---
+
+## Running 有序动态 Caps 与 Decoder 首帧格式定案
+
+### 决策背景
+
+旧模型要求 Ready 阶段沿 Route 一次性传递 Caps，随后 Running 只传 Buffer。它无法表达 FFmpeg Decoder 的实际行为：H.264 等 decoder 在 `avcodec_open2()` 后可能仍无 pix_fmt，必须看到真实 AVFrame 才能确定 RAW 输出格式；同一流也可能在运行中出现新的格式边界。
+
+用 Ready preroll 或“未知时猜 YUV420P”都不能建立可靠合同。因此 Caps 不再是启动期旁路消息，而是流内有序配置边界。
+
+### 正式合同
+
+- Build 阶段只用 TemplateCaps 做 MediaType 交集检查；Ready 只建立不依赖上游格式的资源，不收发 Caps。
+- Running 阶段每条逻辑 Route 的序列为：
+
+  ```text
+  CapsEvent → Buffer* → CapsEvent → Buffer* → EOSEvent
+  ```
+
+  每份 Caps 必须完整、准确地解释其后至下一份 Caps 前的全部 Buffer；Buffer 在 active Caps 前到达或其 media_type 不一致都是协议错误。
+- `QueueItem = variant<BufferRef, Event>` 同时是 Route 传输项与 Transform 的本地拥有型待发布序列。Caps、Buffer、EOS、Decoder delayed 输出和 EOS flush 都走同一个顺序/RAII 发布边界。
+- 取消全局 `CapsEvent::isComplete()`。传输层只检查 Route 和 TemplateCaps 的 MediaType；格式字段是否充分由实际使用点判断：Decode 至少需 codec_id，VideoRender 需 RAW 视频 width/height/pix_fmt，AudioPlay 需完整受支持 RAW 音频格式，Mux 的容器字段由具体 `addStream()` 后端检查。
+- `hasSameFormat()` 只比较 Caps 声明值，不能充当全局重配闸门。VIDEO_ENCODED 比较 codec/width/height/extradata；AUDIO_ENCODED 比较 codec/sample_rate/channel_layout/extradata。
+- `ChannelLayout` 是可复制框架值类型，避免把含 FFmpeg 堆指针的 `AVChannelLayout` 直接嵌入 Caps。AUDIO_ENCODED 的 sample_rate/channel_layout 是可选提示：Decode 有效时写入 AVCodecContext，未知时留给 FFmpeg 从 extradata/bitstream 确定；Decode 从真实 AVFrame 生成的 AUDIO_RAW Caps 则必须完整。
+
+### 节点边界
+
+- Demux 在 Ready 探测并缓存 encoded Caps；worker 启动后先为每条 Route 发布 Caps，再发布 Packet。
+- Decode 收到新的 encoded Caps 时，先把旧 decoder 的 delayed 输出放入同一有序 outputs，再替换 decoder context。Decode 不从 `avcodec_open2()` 后的 context 猜 RAW Caps；每个真实 AVFrame 在首帧或格式变化时先输出 RAW Caps、后输出 Frame Buffer。Transform 基类在 `onEOS()` 返回后统一追加唯一 EOSEvent。
+- VideoRender 在 Running `onCaps()` 应用格式边界，仅支持紧密 YUV420P/YUVJ420P；尺寸变化时销毁旧 Texture，下一帧重建。
+- AudioPlay 在 Ready 建固定 canonical SDL 提交端（S16 packed、设备派生 rate、stereo）。Running AudioRaw Caps 重配前先 drain 旧 swr 到 canonical 队列，再重建 input→canonical swr；不清空 SDL canonical 队列，水位、账本和 Clock 始终使用 canonical 帧量纲。
+- Mux 只在全部输入初始 encoded Caps 到齐后发布 CONTAINER Caps、写 Header；Header 后 encoded Caps 重配明确报错。每个写入 Buffer 都必须已有同 Pad active Caps 且 media_type 匹配。
+
+### 当前明确边界
+
+该决策解决 Decoder 首帧格式未知、同 Route 有序 Caps、Video 尺寸变化和 Audio 输入重配；不包含 PTS discontinuity、Caps generation、非 YUV420P swscale，也不提前设计通用采集 Source 的 Caps 生产接口。Mux Header 后的 encoded Caps 拒绝是已确定的 Header 冻结合同，不属于待实现的运行期重配。默认 `SourceNode::capture() -> Buffer*` 无法表达有序 Caps，留待 V4L2/AudioCapture 的设备协商模型确定后处理。
+
+---
+
+## framerate 的 timing hint 语义更正
+
+上一节把 framerate 列入 `hasSameFormat()` 的 VIDEO_ENCODED 声明比较，现予以更正：framerate 不改变 payload 布局，不要求重建 Texture、重建 swr、重新解释 Buffer 或 drain/reopen Decoder，因此不属于本框架的格式边界。
+
+- `CapsEvent::framerate` 仅保留给 VIDEO_ENCODED，作为 Demux 提供给 Decode 的 nominal timing hint；Decode 用它推导输出 VIDEO_RAW Buffer 的 `duration`。
+- VIDEO_RAW Caps 不携带 framerate；后续帧的实际时序由 Buffer 自己的 `pts` 与 `duration` 表达。
+- `hasSameFormat()` 的 VIDEO_RAW 只比较 width/height/pix_fmt，VIDEO_ENCODED 只比较 codec_id/width/height/extradata；framerate 单独变化不产生 Caps 配置边界。
+- 将来若某个消费者确实需要感知 nominal framerate 更新，应设计独立 timing property update 语义，不能复用 payload 格式 Caps 或令渲染资源重配。

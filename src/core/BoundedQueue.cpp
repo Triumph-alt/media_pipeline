@@ -113,7 +113,7 @@ void BoundedQueue::flush() {
 
 // ===================================================================
 // resize：调整队列容量
-// 只在 onStreamInfo() 阶段调用，此时线程尚未启动，无并发问题
+// legacy queue helper; Route capacity is now selected when a complete CapsEvent is published
 // ===================================================================
 void BoundedQueue::resize(size_t new_capacity) {
     std::lock_guard<std::mutex> lock(mutex_);

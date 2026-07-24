@@ -15,7 +15,8 @@ namespace pipeline {
 // 职责：
 //   - 维护邻接表（nodes_ + edges_）
 //   - Build 阶段：静态 Caps 检查、拓扑排序、环路检测、孤立节点检测
-//   - Ready 阶段：按拓扑顺序 onReady → onStreamInfo，完成 Route 容量确定和 Caps 协商
+//   - Ready 阶段：按拓扑顺序建立不依赖上游格式的资源
+//   - Running 阶段：CapsEvent 与 Buffer / EOS 在同一 Route 中有序协商
 //
 // Pad 创建机制：
 //   - 节点构造时声明固定 Pad（如 TransformNode 的 "in"）
@@ -38,8 +39,7 @@ public:
     // 执行拓扑排序、环路/孤立节点校验，并 seal 全部 Route；成功后拓扑不可变。
     bool build();
 
-    // 按拓扑顺序执行 onReady，创建队列，onStreamInfo；
-    // 失败时 cancel Route 并逆拓扑回滚 onStop。
+    // 按拓扑顺序执行格式无关 onReady；失败时 cancel Route 并逆拓扑回滚 onStop。
     bool ready();
 
     // build 成功后的 DAG 拓扑序：Pipeline 以逆序启动/停止节点线程。

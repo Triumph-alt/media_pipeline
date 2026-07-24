@@ -9,327 +9,172 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace pipeline;
 
+namespace {
+
+CapsEvent makeVideoCaps(int width = 16, int height = 8) {
+    CapsEvent caps;
+    caps.media_type = MediaType::VIDEO_RAW;
+    caps.width = width;
+    caps.height = height;
+    caps.pix_fmt = AV_PIX_FMT_YUV420P;
+    caps.framerate = AVRational{30, 1};
+    return caps;
+}
+
+CapsEvent makeEncodedVideoCaps() {
+    CapsEvent caps;
+    caps.media_type = MediaType::VIDEO_ENCODED;
+    caps.codec_id = AV_CODEC_ID_H264;
+    caps.width = 16;
+    caps.height = 8;
+    caps.framerate = AVRational{30, 1};
+    return caps;
+}
+
+CapsEvent makeAudioCaps() {
+    CapsEvent caps;
+    caps.media_type = MediaType::AUDIO_RAW;
+    caps.sample_rate = 48000;
+    caps.sample_fmt = AV_SAMPLE_FMT_S16;
+    caps.channel_layout = ChannelLayout::stereo();
+    return caps;
+}
+
+CapsEvent makeEncodedAudioCaps() {
+    CapsEvent caps;
+    caps.media_type = MediaType::AUDIO_ENCODED;
+    caps.codec_id = AV_CODEC_ID_AAC;
+    caps.sample_rate = 48000;
+    caps.channel_layout = ChannelLayout::stereo();
+    return caps;
+}
+
+BufferRef makeBuffer(MediaType type, uint8_t value = 1, size_t size = 1) {
+    auto* buffer = new Buffer();
+    buffer->data = new uint8_t[size];
+    memset(buffer->data, value, size);
+    buffer->size = size;
+    buffer->media_type = type;
+    if (type == MediaType::VIDEO_RAW) {
+        buffer->meta = VideoRawMeta{};
+    } else if (type == MediaType::AUDIO_RAW) {
+        buffer->meta = AudioRawMeta{static_cast<int>(size / 4)};
+    } else {
+        buffer->meta = EncodedMeta{};
+    }
+    return BufferRef(buffer);
+}
+
 // ===================================================================
-// Mock 节点
+// CapsScriptSource emits an explicit Running sequence. It deliberately does not rely on Ready Caps;
+// each script item passes through the same Route publish machinery as production nodes.
 // ===================================================================
-
-class MockSource : public SourceNode {
+class CapsScriptSource final : public SourceNode {
 public:
-    MockSource(const std::string& name, int frame_count, MediaType type)
-        : SourceNode(name), max_frames_(frame_count), type_(type) {}
-
-    int generated() const { return count_; }
+    CapsScriptSource(const std::string& name, std::vector<QueueItem> script)
+        : SourceNode(name), script_(std::move(script)) {}
 
 protected:
     bool onReady() override { return true; }
     void onStop() override {}
+    Buffer* capture() override { return nullptr; }
 
-    Buffer* capture() override {
-        if (count_++ >= max_frames_) return nullptr;
-        auto* buf = new Buffer();
-        buf->data = new uint8_t[4]{1, 2, 3, 4};
-        buf->size = 4;
-        buf->media_type = type_;
-        buf->pts = count_ * 33000;
-        return buf;
-    }
-
-private:
-    int max_frames_;
-    MediaType type_;
-    int count_ = 0;
-};
-
-class MockTransform : public TransformNode {
-public:
-    MockTransform(const std::string& name) : TransformNode(name) {
-        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW, MediaType::AUDIO_RAW}});
-    }
-    int processed() const { return count_; }
-
-protected:
-    bool onReady() override { return true; }
-    void onStop() override {}
-
-    void process(const Buffer* input, std::vector<BufferRef>& outputs) override {
-        count_++;
-        auto* out = new Buffer();
-        out->data = new uint8_t[input->size];
-        memcpy(out->data, input->data, input->size);
-        out->size = input->size;
-        out->media_type = input->media_type;
-        out->pts = input->pts;
-        outputs.emplace_back(out);
-    }
-
-private:
-    int count_ = 0;
-};
-
-class MockSink : public SinkNode {
-public:
-    MockSink(const std::string& name) : SinkNode(name) {
-        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW, MediaType::AUDIO_RAW}});
-    }
-    int received() const { return count_; }
-
-protected:
-    bool onReady() override { return true; }
-    void onStop() override {}
-    void consume(const Buffer* buf) override { count_++; }
-
-private:
-    int count_ = 0;
-};
-
-class MockSourceWithCaps : public SourceNode {
-public:
-    MockSourceWithCaps(const std::string& name, int frame_count)
-        : SourceNode(name), max_frames_(frame_count) {}
-
-    std::optional<MediaType> outActualType() {
-        SrcPad* p = getSrcPad("out");
-        return p ? p->actualType() : std::nullopt;
-    }
-
-protected:
-    bool onReady() override { return true; }
-    void onStop() override {}
-
-    bool onStreamInfo() override {
-        CapsEvent caps;
-        caps.media_type = MediaType::VIDEO_ENCODED;
-        caps.codec_id = AV_CODEC_ID_H264;
-        caps.width = 1920;
-        caps.height = 1080;
-        if (!sendCapsEvent("out", caps)) {
-            return false;   // sendCapsEvent 已 postMessage(ERROR)，触发 Ready 回滚
+    void runLoop() override {
+        for (auto& item : script_) {
+            if (stop_requested_.load() || !publishOutputItem(std::move(item))) {
+                return;
+            }
         }
+        sendEOSDownstream();
+    }
+
+private:
+    std::vector<QueueItem> script_;
+};
+
+class CapsTrackingSink final : public SinkNode {
+public:
+    explicit CapsTrackingSink(const std::string& name) : SinkNode(name) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW, MediaType::AUDIO_RAW}});
+    }
+
+    int received() const { return received_.load(); }
+    std::vector<int> appliedWidths() const {
+        std::lock_guard lock(mutex_);
+        return applied_widths_;
+    }
+    std::vector<int> consumedWidths() const {
+        std::lock_guard lock(mutex_);
+        return consumed_widths_;
+    }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+
+    bool onCaps(const std::string&, const CapsEvent& caps,
+                std::vector<QueueItem>*) override {
+        std::lock_guard lock(mutex_);
+        applied_widths_.push_back(caps.width);
         return true;
     }
 
-    Buffer* capture() override {
-        if (count_++ >= max_frames_) return nullptr;
-        auto* buf = new Buffer();
-        buf->data = new uint8_t[8]{1, 2, 3, 4, 5, 6, 7, 8};
-        buf->size = 8;
-        buf->media_type = MediaType::VIDEO_ENCODED;
-        return buf;
+    void consume(const Buffer*) override {
+        std::lock_guard lock(mutex_);
+        consumed_widths_.push_back(active_caps_.at("in").width);
+        ++received_;
     }
 
 private:
-    int max_frames_;
-    int count_ = 0;
+    std::atomic<int> received_{0};
+    mutable std::mutex mutex_;
+    std::vector<int> applied_widths_;
+    std::vector<int> consumed_widths_;
 };
 
-class MockTransformWithCaps : public TransformNode {
+class ForwardTransform final : public TransformNode {
 public:
-    MockTransformWithCaps(const std::string& name) : TransformNode(name) {
-        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_ENCODED, MediaType::AUDIO_ENCODED}});
+    explicit ForwardTransform(const std::string& name) : TransformNode(name) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
     }
-    bool got_caps() const { return got_caps_; }
-    int processed() const { return count_; }
-    std::optional<MediaType> inActualType() {
-        SinkPad* p = getSinkPad("in");
-        return p ? p->actualType() : std::nullopt;
-    }
+
+    int processed() const { return processed_.load(); }
 
 protected:
     bool onReady() override { return true; }
     void onStop() override {}
 
-    bool onStreamInfo() override {
-        // receiveCapsEvent 内部完成 acquire + 校验 + setActualType + ack + 存入 negotiated_caps_["in"]
-        if (!receiveCapsEvent("in")) {
-            return false;   // receiveCapsEvent 已 postMessage(ERROR)，触发 Ready 回滚
-        }
-        got_caps_ = true;
+    bool onCaps(const std::string&, const CapsEvent& caps,
+                std::vector<QueueItem>* outputs) override {
+        assert(outputs != nullptr);
+        outputs->emplace_back(Event{caps});
         return true;
     }
 
-    void process(const Buffer* input, std::vector<BufferRef>& outputs) override {
-        count_++;
-        auto* out = new Buffer();
-        out->data = new uint8_t[input->size];
-        memcpy(out->data, input->data, input->size);
-        out->size = input->size;
-        out->media_type = MediaType::VIDEO_RAW;
-        outputs.emplace_back(out);
+    void process(const Buffer* input, std::vector<QueueItem>& outputs) override {
+        auto* copy = new Buffer();
+        copy->data = new uint8_t[input->size];
+        memcpy(copy->data, input->data, input->size);
+        copy->size = input->size;
+        copy->media_type = input->media_type;
+        copy->pts = input->pts;
+        copy->meta = input->meta;
+        outputs.emplace_back(BufferRef(copy));
+        ++processed_;
     }
 
 private:
-    int count_ = 0;
-    bool got_caps_ = false;
+    std::atomic<int> processed_{0};
 };
 
-// ===================================================================
-// MockSourceBadCaps: SrcPad 声明 {VIDEO_RAW}，onStreamInfo 却发 VIDEO_ENCODED
-// 用于验证 sendCapsEvent 的 media_type ∈ TemplateCaps 校验失败 → Ready 回滚
-// ===================================================================
-class MockSourceBadCaps : public SourceNode {
-public:
-    MockSourceBadCaps(const std::string& name) : SourceNode(name) {
-        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW}});
-    }
-
-protected:
-    bool onReady() override { return true; }
-    void onStop() override {}
-
-    bool onStreamInfo() override {
-        CapsEvent caps;
-        caps.media_type = MediaType::VIDEO_ENCODED;   // 不在 SrcPad {VIDEO_RAW} 内
-        return sendCapsEvent("out", caps);
-    }
-
-    Buffer* capture() override { return nullptr; }
-};
-
-// ===================================================================
-// MockSourceSendsAudio: SrcPad 声明 {VIDEO_ENCODED, AUDIO_ENCODED}，发 AUDIO_ENCODED
-// 配合 MockTransformVideoOnly（SinkPad 只收 VIDEO_ENCODED）验证 receiveCapsEvent 校验：
-// link 期两端交集非空能通过，但 Ready 时 AUDIO_ENCODED ∉ 下游 SinkPad → 失败
-// ===================================================================
-class MockSourceSendsAudio : public SourceNode {
-public:
-    MockSourceSendsAudio(const std::string& name) : SourceNode(name) {
-        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_ENCODED, MediaType::AUDIO_ENCODED}});
-    }
-
-protected:
-    bool onReady() override { return true; }
-    void onStop() override {}
-
-    bool onStreamInfo() override {
-        CapsEvent caps;
-        caps.media_type = MediaType::AUDIO_ENCODED;   // 下游 SinkPad 只含 VIDEO_ENCODED
-        return sendCapsEvent("out", caps);
-    }
-
-    Buffer* capture() override { return nullptr; }
-};
-
-// ===================================================================
-// MockTransformVideoOnly: SinkPad 只声明 {VIDEO_ENCODED}
-// 收到 AUDIO_ENCODED CapsEvent 时 receiveCapsEvent 校验失败
-// ===================================================================
-class MockTransformVideoOnly : public TransformNode {
-public:
-    MockTransformVideoOnly(const std::string& name) : TransformNode(name) {
-        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_ENCODED}});
-    }
-
-protected:
-    bool onReady() override { return true; }
-    void onStop() override {}
-
-    bool onStreamInfo() override {
-        return receiveCapsEvent("in");   // AUDIO_ENCODED ∉ {VIDEO_ENCODED} → false
-    }
-
-    void process(const Buffer*, std::vector<BufferRef>&) override {}
-};
-
-// ===================================================================
-// MockSlowSink: consume 里 sleep 一小段时间，制造下游背压
-// 配合小容量 OutputRoute 验证慢订阅者不会丢帧，并最终反压生产者
-// ===================================================================
-class MockSlowSink : public SinkNode {
-public:
-    MockSlowSink(const std::string& name, int sleep_us)
-        : SinkNode(name), sleep_us_(sleep_us) {
-        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
-    }
-    int received() const { return count_; }
-
-protected:
-    bool onReady() override { return true; }
-    void onStop() override {}
-    void consume(const Buffer* buf) override {
-        count_++;
-        if (sleep_us_ > 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(sleep_us_));
-        }
-    }
-
-private:
-    int sleep_us_;
-    int count_ = 0;
-};
-
-// ===================================================================
-// MockFailingSource: onReady 里 postMessage(ERROR) 后返回 false
-// 用于验证 Ready 阶段错误消息能被 lastError() 拿到
-// ===================================================================
-class MockFailingSource : public SourceNode {
-public:
-    MockFailingSource(const std::string& name, const std::string& err_text)
-        : SourceNode(name), err_text_(err_text) {
-        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW}});
-    }
-
-protected:
-    bool onReady() override {
-        postMessage(MessageType::ERROR, err_text_);
-        return false;
-    }
-    void onStop() override {}
-    Buffer* capture() override { return nullptr; }
-
-private:
-    std::string err_text_;
-};
-
-// ===================================================================
-// MockOnStopTracker: 记录 onStop 被调用次数
-// 用于验证 Ready 失败时事务性回滚（前置节点已经 onReady 成功后应被回滚）
-// ===================================================================
-class MockOnStopTracker : public SourceNode {
-public:
-    MockOnStopTracker(const std::string& name)
-        : SourceNode(name) {
-        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW}});
-    }
-    int stopCalled() const { return stop_calls_; }
-
-protected:
-    bool onReady() override { return true; }
-    void onStop() override { stop_calls_++; }
-    Buffer* capture() override { return nullptr; }
-
-private:
-    int stop_calls_ = 0;
-};
-
-// ===================================================================
-// MockFailingSink: onReady 里让 Ready 阶段推进到中段再失败
-// 前置节点先 onReady 成功，Sink 失败 → 前置的 onStop 应被回滚调用
-// ===================================================================
-class MockFailingSink : public SinkNode {
-public:
-    MockFailingSink(const std::string& name) : SinkNode(name) {
-        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
-    }
-
-protected:
-    bool onReady() override {
-        postMessage(MessageType::ERROR, "sink init failed");
-        return false;
-    }
-    void onStop() override {}
-    void consume(const Buffer* buf) override {}
-};
-
-// ===================================================================
-// StopAfterProduceTransform: process 产出后等待 Pipeline stop。
-// 用观察引用验证 Transform 的本地 outputs 在“process 后 stop”路径释放发布引用。
-// ===================================================================
-class StopAfterProduceTransform : public TransformNode {
+class StopAfterProduceTransform final : public TransformNode {
 public:
     explicit StopAfterProduceTransform(const std::string& name) : TransformNode(name) {
         addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
@@ -342,38 +187,42 @@ public:
 
     bool observersAreSoleOwners() {
         std::lock_guard lock(mutex_);
+        if (observers_.size() != 3) {
+            return false;
+        }
         for (const auto& observer : observers_) {
             if (observer->ref_count.load() != 1) {
                 return false;
             }
         }
-        return observers_.size() == 3;
+        return true;
     }
 
 protected:
     bool onReady() override { return true; }
     void onStop() override {}
 
-    void process(const Buffer*, std::vector<BufferRef>& outputs) override {
+    bool onCaps(const std::string&, const CapsEvent& caps,
+                std::vector<QueueItem>* outputs) override {
+        outputs->emplace_back(Event{caps});
+        return true;
+    }
+
+    void process(const Buffer*, std::vector<QueueItem>& outputs) override {
         for (uint8_t value = 1; value <= 3; ++value) {
-            auto* output = new Buffer();
-            output->data = new uint8_t[1]{value};
-            output->size = 1;
-            output->media_type = MediaType::VIDEO_RAW;
-
-            // outputs 持有待发布引用，observers_ 只为测试保留一份独立观察引用。
-            outputs.emplace_back(output);
-            std::lock_guard lock(mutex_);
-            observers_.push_back(outputs.back());
+            auto output = makeBuffer(MediaType::VIDEO_RAW, value);
+            {
+                std::lock_guard lock(mutex_);
+                observers_.push_back(output);
+            }
+            outputs.emplace_back(std::move(output));
         }
-
         {
             std::lock_guard lock(mutex_);
             outputs_ready_ = true;
         }
         cv_.notify_one();
 
-        // 让测试线程确定性地在 process 已产出、尚未返回发布循环时触发 stop。
         while (!stop_requested_.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -386,78 +235,50 @@ private:
     bool outputs_ready_ = false;
 };
 
-// ===================================================================
-// BurstTransform + BlockingSink: 一次产出超过 VIDEO_RAW Route 容量的输出，
-// Sink 保持首个 Delivery 未 ack，使 Transform 在部分发布后阻塞并由 cancel 打断。
-// ===================================================================
-class BurstTransform : public TransformNode {
+class EosAfterFlushTransform final : public TransformNode {
 public:
-    explicit BurstTransform(const std::string& name) : TransformNode(name) {
+    explicit EosAfterFlushTransform(const std::string& name) : TransformNode(name) {
         addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
-    }
-
-    bool waitUntilOutputsReady() {
-        std::unique_lock lock(mutex_);
-        return cv_.wait_for(lock, std::chrono::seconds(2), [this] { return outputs_ready_; });
-    }
-
-    bool waitUntilOutputRouteFull() {
-        SrcPad* output_pad = getSrcPad("out");
-        if (!output_pad || !output_pad->route()) {
-            return false;
-        }
-
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (output_pad->route()->retainedItems() == output_pad->route()->capacity()) {
-                return true;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        return false;
-    }
-
-    bool observersAreSoleOwners() {
-        std::lock_guard lock(mutex_);
-        for (const auto& observer : observers_) {
-            if (observer->ref_count.load() != 1) {
-                return false;
-            }
-        }
-        return observers_.size() == 12;
     }
 
 protected:
     bool onReady() override { return true; }
     void onStop() override {}
-
-    void process(const Buffer*, std::vector<BufferRef>& outputs) override {
-        for (uint8_t value = 1; value <= 12; ++value) {
-            auto* output = new Buffer();
-            output->data = new uint8_t[1]{value};
-            output->size = 1;
-            output->media_type = MediaType::VIDEO_RAW;
-
-            outputs.emplace_back(output);
-            std::lock_guard lock(mutex_);
-            observers_.push_back(outputs.back());
-        }
-
-        {
-            std::lock_guard lock(mutex_);
-            outputs_ready_ = true;
-        }
-        cv_.notify_one();
+    void process(const Buffer*, std::vector<QueueItem>&) override {}
+    void onEOS(std::vector<QueueItem>& outputs) override {
+        // A subclass only contributes delayed output. TransformNode::runLoop is responsible for the EOS item.
+        outputs.emplace_back(makeBuffer(MediaType::VIDEO_RAW, 99));
     }
-
-private:
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::vector<BufferRef> observers_;
-    bool outputs_ready_ = false;
 };
 
-class BlockingSink : public SinkNode {
+class OrderedVideoSink final : public SinkNode {
+public:
+    explicit OrderedVideoSink(const std::string& name) : SinkNode(name) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+
+    std::vector<uint8_t> values() const {
+        std::lock_guard lock(mutex_);
+        return values_;
+    }
+    bool sawEOS() const { return eos_.load(); }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+    void consume(const Buffer* buffer) override {
+        std::lock_guard lock(mutex_);
+        values_.push_back(buffer->data[0]);
+    }
+    void onDrain() override { eos_ = true; }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<uint8_t> values_;
+    std::atomic<bool> eos_{false};
+};
+
+class BlockingSink final : public SinkNode {
 public:
     explicit BlockingSink(const std::string& name) : SinkNode(name) {
         addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
@@ -471,15 +292,12 @@ public:
 protected:
     bool onReady() override { return true; }
     void onStop() override {}
-
     void consume(const Buffer*) override {
         {
             std::lock_guard lock(mutex_);
             consuming_ = true;
         }
         cv_.notify_one();
-
-        // 保持首个 Delivery 未 ack，直到 Pipeline stop/cancel 唤醒整个链路。
         while (!stop_requested_.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -491,223 +309,293 @@ private:
     bool consuming_ = false;
 };
 
-// ===================================================================
-// 组件级测试
-// ===================================================================
+class BurstTransform final : public TransformNode {
+public:
+    explicit BurstTransform(const std::string& name) : TransformNode(name) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
 
-static void test_template_caps() {
-    printf("  test_template_caps...");
+    bool waitUntilOutputRouteFull() {
+        SrcPad* output = getSrcPad("out");
+        if (!output || !output->route()) {
+            return false;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (output->route()->retainedItems() == output->route()->capacity()) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    }
+
+    bool observersAreSoleOwners() {
+        std::lock_guard lock(mutex_);
+        if (observers_.size() != 12) {
+            return false;
+        }
+        for (const auto& observer : observers_) {
+            if (observer->ref_count.load() != 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+    bool onCaps(const std::string&, const CapsEvent& caps,
+                std::vector<QueueItem>* outputs) override {
+        outputs->emplace_back(Event{caps});
+        return true;
+    }
+    void process(const Buffer*, std::vector<QueueItem>& outputs) override {
+        for (uint8_t value = 1; value <= 12; ++value) {
+            auto output = makeBuffer(MediaType::VIDEO_RAW, value);
+            {
+                std::lock_guard lock(mutex_);
+                observers_.push_back(output);
+            }
+            outputs.emplace_back(std::move(output));
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    std::vector<BufferRef> observers_;
+};
+
+class MockSink final : public SinkNode {
+public:
+    explicit MockSink(const std::string& name) : SinkNode(name) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+    void consume(const Buffer*) override {}
+};
+
+class SlowVideoSink final : public SinkNode {
+public:
+    SlowVideoSink(const std::string& name, int sleep_us)
+        : SinkNode(name), sleep_us_(sleep_us) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+
+    int received() const { return received_.load(); }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+    void consume(const Buffer*) override {
+        ++received_;
+        std::this_thread::sleep_for(std::chrono::microseconds(sleep_us_));
+    }
+
+private:
+    int sleep_us_;
+    std::atomic<int> received_{0};
+};
+
+class ContainerSink final : public SinkNode {
+public:
+    explicit ContainerSink(const std::string& name) : SinkNode(name) {
+        addSinkPad("in", TemplateCaps{{MediaType::CONTAINER}});
+    }
+
+    int received() const { return received_.load(); }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+    void consume(const Buffer*) override { ++received_; }
+
+private:
+    std::atomic<int> received_{0};
+};
+
+class FakeMux final : public MuxNode {
+public:
+    explicit FakeMux(const std::string& name) : MuxNode(name, MuxFormat::MPEGTS) {}
+
+    int streamCount() const { return stream_count_; }
+
+private:
+    bool allocateContext(MuxFormat) override { return true; }
+    bool addStream(const CapsEvent&, int* stream_index) override {
+        *stream_index = stream_count_++;
+        return true;
+    }
+    bool writeHeader() override {
+        const uint8_t header = 0x48;
+        return appendContainerBytes(&header, 1);
+    }
+    bool writePacket(const Buffer*, int) override {
+        const uint8_t packet = 0x50;
+        return appendContainerBytes(&packet, 1);
+    }
+    bool writeTrailer() override {
+        const uint8_t trailer = 0x54;
+        return appendContainerBytes(&trailer, 1);
+    }
+    void closeContext() override {}
+
+    int stream_count_ = 0;
+};
+
+void test_template_caps_compatibility() {
+    printf("  test_template_caps_compatibility...");
     fflush(stdout);
 
     TemplateCaps video_raw{{MediaType::VIDEO_RAW}};
-    TemplateCaps video_enc{{MediaType::VIDEO_ENCODED}};
     TemplateCaps audio_raw{{MediaType::AUDIO_RAW}};
-    TemplateCaps multi{{MediaType::VIDEO_RAW, MediaType::AUDIO_RAW}};
-
+    TemplateCaps both{{MediaType::VIDEO_RAW, MediaType::AUDIO_RAW}};
     assert(video_raw.isCompatibleWith(video_raw));
-    assert(!video_raw.isCompatibleWith(video_enc));
     assert(!video_raw.isCompatibleWith(audio_raw));
-    assert(multi.isCompatibleWith(video_raw));
-    assert(multi.isCompatibleWith(audio_raw));
-    assert(!multi.isCompatibleWith(video_enc));
-
+    assert(both.isCompatibleWith(video_raw));
+    assert(both.isCompatibleWith(audio_raw));
     printf(" OK\n");
 }
 
-static void test_buffer_refcount() {
-    printf("  test_buffer_refcount...");
+void test_buffer_ref_lifecycle() {
+    printf("  test_buffer_ref_lifecycle...");
     fflush(stdout);
 
-    auto* buf = new Buffer();
-    buf->data = new uint8_t[4]{1, 2, 3, 4};
-    buf->size = 4;
-    buf->media_type = MediaType::VIDEO_RAW;
-
-    assert(buf->ref_count.load() == 1);
-    buf->ref();
-    assert(buf->ref_count.load() == 2);
-    buf->unref();
-    assert(buf->ref_count.load() == 1);
-    buf->unref();  // ref_count → 0，释放
-
-    printf(" OK\n");
-}
-
-static void test_buffer_clone() {
-    printf("  test_buffer_clone...");
-    fflush(stdout);
-
-    auto* buf = new Buffer();
-    buf->data = new uint8_t[4]{10, 20, 30, 40};
-    buf->size = 4;
-    buf->media_type = MediaType::VIDEO_RAW;
-    buf->pts = 12345;
-
-    auto* clone = buf->clone();
-    assert(clone != buf);
-    assert(clone->size == 4);
-    assert(memcmp(clone->data, buf->data, 4) == 0);
-    assert(clone->pts == 12345);
-    assert(clone->ref_count.load() == 1);
-
-    buf->unref();
-    clone->unref();
-
-    printf(" OK\n");
-}
-
-static void test_buffer_ref() {
-    printf("  test_buffer_ref...");
-    fflush(stdout);
-
-    auto* buf = new Buffer();
-    buf->data = new uint8_t[4]{1, 2, 3, 4};
-    buf->size = 4;
-    buf->media_type = MediaType::VIDEO_RAW;
-
-    BufferRef ref1(buf);
-    assert(buf->ref_count.load() == 1);
-
+    BufferRef original = makeBuffer(MediaType::VIDEO_RAW, 17, 4);
+    const Buffer* raw = original.get();
+    assert(raw->ref_count.load() == 1);
     {
-        BufferRef ref2(ref1);
-        assert(buf->ref_count.load() == 2);
+        BufferRef shared = original;
+        assert(raw->ref_count.load() == 2);
+        BufferRef cloned = original.clone();
+        assert(cloned.get() != raw);
+        assert(cloned->size == original->size);
+        assert(memcmp(cloned->data, original->data, original->size) == 0);
     }
-    assert(buf->ref_count.load() == 1);
-
+    assert(raw->ref_count.load() == 1);
     printf(" OK\n");
 }
 
-static void test_buffer_from_avpacket_metadata() {
-    printf("  test_buffer_from_avpacket_metadata...");
+void test_channel_layout_value_semantics() {
+    printf("  test_channel_layout_value_semantics...");
     fflush(stdout);
 
-    uint8_t data[3]{1, 2, 3};
-    AVPacket pkt{};
-    pkt.data = data;
-    pkt.size = sizeof(data);
-    pkt.pts = AV_NOPTS_VALUE;
-    pkt.dts = AV_NOPTS_VALUE;
-    pkt.duration = 90;
-    pkt.flags = AV_PKT_FLAG_KEY;
+    ChannelLayout stereo = ChannelLayout::stereo();
+    assert(stereo.isValid());
+    AVChannelLayout ffmpeg_layout{};
+    assert(stereo.toAV(&ffmpeg_layout));
+    AVChannelLayout expected = AV_CHANNEL_LAYOUT_STEREO;
+    assert(av_channel_layout_compare(&ffmpeg_layout, &expected) == 0);
+    av_channel_layout_uninit(&expected);
 
-    auto* buf = Buffer::fromAVPacket(&pkt, MediaType::VIDEO_ENCODED,
-                                     AVRational{1, 90000}, AV_CODEC_ID_H264);
-    assert(buf != nullptr);
-    assert(buf->pts == AV_NOPTS_VALUE);
-    assert(buf->dts == AV_NOPTS_VALUE);
-    assert(buf->duration == 1000);
-
-    auto meta = std::get<EncodedMeta>(buf->meta);
-    assert(meta.codec_id == AV_CODEC_ID_H264);
-    assert(meta.flags == AV_PKT_FLAG_KEY);
-
-    buf->unref();
+    ChannelLayout copied;
+    assert(ChannelLayout::fromAV(ffmpeg_layout, &copied));
+    assert(copied == stereo);
+    av_channel_layout_uninit(&ffmpeg_layout);
     printf(" OK\n");
 }
 
-static void test_buffer_from_avpacket_invalid_type() {
-    printf("  test_buffer_from_avpacket_invalid_type...");
+void test_caps_format_comparison_excludes_framerate() {
+    printf("  test_caps_format_comparison_excludes_framerate...");
     fflush(stdout);
 
-    uint8_t data[1]{0};
-    AVPacket pkt{};
-    pkt.data = data;
-    pkt.size = sizeof(data);
+    CapsEvent raw = makeVideoCaps();
+    CapsEvent raw_with_new_timing = raw;
+    raw_with_new_timing.framerate = AVRational{25, 1};
+    assert(raw.hasSameFormat(raw_with_new_timing));
+    raw_with_new_timing.width = 32;
+    assert(!raw.hasSameFormat(raw_with_new_timing));
 
-    assert(Buffer::fromAVPacket(&pkt, MediaType::VIDEO_RAW, AVRational{1, 1000}) == nullptr);
-
+    CapsEvent encoded = makeEncodedVideoCaps();
+    CapsEvent encoded_with_new_timing = encoded;
+    encoded_with_new_timing.framerate = AVRational{25, 1};
+    assert(encoded.hasSameFormat(encoded_with_new_timing));
+    encoded_with_new_timing.height = 16;
+    assert(!encoded.hasSameFormat(encoded_with_new_timing));
     printf(" OK\n");
 }
 
-static void test_buffer_from_avframe_invalid_input() {
-    printf("  test_buffer_from_avframe_invalid_input...");
+void test_buffer_metadata_is_frame_scoped() {
+    printf("  test_buffer_metadata_is_frame_scoped...");
     fflush(stdout);
 
-    assert(Buffer::fromAVFrame(nullptr, MediaType::VIDEO_RAW, AVRational{1, 1000}) == nullptr);
+    uint8_t packet_data[2] = {1, 2};
+    AVPacket packet{};
+    packet.data = packet_data;
+    packet.size = sizeof(packet_data);
+    packet.flags = AV_PKT_FLAG_KEY;
+    BufferRef encoded(Buffer::fromAVPacket(&packet, MediaType::VIDEO_ENCODED,
+                                           AVRational{1, 1000}, AV_CODEC_ID_H264));
+    assert(encoded);
+    const auto& encoded_meta = std::get<EncodedMeta>(encoded->meta);
+    assert(encoded_meta.flags == AV_PKT_FLAG_KEY);
 
-    AVFrame* frame = av_frame_alloc();
-    assert(frame != nullptr);
-    frame->format = AV_PIX_FMT_YUV420P;
-    frame->width = 0;
-    frame->height = 1080;
-    assert(Buffer::fromAVFrame(frame, MediaType::VIDEO_RAW, AVRational{1, 1000}) == nullptr);
-    av_frame_free(&frame);
-
+    AVFrame* audio = av_frame_alloc();
+    assert(audio);
+    uint8_t audio_data[16]{};
+    audio->format = AV_SAMPLE_FMT_S16;
+    audio->sample_rate = 48000;
+    audio->ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+    audio->nb_samples = 4;
+    audio->data[0] = audio_data;
+    BufferRef raw(Buffer::fromAVFrame(audio, MediaType::AUDIO_RAW, AVRational{1, 48000}));
+    assert(raw);
+    assert(std::get<AudioRawMeta>(raw->meta).nb_samples == 4);
+    av_frame_free(&audio);
     printf(" OK\n");
 }
 
-static void test_buffer_from_avframe_audio_meta() {
-    printf("  test_buffer_from_avframe_audio_meta...");
-    fflush(stdout);
-
-    uint8_t data[16]{};
-    AVFrame* frame = av_frame_alloc();
-    assert(frame != nullptr);
-    frame->format = AV_SAMPLE_FMT_S16;
-    frame->sample_rate = 48000;
-    frame->ch_layout.nb_channels = 2;
-    frame->nb_samples = 4;
-    frame->pts = AV_NOPTS_VALUE;
-    frame->data[0] = data;
-
-    auto* buf = Buffer::fromAVFrame(frame, MediaType::AUDIO_RAW, AVRational{1, 48000});
-    assert(buf != nullptr);
-    assert(buf->pts == AV_NOPTS_VALUE);
-    assert(buf->duration == 83);
-    assert(buf->size == sizeof(data));
-
-    auto meta = std::get<AudioRawMeta>(buf->meta);
-    assert(meta.sample_rate == 48000);
-    assert(meta.channels == 2);
-    assert(meta.nb_samples == 4);
-    assert(meta.sample_fmt == AV_SAMPLE_FMT_S16);
-
-    buf->unref();
-    av_frame_free(&frame);
-
-    printf(" OK\n");
-}
-
-static BufferRef makeRouteBuffer(uint8_t value) {
-    auto* buf = new Buffer();
-    buf->data = new uint8_t[1]{value};
-    buf->size = 1;
-    buf->media_type = MediaType::VIDEO_RAW;
-    return BufferRef{buf};
-}
-
-static void test_output_route_shared_delivery() {
+void test_output_route_shared_delivery() {
     printf("  test_output_route_shared_delivery...");
     fflush(stdout);
 
-    auto route = std::make_shared<OutputRoute>(4);
+    auto route = std::make_shared<OutputRoute>(2);
     auto first = route->subscribe();
     auto second = route->subscribe();
     assert(route->seal());
 
-    BufferRef source = makeRouteBuffer(42);
+    BufferRef source = makeBuffer(MediaType::VIDEO_RAW, 42);
     const Buffer* original = source.get();
     assert(route->publishBlocking(QueueItem{source}) == RoutePublishResult::PUBLISHED);
 
     auto first_delivery = first.acquireBlocking();
     auto second_delivery = second.acquireBlocking();
     assert(first_delivery && second_delivery);
-
-    const auto& first_ref = std::get<BufferRef>(first_delivery->item());
-    const auto& second_ref = std::get<BufferRef>(second_delivery->item());
-    assert(first_ref.get() == original);
-    assert(second_ref.get() == original);
-    assert(first_ref.get() == second_ref.get());
-
+    assert(std::get<BufferRef>(first_delivery->item()).get() == original);
+    assert(std::get<BufferRef>(second_delivery->item()).get() == original);
     assert(first_delivery->ack());
-    assert(route->retainedItems() == 1);
     assert(second_delivery->ack());
     assert(route->retainedItems() == 0);
-
     printf(" OK\n");
 }
 
-static void test_output_route_ack_controls_backpressure() {
+void test_output_route_cancel_wakes_publisher() {
+    printf("  test_output_route_cancel_wakes_publisher...");
+    fflush(stdout);
+
+    auto route = std::make_shared<OutputRoute>(1);
+    auto subscription = route->subscribe();
+    assert(route->seal());
+    assert(route->publishBlocking(QueueItem{makeBuffer(MediaType::VIDEO_RAW)}) ==
+           RoutePublishResult::PUBLISHED);
+
+    std::atomic<RoutePublishResult> result{RoutePublishResult::PUBLISHED};
+    std::thread publisher([&] {
+        result = route->publishBlocking(QueueItem{makeBuffer(MediaType::VIDEO_RAW)});
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    route->cancel();
+    publisher.join();
+    assert(result == RoutePublishResult::CANCELLED);
+    assert(!subscription.acquireBlocking());
+    printf(" OK\n");
+}
+
+void test_output_route_ack_controls_backpressure() {
     printf("  test_output_route_ack_controls_backpressure...");
     fflush(stdout);
 
@@ -715,718 +603,365 @@ static void test_output_route_ack_controls_backpressure() {
     auto fast = route->subscribe();
     auto slow = route->subscribe();
     assert(route->seal());
-    assert(route->publishBlocking(QueueItem{makeRouteBuffer(1)}) == RoutePublishResult::PUBLISHED);
+    assert(route->publishBlocking(QueueItem{makeBuffer(MediaType::VIDEO_RAW, 1)}) ==
+           RoutePublishResult::PUBLISHED);
 
     auto fast_delivery = fast.acquireBlocking();
     auto slow_delivery = slow.acquireBlocking();
     assert(fast_delivery && slow_delivery);
     assert(fast_delivery->ack());
 
-    std::atomic<bool> publish_finished{false};
+    std::atomic<bool> published{false};
     std::thread publisher([&] {
-        auto result = route->publishBlocking(QueueItem{makeRouteBuffer(2)});
-        assert(result == RoutePublishResult::PUBLISHED);
-        publish_finished = true;
+        assert(route->publishBlocking(QueueItem{makeBuffer(MediaType::VIDEO_RAW, 2)}) ==
+               RoutePublishResult::PUBLISHED);
+        published = true;
     });
 
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    assert(!publish_finished.load());
-    assert(route->retainedItems() == 1);
-
+    assert(!published.load());
     assert(slow_delivery->ack());
     publisher.join();
-    assert(publish_finished.load());
+    assert(published.load());
 
     auto fast_second = fast.acquireBlocking();
     auto slow_second = slow.acquireBlocking();
     assert(fast_second && slow_second);
     assert(fast_second->ack());
     assert(slow_second->ack());
-
     printf(" OK\n");
 }
 
-static void test_output_route_delivery_abandon_retries() {
+void test_output_route_delivery_abandon_retries() {
     printf("  test_output_route_delivery_abandon_retries...");
     fflush(stdout);
 
     auto route = std::make_shared<OutputRoute>(1);
-    auto subscriber = route->subscribe();
+    auto subscription = route->subscribe();
     assert(route->seal());
-    assert(route->publishBlocking(QueueItem{makeRouteBuffer(7)}) == RoutePublishResult::PUBLISHED);
+    assert(route->publishBlocking(QueueItem{makeBuffer(MediaType::VIDEO_RAW, 7)}) ==
+           RoutePublishResult::PUBLISHED);
 
-    const Buffer* first_ptr = nullptr;
+    const Buffer* first = nullptr;
     {
-        auto delivery = subscriber.acquireBlocking();
+        auto delivery = subscription.acquireBlocking();
         assert(delivery);
-        first_ptr = std::get<BufferRef>(delivery->item()).get();
-        // 未 ack，析构后同一订阅者应重新取得同一项。
+        first = std::get<BufferRef>(delivery->item()).get();
     }
 
-    auto retry = subscriber.acquireBlocking();
+    auto retry = subscription.acquireBlocking();
     assert(retry);
-    assert(std::get<BufferRef>(retry->item()).get() == first_ptr);
+    assert(std::get<BufferRef>(retry->item()).get() == first);
     assert(retry->ack());
-    assert(route->retainedItems() == 0);
-
     printf(" OK\n");
 }
 
-static void test_output_route_ack_after_processing() {
-    printf("  test_output_route_ack_after_processing...");
-    fflush(stdout);
-
-    auto route = std::make_shared<OutputRoute>(1);
-    auto subscriber = route->subscribe();
-    assert(route->seal());
-    assert(route->publishBlocking(QueueItem{makeRouteBuffer(1)}) == RoutePublishResult::PUBLISHED);
-
-    auto delivery = subscriber.acquireBlocking();
-    assert(delivery);
-
-    std::atomic<bool> publish_finished{false};
-    std::thread publisher([&] {
-        assert(route->publishBlocking(QueueItem{makeRouteBuffer(2)}) ==
-               RoutePublishResult::PUBLISHED);
-        publish_finished = true;
-    });
-
-    // acquire 并不释放容量；只有处理完成后的 ack 才允许第二次 publish。
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    assert(!publish_finished.load());
-    assert(delivery->ack());
-    publisher.join();
-    assert(publish_finished.load());
-
-    auto second = subscriber.acquireBlocking();
-    assert(second && second->ack());
-
-    printf(" OK\n");
-}
-
-static void test_output_route_cancel_wakes_subscriber() {
-    printf("  test_output_route_cancel_wakes_subscriber...");
-    fflush(stdout);
-
-    auto route = std::make_shared<OutputRoute>(1);
-    auto subscriber = route->subscribe();
-    assert(route->seal());
-
-    std::atomic<bool> returned{false};
-    std::thread consumer([&] {
-        auto delivery = subscriber.acquireBlocking();
-        assert(!delivery);
-        returned = true;
-    });
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    assert(!returned.load());
-    route->cancel();
-    consumer.join();
-    assert(returned.load());
-
-    printf(" OK\n");
-}
-
-static void test_output_route_cancel_wakes_publisher() {
-    printf("  test_output_route_cancel_wakes_publisher...");
-    fflush(stdout);
-
-    auto route = std::make_shared<OutputRoute>(1);
-    auto subscriber = route->subscribe();
-    assert(route->seal());
-    assert(route->publishBlocking(QueueItem{makeRouteBuffer(1)}) == RoutePublishResult::PUBLISHED);
-
-    std::atomic<RoutePublishResult> result{RoutePublishResult::PUBLISHED};
-    std::thread publisher([&] {
-        result = route->publishBlocking(QueueItem{makeRouteBuffer(2)});
-    });
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    route->cancel();
-    publisher.join();
-    assert(result.load() == RoutePublishResult::CANCELLED);
-    assert(!subscriber.acquireBlocking());
-
-    printf(" OK\n");
-}
-
-static void test_output_route_event_order() {
+void test_output_route_event_order() {
     printf("  test_output_route_event_order...");
     fflush(stdout);
 
     auto route = std::make_shared<OutputRoute>(4);
-    auto subscriber = route->subscribe();
+    auto subscription = route->subscribe();
     assert(route->seal());
-
-    CapsEvent caps;
-    caps.media_type = MediaType::VIDEO_RAW;
+    const CapsEvent caps = makeVideoCaps();
     assert(route->publishBlocking(QueueItem{Event{caps}}) == RoutePublishResult::PUBLISHED);
-    assert(route->publishBlocking(QueueItem{makeRouteBuffer(9)}) == RoutePublishResult::PUBLISHED);
+    assert(route->publishBlocking(QueueItem{makeBuffer(MediaType::VIDEO_RAW, 9)}) ==
+           RoutePublishResult::PUBLISHED);
     assert(route->publishBlocking(QueueItem{Event{EOSEvent{}}}) == RoutePublishResult::PUBLISHED);
 
-    auto first = subscriber.acquireBlocking();
-    assert(first && std::holds_alternative<Event>(first->item()));
-    assert(std::holds_alternative<CapsEvent>(std::get<Event>(first->item())));
+    auto first = subscription.acquireBlocking();
+    assert(first && std::holds_alternative<CapsEvent>(std::get<Event>(first->item())));
     assert(first->ack());
-
-    auto second = subscriber.acquireBlocking();
+    auto second = subscription.acquireBlocking();
     assert(second && std::holds_alternative<BufferRef>(second->item()));
     assert(second->ack());
-
-    auto third = subscriber.acquireBlocking();
-    assert(third && std::holds_alternative<Event>(third->item()));
-    assert(std::holds_alternative<EOSEvent>(std::get<Event>(third->item())));
+    auto third = subscription.acquireBlocking();
+    assert(third && std::holds_alternative<EOSEvent>(std::get<Event>(third->item())));
     assert(third->ack());
-
     printf(" OK\n");
 }
 
-static void test_select_route_capacity() {
-    printf("  test_select_route_capacity...");
+void test_pipeline_running_caps_and_dynamic_boundary() {
+    printf("  test_pipeline_running_caps_and_dynamic_boundary...");
     fflush(stdout);
 
-    assert(selectRouteCapacity(MediaType::VIDEO_RAW) == 4);
-    assert(selectRouteCapacity(MediaType::AUDIO_RAW) == 50);
-    assert(selectRouteCapacity(MediaType::VIDEO_ENCODED) == 32);
-    assert(selectRouteCapacity(MediaType::AUDIO_ENCODED) == 32);
-    assert(selectRouteCapacity(MediaType::CONTAINER) == 32);
-
-    auto route = std::make_shared<OutputRoute>(2);
-    assert(route->capacity() == 2);
-    route->resize(8);
-    assert(route->capacity() == 8);
-
-    printf(" OK\n");
-}
-
-static void test_graph_build_cycle_detection() {
-    printf("  test_graph_build_cycle_detection...");
-    fflush(stdout);
-
-    // 构造一个有环的图：A → B → C → A
-    // 通过手动操作 Graph 内部来测试
-    // 由于 Graph 的 link() 不允许创建环（Pad 已被占用），
-    // 我们用一个特殊方式：直接操作 Edge 来制造环
-    //
-    // 但 Graph::link() 会检查 isConnected()，所以环在 link 阶段就会被阻止
-    // 实际上环路检测是在 build() 里做的，作为拓扑排序的副产品
-    // 如果 topo_order_.size() != nodes_.size() 就说明有环
-    //
-    // 由于我们的 link() 实现已经阻止了环的创建（Pad 只能连一个 Edge），
-    // 这个测试验证的是：正常无环图 build 成功
-    Pipeline pipeline;
-    auto* src = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
-    auto* sink = pipeline.addNode<MockSink>("sink");
-    pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW);
-
-    assert(pipeline.build());  // 正常图应该 build 成功
-
-    printf(" OK\n");
-}
-
-static void test_graph_build_orphan_detection() {
-    printf("  test_graph_build_orphan_detection...");
-    fflush(stdout);
-
-    // 创建一个孤立节点（不连接到任何其他节点）
-    Pipeline pipeline;
-    auto* src = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
-    auto* sink = pipeline.addNode<MockSink>("sink");
-    // 故意不 link，让 sink 成为孤立节点
-    (void)src;
-    (void)sink;
-
-    // build 应该失败，因为 sink 是孤立节点
-    assert(!pipeline.build());
-
-    printf(" OK\n");
-}
-
-// ===================================================================
-// 集成级测试
-// ===================================================================
-
-static void test_pipeline_source_to_sink() {
-    printf("  test_pipeline_source_to_sink...");
-    fflush(stdout);
+    std::vector<QueueItem> script;
+    script.emplace_back(Event{makeVideoCaps(16, 8)});
+    script.emplace_back(makeBuffer(MediaType::VIDEO_RAW, 1));
+    script.emplace_back(Event{makeVideoCaps(32, 8)});
+    script.emplace_back(makeBuffer(MediaType::VIDEO_RAW, 2));
+    script.emplace_back(makeBuffer(MediaType::VIDEO_RAW, 3));
 
     Pipeline pipeline;
-    auto* src  = pipeline.addNode<MockSource>("src", 10, MediaType::VIDEO_RAW);
-    auto* sink = pipeline.addNode<MockSink>("sink");
-
-    assert(pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW));
+    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* sink = pipeline.addNode<CapsTrackingSink>("sink");
+    assert(pipeline.link(source, "out", sink, "in", MediaType::VIDEO_RAW));
     assert(pipeline.build());
     assert(pipeline.play());
     pipeline.waitEOS();
 
-    assert(sink->received() == 10);
-
-    printf(" OK\n");
-}
-
-static void test_pipeline_source_transform_sink() {
-    printf("  test_pipeline_source_transform_sink...");
-    fflush(stdout);
-
-    Pipeline pipeline;
-    auto* src   = pipeline.addNode<MockSource>("src", 5, MediaType::VIDEO_RAW);
-    auto* xform = pipeline.addNode<MockTransform>("xform");
-    auto* sink  = pipeline.addNode<MockSink>("sink");
-
-    assert(pipeline.link(src, "out", xform, "in", MediaType::VIDEO_RAW));
-    assert(pipeline.link(xform, "out", sink, "in", MediaType::VIDEO_RAW));
-    assert(pipeline.build());
-    assert(pipeline.play());
-    pipeline.waitEOS();
-
-    assert(xform->processed() == 5);
-    assert(sink->received() == 5);
-
-    printf(" OK\n");
-}
-
-static void test_pipeline_stop_idempotent() {
-    printf("  test_pipeline_stop_idempotent...");
-    fflush(stdout);
-
-    Pipeline pipeline;
-    auto* src  = pipeline.addNode<MockSource>("src", 100, MediaType::VIDEO_RAW);
-    auto* sink = pipeline.addNode<MockSink>("sink");
-
-    pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW);
-    pipeline.build();
-    pipeline.play();
-
-    pipeline.stop();
-    pipeline.stop();
-    pipeline.stop();
-
-    printf(" OK\n");
-}
-
-static void test_pipeline_stop_before_play() {
-    printf("  test_pipeline_stop_before_play...");
-    fflush(stdout);
-
-    Pipeline pipeline;
-    pipeline.stop();  // CAS 失败直接返回
-
-    printf(" OK\n");
-}
-
-static void test_pipeline_play_without_build() {
-    printf("  test_pipeline_play_without_build...");
-    fflush(stdout);
-
-    Pipeline pipeline;
-    auto* src = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
-    auto* sink = pipeline.addNode<MockSink>("sink");
-    pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW);
-
-    assert(!pipeline.play());
-
-    printf(" OK\n");
-}
-
-static void test_pipeline_build_twice() {
-    printf("  test_pipeline_build_twice...");
-    fflush(stdout);
-
-    Pipeline pipeline;
-    auto* src = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
-    auto* sink = pipeline.addNode<MockSink>("sink");
-    pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW);
-
-    assert(pipeline.build());
-    assert(!pipeline.build());
-
-    printf(" OK\n");
-}
-
-static void test_pipeline_link_incompatible() {
-    printf("  test_pipeline_link_incompatible...");
-    fflush(stdout);
-
-    Pipeline pipeline;
-    auto* src = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
-    auto* sink = pipeline.addNode<MockSink>("sink");
-
-    assert(!pipeline.link(src, "out", sink, "in", MediaType::AUDIO_ENCODED));
-
-    printf(" OK\n");
-}
-
-static void test_pipeline_caps_propagation() {
-    printf("  test_pipeline_caps_propagation...");
-    fflush(stdout);
-
-    Pipeline pipeline;
-    auto* src   = pipeline.addNode<MockSourceWithCaps>("src", 3);
-    auto* xform = pipeline.addNode<MockTransformWithCaps>("xform");
-    auto* sink  = pipeline.addNode<MockSink>("sink");
-
-    assert(pipeline.link(src, "out", xform, "in", MediaType::VIDEO_ENCODED));
-    assert(pipeline.link(xform, "out", sink, "in", MediaType::VIDEO_RAW));
-    assert(pipeline.build());
-    assert(pipeline.play());
-    pipeline.waitEOS();
-
-    assert(xform->got_caps());
-    assert(xform->processed() == 3);
     assert(sink->received() == 3);
-
+    assert((sink->appliedWidths() == std::vector<int>{16, 32}));
+    assert((sink->consumedWidths() == std::vector<int>{16, 32, 32}));
+    assert(pipeline.lastError().empty());
     printf(" OK\n");
 }
 
-static void test_pipeline_concurrent_stop() {
-    printf("  test_pipeline_concurrent_stop...");
+void test_transform_preserves_caps_before_buffer() {
+    printf("  test_transform_preserves_caps_before_buffer...");
     fflush(stdout);
 
+    std::vector<QueueItem> script;
+    script.emplace_back(Event{makeVideoCaps()});
+    script.emplace_back(makeBuffer(MediaType::VIDEO_RAW));
+
     Pipeline pipeline;
-    auto* src  = pipeline.addNode<MockSource>("src", 1000, MediaType::VIDEO_RAW);
-    auto* sink = pipeline.addNode<MockSink>("sink");
+    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* transform = pipeline.addNode<ForwardTransform>("transform");
+    auto* sink = pipeline.addNode<CapsTrackingSink>("sink");
+    assert(pipeline.link(source, "out", transform, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.link(transform, "out", sink, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+    assert(pipeline.play());
+    pipeline.waitEOS();
 
-    pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW);
-    pipeline.build();
-    pipeline.play();
-
-    std::thread t1([&]() { pipeline.stop(); });
-    std::thread t2([&]() { pipeline.stop(); });
-    t1.join();
-    t2.join();
-
+    assert(transform->processed() == 1);
+    assert(sink->received() == 1);
+    assert((sink->appliedWidths() == std::vector<int>{16}));
+    assert(pipeline.lastError().empty());
     printf(" OK\n");
 }
 
-static void test_pipeline_wait_eos_and_stop() {
-    printf("  test_pipeline_wait_eos_and_stop...");
+void test_buffer_before_caps_is_protocol_error() {
+    printf("  test_buffer_before_caps_is_protocol_error...");
     fflush(stdout);
 
+    std::vector<QueueItem> script;
+    script.emplace_back(makeBuffer(MediaType::VIDEO_RAW));
+
     Pipeline pipeline;
-    auto* src  = pipeline.addNode<MockSource>("src", 1000, MediaType::VIDEO_RAW);
+    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
     auto* sink = pipeline.addNode<MockSink>("sink");
-
-    pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW);
-    pipeline.build();
-    pipeline.play();
-
-    std::thread t1([&]() { pipeline.waitEOS(); });
-    std::thread t2([&]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        pipeline.stop();
-    });
-    t1.join();
-    t2.join();
-
+    assert(pipeline.link(source, "out", sink, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+    assert(pipeline.play());
+    pipeline.waitEOS();
+    assert(pipeline.lastError().find("before initial CapsEvent") != std::string::npos);
     printf(" OK\n");
 }
 
-// ===================================================================
-// Transform process 产出后收到 stop：全部输出尚未发布，必须由 outputs RAII 释放。
-// ===================================================================
-static void test_transform_stop_releases_unpublished_outputs() {
+void test_transform_eos_follows_flush_sequence() {
+    printf("  test_transform_eos_follows_flush_sequence...");
+    fflush(stdout);
+
+    std::vector<QueueItem> script;
+    script.emplace_back(Event{makeVideoCaps()});
+    script.emplace_back(makeBuffer(MediaType::VIDEO_RAW, 1));
+
+    Pipeline pipeline;
+    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* transform = pipeline.addNode<EosAfterFlushTransform>("transform");
+    auto* sink = pipeline.addNode<OrderedVideoSink>("sink");
+    assert(pipeline.link(source, "out", transform, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.link(transform, "out", sink, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+    assert(pipeline.play());
+    pipeline.waitEOS();
+
+    assert(pipeline.lastError().empty());
+    assert((sink->values() == std::vector<uint8_t>{99}));
+    assert(sink->sawEOS());
+    printf(" OK\n");
+}
+
+void test_transform_stop_releases_unpublished_outputs() {
     printf("  test_transform_stop_releases_unpublished_outputs...");
     fflush(stdout);
 
+    std::vector<QueueItem> script;
+    script.emplace_back(Event{makeVideoCaps()});
+    script.emplace_back(makeBuffer(MediaType::VIDEO_RAW));
+
     Pipeline pipeline;
-    auto* src = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
+    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
     auto* transform = pipeline.addNode<StopAfterProduceTransform>("transform");
     auto* sink = pipeline.addNode<MockSink>("sink");
-
-    assert(pipeline.link(src, "out", transform, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.link(source, "out", transform, "in", MediaType::VIDEO_RAW));
     assert(pipeline.link(transform, "out", sink, "in", MediaType::VIDEO_RAW));
     assert(pipeline.build());
     assert(pipeline.play());
     assert(transform->waitUntilOutputsReady());
 
     pipeline.stop();
-
-    // stop/join 后，每个输出只允许剩下测试观察引用，证明 Transform 发布引用已释放。
     assert(transform->observersAreSoleOwners());
     printf(" OK\n");
 }
 
-// ===================================================================
-// Transform 部分发布后 Route 满并被 cancel：已发布、当前失败和未遍历输出均须释放。
-// ===================================================================
-static void test_transform_cancel_releases_partial_outputs() {
+void test_transform_cancel_releases_partial_outputs() {
     printf("  test_transform_cancel_releases_partial_outputs...");
     fflush(stdout);
 
+    std::vector<QueueItem> script;
+    script.emplace_back(Event{makeVideoCaps()});
+    script.emplace_back(makeBuffer(MediaType::VIDEO_RAW));
+
     Pipeline pipeline;
-    auto* src = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
+    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
     auto* transform = pipeline.addNode<BurstTransform>("transform");
     auto* sink = pipeline.addNode<BlockingSink>("sink");
-
-    assert(pipeline.link(src, "out", transform, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.link(source, "out", transform, "in", MediaType::VIDEO_RAW));
     assert(pipeline.link(transform, "out", sink, "in", MediaType::VIDEO_RAW));
     assert(pipeline.build());
     assert(pipeline.play());
-    assert(transform->waitUntilOutputsReady());
     assert(sink->waitUntilConsuming());
     assert(transform->waitUntilOutputRouteFull());
 
     pipeline.stop();
-
-    // Route cancel 清已发布项，失败参数和 outputs 尾部由 BufferRef RAII 自动释放。
+    // Route cancel releases published entries; publish failure and unvisited QueueItems remain RAII-owned.
     assert(transform->observersAreSoleOwners());
     printf(" OK\n");
 }
 
-// ===================================================================
-// 分叉路径：Source 一路输出 fork 给两个 Sink
-// 覆盖同一逻辑 Route 的两个静态可靠订阅者。
-// 两路共享底层 BufferRef，并且都必须收到全部帧。
-// ===================================================================
-static void test_pipeline_forked_broadcast() {
-    printf("  test_pipeline_forked_broadcast...");
+void test_pipeline_concurrent_stop() {
+    printf("  test_pipeline_concurrent_stop...");
     fflush(stdout);
 
+    std::vector<QueueItem> script;
+    script.emplace_back(Event{makeVideoCaps()});
+    for (int i = 0; i < 100; ++i) {
+        script.emplace_back(makeBuffer(MediaType::VIDEO_RAW, static_cast<uint8_t>(i)));
+    }
+
     Pipeline pipeline;
-    auto* src   = pipeline.addNode<MockSource>("src", 20, MediaType::VIDEO_RAW);
-    auto* sink1 = pipeline.addNode<MockSink>("sink1");
-    auto* sink2 = pipeline.addNode<MockSink>("sink2");
-
-    // 第一次 link 直接用 "out"（走 requestSrcPad 创建）
-    assert(pipeline.link(src, "out",  sink1, "in", MediaType::VIDEO_RAW));
-    // 第二次 link 用新 pad 名，触发 SourceNode::requestSrcPad 分叉分支
-    assert(pipeline.link(src, "out2", sink2, "in", MediaType::VIDEO_RAW));
-
+    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* sink = pipeline.addNode<CapsTrackingSink>("sink");
+    assert(pipeline.link(source, "out", sink, "in", MediaType::VIDEO_RAW));
     assert(pipeline.build());
     assert(pipeline.play());
-    pipeline.waitEOS();
 
-    // 所有可靠订阅者都应收到完整序列，不允许因下游调度差异丢帧。
-    assert(sink1->received() == 20);
-    assert(sink2->received() == 20);
-
+    std::thread first([&] { pipeline.stop(); });
+    std::thread second([&] { pipeline.stop(); });
+    first.join();
+    second.join();
     printf(" OK\n");
 }
 
-// ===================================================================
-// 分叉路径压力：一路慢 Sink 使 Route 达到硬容量，验证最慢可靠订阅者
-// 将背压传给 Source，同时快慢两路最终都收到完整序列。
-// ===================================================================
-static void test_pipeline_forked_backpressure_no_uaf() {
-    printf("  test_pipeline_forked_backpressure_no_uaf...");
+void test_pipeline_forked_backpressure() {
+    printf("  test_pipeline_forked_backpressure...");
     fflush(stdout);
 
+    std::vector<QueueItem> script;
+    script.emplace_back(Event{makeVideoCaps()});
+    for (int index = 0; index < 100; ++index) {
+        script.emplace_back(makeBuffer(MediaType::VIDEO_RAW, static_cast<uint8_t>(index)));
+    }
+
     Pipeline pipeline;
-    auto* src   = pipeline.addNode<MockSource>("src", 200, MediaType::VIDEO_RAW);
-    auto* fast  = pipeline.addNode<MockSink>("fast");
-    auto* slow  = pipeline.addNode<MockSlowSink>("slow", 500);  // 每帧 sleep 500us
-
-    assert(pipeline.link(src, "out",  fast, "in", MediaType::VIDEO_RAW));
-    assert(pipeline.link(src, "out2", slow, "in", MediaType::VIDEO_RAW));
-
+    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* fast = pipeline.addNode<CapsTrackingSink>("fast");
+    auto* slow = pipeline.addNode<SlowVideoSink>("slow", 500);
+    assert(pipeline.link(source, "out", fast, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.link(source, "out2", slow, "in", MediaType::VIDEO_RAW));
     assert(pipeline.build());
     assert(pipeline.play());
     pipeline.waitEOS();
 
-    // Route 满时阻塞 publish，不允许任何可靠订阅者丢帧。
     assert(pipeline.lastError().empty());
-    assert(fast->received() == 200);
-    assert(slow->received() == 200);
-
+    assert(fast->received() == 100);
+    assert(slow->received() == 100);
     printf(" OK\n");
 }
 
-// ===================================================================
-// Ready 失败：错误消息能被 lastError() 拿到
-// 覆盖问题 1 的核心承诺（bus 提前启动 + Ready 失败前 join drain）
-// ===================================================================
-static void test_pipeline_ready_failure_reports_error() {
-    printf("  test_pipeline_ready_failure_reports_error...");
+void test_mux_waits_for_all_initial_caps() {
+    printf("  test_mux_waits_for_all_initial_caps...");
     fflush(stdout);
 
-    Pipeline pipeline;
-    auto* src  = pipeline.addNode<MockFailingSource>("bad_src", "device open failed");
-    auto* sink = pipeline.addNode<MockSink>("sink");
+    std::vector<QueueItem> video_script;
+    video_script.emplace_back(Event{makeEncodedVideoCaps()});
+    video_script.emplace_back(makeBuffer(MediaType::VIDEO_ENCODED, 1));
 
-    assert(pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW));
+    std::vector<QueueItem> audio_script;
+    audio_script.emplace_back(Event{makeEncodedAudioCaps()});
+    audio_script.emplace_back(makeBuffer(MediaType::AUDIO_ENCODED, 2));
+
+    Pipeline pipeline;
+    auto* video = pipeline.addNode<CapsScriptSource>("video", std::move(video_script));
+    auto* audio = pipeline.addNode<CapsScriptSource>("audio", std::move(audio_script));
+    auto* mux = pipeline.addNode<FakeMux>("mux");
+    auto* sink = pipeline.addNode<ContainerSink>("sink");
+    assert(pipeline.link(video, "out", mux, "video", MediaType::VIDEO_ENCODED));
+    assert(pipeline.link(audio, "out", mux, "audio", MediaType::AUDIO_ENCODED));
+    assert(pipeline.link(mux, "out_0", sink, "in", MediaType::CONTAINER));
     assert(pipeline.build());
-    assert(!pipeline.play());   // Ready 失败
+    assert(pipeline.play());
+    pipeline.waitEOS();
 
-    // 修复前这里是空串
-    assert(pipeline.lastError() == "device open failed");
-
+    assert(pipeline.lastError().empty());
+    assert(mux->streamCount() == 2);
+    assert(sink->received() == 4);  // header + video packet + audio packet + trailer
     printf(" OK\n");
 }
 
-// ===================================================================
-// Ready 失败事务性回滚：前置节点 onReady 成功后，
-// 后置节点失败时前置节点的 onStop 应被回滚调用
-// ===================================================================
-static void test_pipeline_ready_failure_rollback() {
-    printf("  test_pipeline_ready_failure_rollback...");
+void test_pipeline_ready_failure_rolls_back() {
+    printf("  test_pipeline_ready_failure_rolls_back...");
     fflush(stdout);
 
-    Pipeline pipeline;
-    auto* src  = pipeline.addNode<MockOnStopTracker>("tracker");
-    auto* sink = pipeline.addNode<MockFailingSink>("bad_sink");
+    class FailingSource final : public SourceNode {
+    public:
+        explicit FailingSource(const std::string& name) : SourceNode(name) {
+            addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW}});
+        }
+        int stopped() const { return stopped_; }
+    protected:
+        bool onReady() override {
+            postMessage(MessageType::ERROR, "expected Ready failure");
+            return false;
+        }
+        void onStop() override { ++stopped_; }
+        Buffer* capture() override { return nullptr; }
+    private:
+        int stopped_ = 0;
+    };
 
-    assert(pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW));
+    Pipeline pipeline;
+    auto* source = pipeline.addNode<FailingSource>("source");
+    auto* sink = pipeline.addNode<MockSink>("sink");
+    assert(pipeline.link(source, "out", sink, "in", MediaType::VIDEO_RAW));
     assert(pipeline.build());
     assert(!pipeline.play());
-
-    // 前置 tracker 的 onReady 已成功、queue 已建、然后 sink 的 onReady 失败
-    // Graph::ready() 应按拓扑逆序回滚：先 sink.onStop 再 tracker.onStop
-    // tracker 至少被 onStop 一次
-    assert(src->stopCalled() >= 1);
-    // sink 上报的错误也应能拿到
-    assert(pipeline.lastError() == "sink init failed");
-
+    assert(source->stopped() >= 1);
+    assert(pipeline.lastError() == "expected Ready failure");
     printf(" OK\n");
 }
 
-// ===================================================================
-// actual_type / Caps 校验测试
-// ===================================================================
-
-static void test_pad_actual_type_lifecycle() {
-    printf("  test_pad_actual_type_lifecycle...");
-    fflush(stdout);
-
-    Pipeline pipeline;
-    auto* src   = pipeline.addNode<MockSourceWithCaps>("src", 1);
-    auto* xform = pipeline.addNode<MockTransformWithCaps>("xform");
-    auto* sink  = pipeline.addNode<MockSink>("sink");
-
-    assert(pipeline.link(src, "out", xform, "in", MediaType::VIDEO_ENCODED));
-    assert(pipeline.link(xform, "out", sink, "in", MediaType::VIDEO_RAW));
-    assert(pipeline.build());
-
-    // Ready 前：actualType 一律 nullopt（契约：Ready 之前不依赖 actualType 有值）
-    assert(!src->outActualType().has_value());
-    assert(!xform->inActualType().has_value());
-
-    assert(pipeline.play());
-    pipeline.waitEOS();
-
-    // Ready 后：已连接且走过 CapsEvent 的 pad，actualType 必有值
-    assert(src->outActualType().has_value());
-    assert(*src->outActualType() == MediaType::VIDEO_ENCODED);
-    assert(xform->inActualType().has_value());
-    assert(*xform->inActualType() == MediaType::VIDEO_ENCODED);
-
-    printf(" OK\n");
-}
-
-static void test_send_caps_event_validation_fail() {
-    printf("  test_send_caps_event_validation_fail...");
-    fflush(stdout);
-
-    Pipeline pipeline;
-    auto* src  = pipeline.addNode<MockSourceBadCaps>("src");
-    auto* sink = pipeline.addNode<MockSink>("sink");
-
-    assert(pipeline.link(src, "out", sink, "in", MediaType::VIDEO_RAW));
-    assert(pipeline.build());
-    assert(!pipeline.play());   // sendCapsEvent 校验失败 → Ready 回滚
-
-    const std::string err = pipeline.lastError();
-    assert(err.find("sendCapsEvent") != std::string::npos);
-    assert(err.find("not in src pad") != std::string::npos);
-
-    printf(" OK\n");
-}
-
-static void test_receive_caps_event_validation_fail() {
-    printf("  test_receive_caps_event_validation_fail...");
-    fflush(stdout);
-
-    Pipeline pipeline;
-    auto* src   = pipeline.addNode<MockSourceSendsAudio>("src");
-    auto* xform = pipeline.addNode<MockTransformVideoOnly>("xform");
-
-    assert(pipeline.link(src, "out", xform, "in", MediaType::VIDEO_ENCODED));
-    assert(pipeline.build());
-    assert(!pipeline.play());   // receiveCapsEvent 校验失败 → Ready 回滚
-
-    const std::string err = pipeline.lastError();
-    assert(err.find("receiveCapsEvent") != std::string::npos);
-    assert(err.find("not in sink pad") != std::string::npos);
-
-    printf(" OK\n");
-}
-
-static void test_request_src_pad_rejects_mismatched_hint() {
-    printf("  test_request_src_pad_rejects_mismatched_hint...");
-    fflush(stdout);
-
-    Pipeline pipeline;
-    auto* src   = pipeline.addNode<MockSource>("src", 1, MediaType::VIDEO_RAW);
-    auto* sink1 = pipeline.addNode<MockSink>("sink1");
-    auto* sink2 = pipeline.addNode<MockSink>("sink2");
-
-    // 首次 link：requestSrcPad 建立 {VIDEO_RAW}
-    assert(pipeline.link(src, "out", sink1, "in", MediaType::VIDEO_RAW));
-    // 再次 link：hint_type=AUDIO_RAW 不在已有 {VIDEO_RAW} 能力集合内 → requestSrcPad 返回 nullptr
-    assert(!pipeline.link(src, "out2", sink2, "in", MediaType::AUDIO_RAW));
-
-    // Transform 分叉同理
-    auto* xform = pipeline.addNode<MockTransform>("xform");
-    auto* sink3 = pipeline.addNode<MockSink>("sink3");
-    auto* sink4 = pipeline.addNode<MockSink>("sink4");
-    assert(pipeline.link(xform, "out", sink3, "in", MediaType::VIDEO_RAW));
-    assert(!pipeline.link(xform, "out2", sink4, "in", MediaType::AUDIO_RAW));
-
-    printf(" OK\n");
-}
-
-// ===================================================================
+} // namespace
 
 int main() {
-    printf("=== Phase 2 Unit Tests ===\n\n");
+    printf("=== Dynamic Caps Unit Tests ===\n\n");
 
-    printf("[Component Tests]\n");
-    test_template_caps();
-    test_buffer_refcount();
-    test_buffer_clone();
-    test_buffer_ref();
-    test_buffer_from_avpacket_metadata();
-    test_buffer_from_avpacket_invalid_type();
-    test_buffer_from_avframe_invalid_input();
-    test_buffer_from_avframe_audio_meta();
+    printf("[Value and Route Tests]\n");
+    test_template_caps_compatibility();
+    test_buffer_ref_lifecycle();
+    test_channel_layout_value_semantics();
+    test_caps_format_comparison_excludes_framerate();
+    test_buffer_metadata_is_frame_scoped();
     test_output_route_shared_delivery();
     test_output_route_ack_controls_backpressure();
     test_output_route_delivery_abandon_retries();
-    test_output_route_ack_after_processing();
-    test_output_route_cancel_wakes_subscriber();
     test_output_route_cancel_wakes_publisher();
     test_output_route_event_order();
-    test_select_route_capacity();
 
-    printf("\n[Graph Tests]\n");
-    test_graph_build_cycle_detection();
-    test_graph_build_orphan_detection();
-
-    printf("\n[Integration Tests]\n");
-    test_pipeline_source_to_sink();
-    test_pipeline_source_transform_sink();
-    test_pipeline_stop_idempotent();
-    test_pipeline_stop_before_play();
-    test_pipeline_play_without_build();
-    test_pipeline_build_twice();
-    test_pipeline_link_incompatible();
-    test_pipeline_caps_propagation();
-    test_pipeline_concurrent_stop();
-    test_pipeline_wait_eos_and_stop();
+    printf("\n[Pipeline Caps Tests]\n");
+    test_pipeline_running_caps_and_dynamic_boundary();
+    test_transform_preserves_caps_before_buffer();
+    test_buffer_before_caps_is_protocol_error();
+    test_transform_eos_follows_flush_sequence();
     test_transform_stop_releases_unpublished_outputs();
     test_transform_cancel_releases_partial_outputs();
-    test_pipeline_forked_broadcast();
-    test_pipeline_forked_backpressure_no_uaf();
-
-    printf("\n[Ready Failure Tests]\n");
-    test_pipeline_ready_failure_reports_error();
-    test_pipeline_ready_failure_rollback();
-
-    printf("\n[ActualType / Caps Validation Tests]\n");
-    test_pad_actual_type_lifecycle();
-    test_send_caps_event_validation_fail();
-    test_receive_caps_event_validation_fail();
-    test_request_src_pad_rejects_mismatched_hint();
+    test_pipeline_concurrent_stop();
+    test_pipeline_forked_backpressure();
+    test_mux_waits_for_all_initial_caps();
+    test_pipeline_ready_failure_rolls_back();
 
     printf("\n=== All Tests Passed ===\n");
     return 0;

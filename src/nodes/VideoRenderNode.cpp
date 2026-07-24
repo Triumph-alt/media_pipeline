@@ -25,20 +25,28 @@ VideoRenderNode::VideoRenderNode(const std::string& name)
 }
 
 // ===================================================================
-// onStreamInfo: Ready 阶段只接收并记录初始 Caps
-//
-// SDL 视频资源具有线程亲和性，统一延迟到节点工作线程的 runLoop() 创建
+// onCaps: 在 Running Route 中应用完整视频格式边界
 // ===================================================================
-bool VideoRenderNode::onStreamInfo() {
-    if (!receiveCapsEvent("in")) {
-        return false;
+bool VideoRenderNode::onCaps(const std::string&, const CapsEvent& caps,
+                             std::vector<QueueItem>*) {
+    if (caps.media_type != MediaType::VIDEO_RAW ||
+        caps.width <= 0 || caps.height <= 0 ||
+        (caps.pix_fmt != AV_PIX_FMT_YUV420P && caps.pix_fmt != AV_PIX_FMT_YUVJ420P)) {
+        return failRender("VideoRenderNode: only complete YUV420P/YUVJ420P Caps are supported before swscale");
     }
 
-    const CapsEvent& caps = negotiated_caps_["in"];
+    // Runtime Caps may arrive before this worker has created SDL resources. Record the complete format now;
+    // consume() will create/recreate the Texture after openRenderer succeeds. If a later Caps arrives while
+    // rendering, destroy the old Texture here so no stale dimensions survive the configuration boundary.
+    if (texture_ && (texture_width_ != caps.width || texture_height_ != caps.height)) {
+        SDL_DestroyTexture(static_cast<SDL_Texture*>(texture_));
+        texture_ = nullptr;
+        texture_width_ = 0;
+        texture_height_ = 0;
+    }
     width_ = caps.width;
     height_ = caps.height;
-
-    fprintf(stderr, "[%s] stream info: %dx%d initial_pix_fmt=%d\n",
+    fprintf(stderr, "[%s] applied video caps: %dx%d pix_fmt=%d\n",
             name_.c_str(), width_, height_, caps.pix_fmt);
     return true;
 }
@@ -235,23 +243,20 @@ void VideoRenderNode::consume(const Buffer* buf) {
         return;
     }
 
-    const auto* meta = std::get_if<VideoRawMeta>(&buf->meta);
-    if (!meta) {
-        failRender("VideoRenderNode: received buffer without VideoRawMeta");
-        return;
-    }
-    if (meta->width <= 0 || meta->height <= 0) {
-        failRender("VideoRenderNode: invalid video frame dimensions");
-        return;
-    }
-    if (meta->pix_fmt != AV_PIX_FMT_YUV420P && meta->pix_fmt != AV_PIX_FMT_YUVJ420P) {
-        failRender("VideoRenderNode: only YUV420P is supported before swscale is implemented");
+    const CapsEvent& caps = active_caps_.at("in");
+    if (buf->media_type != MediaType::VIDEO_RAW ||
+        !std::holds_alternative<VideoRawMeta>(buf->meta)) {
+        failRender("VideoRenderNode: received Buffer that does not match VIDEO_RAW active Caps");
         return;
     }
 
-    const size_t y_size = static_cast<size_t>(meta->width) * meta->height;
-    const int chroma_width = (meta->width + 1) / 2;
-    const int chroma_height = (meta->height + 1) / 2;
+    // VideoRaw Buffer 当前约定为由 Buffer::fromAVFrame 生成的紧密连续 YUV420P payload；
+    // width/height/pix_fmt 只从最近成功应用的 active Caps 读取，不能再双重相信 BufferMeta。
+    const int width = caps.width;
+    const int height = caps.height;
+    const size_t y_size = static_cast<size_t>(width) * height;
+    const int chroma_width = (width + 1) / 2;
+    const int chroma_height = (height + 1) / 2;
     const size_t chroma_size = static_cast<size_t>(chroma_width) * chroma_height;
     const size_t required_size = y_size + 2 * chroma_size;
     if (buf->size < required_size) {
@@ -262,7 +267,7 @@ void VideoRenderNode::consume(const Buffer* buf) {
     if (!waitForPresentationTime(buf->pts)) {
         return;
     }
-    if (!ensureTexture(meta->width, meta->height)) {
+    if (!ensureTexture(width, height)) {
         return;
     }
 
@@ -272,7 +277,7 @@ void VideoRenderNode::consume(const Buffer* buf) {
 
     if (!SDL_UpdateYUVTexture(
             static_cast<SDL_Texture*>(texture_), nullptr,
-            y_plane, meta->width,
+            y_plane, width,
             u_plane, chroma_width,
             v_plane, chroma_width)) {
         failRender(std::string("VideoRenderNode: SDL_UpdateYUVTexture failed: ") +

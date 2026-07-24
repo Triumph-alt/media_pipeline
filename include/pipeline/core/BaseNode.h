@@ -28,15 +28,15 @@ class Graph;
 // BaseNode: 节点抽象基类
 //
 // 生命周期回调（由 Pipeline/Graph 调用）：
-//   onReady()      — 初始化自身资源
-//   onStreamInfo() — 发送/处理 CapsEvent
+//   onReady()      — 初始化不依赖上游格式的资源
 //   onStop()       — 释放不要求节点工作线程亲和性的资源（join 线程后调用）
-//   runLoop()      — 工作线程主循环；线程亲和性资源可在退出前由所属节点线程释放
+//   runLoop()      — 工作线程主循环；Caps、Buffer、EOS 都在同一 Route 中有序处理
 //
 // 数据分发（子类调用，不感知下游数量）：
-//   pushToDownstream()   — 向一个逻辑 OutputRoute 可靠发布一次 Buffer
-//   sendCapsEvent()      — 向指定逻辑 Route 可靠发布一次 CapsEvent：校验 → setActualType → publish
-//   receiveCapsEvent()   — 从指定 Subscription acquire/校验/ack CapsEvent，并存 negotiated_caps_
+//   publishOutputItem()  — 向一个逻辑 OutputRoute 可靠发布有序 QueueItem（Caps/Buffer/EOS）
+//   pushToDownstream()   — publishOutputItem 的 BufferRef 便捷入口
+//   sendCapsEvent()      — 向指定逻辑 Route 可靠发布完整、准确的 CapsEvent
+//   applyCapsEvent()     — 校验并将收到的 Caps 设为指定 SinkPad 的 active Caps
 //   sendEOSDownstream()  — 向每条逻辑 Route 可靠发布一次 EOS
 //   postMessage()        — 统一上报 MessageBus
 //
@@ -63,43 +63,38 @@ protected:
     // 不提供默认构造，忘记调用会编译报错，避免 name_ 为空
     explicit BaseNode(const std::string& name) : name_(name) {}
 
-    // 初始化自身资源，Source/Demux 可在此探测流，但不发送 CapsEvent
-    // Transform/SinkNode：基础初始化（此时尚未收到 CapsEvent）
+    // 初始化不依赖上游格式的自身资源。运行期 Caps 在 runLoop 内有序处理。
     // 返回 true 成功，false 失败
     virtual bool onReady() = 0;
-
-    // 发送/处理 CapsEvent（Queue 已就绪）
-    // Source/DemuxNode：构造并发送 CapsEvent
-    // TransformNode：取出上游 CapsEvent → 初始化处理器 → 发送输出 CapsEvent
-    // 普通 SinkNode：取出 CapsEvent → 初始化处理器
-    // 具有线程亲和性资源的具体 Sink（如 VideoRenderNode）可只保存 Caps，
-    // 将资源初始化延迟到自身 runLoop() 所在线程
-    // 默认实现返回 true（Sink 节点无需发送）
-    virtual bool onStreamInfo() { return true; }
 
     // 释放不要求节点工作线程亲和性的资源（Pipeline join 完线程后按拓扑逆序调用）
     // 线程亲和性资源由具体节点在 runLoop() 退出前释放
     virtual void onStop() = 0;
 
+    // 应用一份运行期完整输入 Caps。BaseNode 在此回调成功后才更新 active_caps_。
+    // Transform 可在此填充重配前必须先发布的 delayed 输出；Sink 传 nullptr。
+    virtual bool onCaps(const std::string& sink_pad_name, const CapsEvent& caps,
+                        std::vector<QueueItem>* outputs) { return true; }
+
     // 工作线程主循环（由 Pipeline 创建的线程调用）
     virtual void runLoop() = 0;
 
-    // 将一个 Buffer 发布到指定逻辑 Route。src_pad_name 为空时，节点必须只有一条逻辑输出 Route
-    // 调用方必须显式 move；函数无条件接管这份 BufferRef，返回 false 时同样负责释放
+    // 向一个逻辑 Route 按序发布本地 QueueItem。BufferRef 必须显式 move，入口无条件接管。
+    bool publishOutputItem(QueueItem&& item, const std::string& src_pad_name = "");
+
+    // Buffer 发布的便捷入口；调用方必须显式 move，失败路径同样负责释放。
     bool pushToDownstream(BufferRef&& buf, const std::string& src_pad_name = "");
 
-    // 向每条不同的逻辑 Route publish 一次 EOS，不允许丢失
-    bool sendEOSDownstream();
-
-    // 向指定 SrcPad 的下游发送 CapsEvent，阻塞 push，不允许丢失
-    // 内部校验 caps.media_type ∈ SrcPad.templateCaps
-    // 每个 SrcPad 的 CapsEvent 可以不同；函数只负责发送，不存储
+    // 向指定 SrcPad 的下游发送完整、准确的 CapsEvent；它必须先于受其管辖的第一个 Buffer。
     bool sendCapsEvent(const std::string& src_pad_name, const CapsEvent& caps);
 
-    // 从指定 SinkPad 收取 CapsEvent，阻塞 pop，不允许丢失
-    // 内部校验取到的是 Event 且是 CapsEvent，并且 caps.media_type ∈ SinkPad.templateCaps
-    // 任一步失败 postMessage(ERROR) 返回 false
-    bool receiveCapsEvent(const std::string& sink_pad_name);
+    // 向每条不同的逻辑 Route 可靠发布一次 EOS。
+    bool sendEOSDownstream();
+
+    // 校验并应用一个从指定 SinkPad Route 收到的完整 CapsEvent，成功后更新 active Caps。
+    // Transform 可传 outputs 收集重配前须先发布的有序输出；调用方完成发布后才 ack Delivery。
+    bool applyCapsEvent(const std::string& sink_pad_name, const CapsEvent& caps,
+                        std::vector<QueueItem>* outputs = nullptr);
 
     // 消息上报：统一上报 MessageBus
     void postMessage(MessageType type, const std::string& text, int code = 0);
@@ -126,7 +121,8 @@ protected:
     Pipeline* pipeline_ = nullptr;
     std::vector<std::unique_ptr<SrcPad>> src_pads_;
     std::vector<std::unique_ptr<SinkPad>> sink_pads_;
-    std::unordered_map<std::string, CapsEvent> negotiated_caps_;
+    // 每个输入 Pad 最近一次成功应用的完整 Caps。它是该 Pad 后续 Buffer 的唯一格式权威。
+    std::unordered_map<std::string, CapsEvent> active_caps_;
     std::atomic<bool> stop_requested_{false};
 
     friend class Pipeline;
@@ -182,15 +178,12 @@ protected:
     explicit SinkNode(const std::string& name) : BaseNode(name) {}
     void runLoop() override;
 
-    // 子类实现：消费一帧数据
+    // 子类实现：消费一帧数据；调用前基类已保证该 SinkPad 存在 active Caps。
     virtual void consume(const Buffer* buf) = 0;
 
-    // 输出侧 drain，默认空实现，子类（如 VideoRenderNode）可重写
+    // 输出侧 drain，默认空实现，子类（如 AudioPlayNode）可重写
     // 收到上游 EOS 之后，上报最终 EOS 前调用，用于等待输出真正完成（如 AudioPlayNode 要等 SDL 设备播完尾音）
     virtual void onDrain() {}
-
-    // 子类可重写：处理事件（默认收到 EOS 时上报 Pipeline）
-    virtual void onEvent(const Event& event);
 };
 
 // ===================================================================
@@ -209,13 +202,18 @@ protected:
 protected:
     void runLoop() override;
 
-    // 子类实现：一个输入，产出 0 到 N 个由 BufferRef 唯一持有的待发布输出
-    // DecodeNode：一个 packet → 0 到 N 帧
-    // EncodeNode：一帧 → 0 到 1 个 packet
-    virtual void process(const Buffer* input, std::vector<BufferRef>& outputs) = 0;
+    // 一个输入映射为有序 Route 项。Caps 必须排在其管辖 Buffer 的前面；EOS flush
+    // 必须把尾帧及其 EOS 都放入同一序列。新建 Buffer 立即由 BufferRef 接管。
+    virtual void process(const Buffer* input, std::vector<QueueItem>& outputs) = 0;
 
-    // 子类可重写：处理事件（默认透传给下游）
-    virtual void onEvent(const Event& event);
+    // 应用一份运行期完整输入 Caps。Decoder 可将重配前必须先发布的 delayed 输出填入 outputs。
+    bool onCaps(const std::string& sink_pad_name, const CapsEvent& caps,
+                std::vector<QueueItem>* outputs) override;
+
+    // 收到输入 EOS 后仅收集仍须发布的有序输出（如 Decode 的 delayed frames）。
+    // 框架 runLoop 无条件在成功返回后向序列末尾追加唯一 EOSEvent，再发布并 ack 输入 EOS。
+    // 子类绝不负责转发或追加 EOSEvent，因而不能遗漏终结事件。
+    virtual void onEOS(std::vector<QueueItem>& outputs) {}
 
     // 支持分叉，新 SrcPad 是已有 SrcPad 的同源多路拷贝，能力集合必须与已有 pad 一致
     // hint_type 只用于校验"这次 link 想承载的类型是否落在已有能力集合内"
@@ -293,7 +291,6 @@ protected:
 
     // 基类统一生命周期（子类不要重写）
     bool onReady() override final;
-    bool onStreamInfo() override final;
     void runLoop() override final;
     void onStop() override final;
 
@@ -366,7 +363,6 @@ protected:
 
     // === 基类统一生命周期（子类不要重写）===
     bool onReady() override final;
-    bool onStreamInfo() override final;
     void runLoop() override final;
     void onStop() override final;
 
@@ -375,7 +371,9 @@ protected:
 
 private:
     // 将 pending 字节作为一个 CONTAINER Buffer 阻塞发送到固定 out_0。
-    void flushPendingOutput();
+    bool flushPendingOutput();
+    bool configureInitialInput(const std::string& pad_name, const CapsEvent& caps);
+    bool writeHeaderAfterAllInputsConfigured();
 
     // 多路复用辅助
     SinkPad* waitAnyPadReady();
@@ -383,11 +381,13 @@ private:
 
     // pad_name -> 具体后端返回的抽象输出流序号，基类不解释该整数
     std::unordered_map<std::string, int> pad_to_stream_;
+    std::unordered_set<std::string> initial_caps_pads_;
 
-    // 已收到 EOS 的输入 Pad。Mux 进入 Running 前保证所有 SinkPad 均已连接。
+    // 已收到 EOS 的输入 Pad。Mux 在每路初始 Caps 后才允许处理其 EOS。
     std::unordered_set<std::string> eos_pads_;
+    bool header_written_ = false;
 
-    // Ready 阶段及格式钩子产生、尚未发给下游的容器字节。
+    // 格式钩子产生、尚未发给下游的容器字节。
     std::vector<uint8_t> pending_output_;
 
     // 多路复用等待

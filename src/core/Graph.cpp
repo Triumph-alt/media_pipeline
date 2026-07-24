@@ -174,7 +174,8 @@ void Graph::cancelAllRoutes() {
 }
 
 bool Graph::ready() {
-    // Ready 尚未启动节点线程；失败时先 cancel Route 唤醒可能的 Caps 等待，再逆拓扑释放资源
+    // Ready 只建立不依赖上游格式的后端资源。CapsEvent 在 Running 中与 Buffer/EOS
+    // 共用同一条 Route，因此格式配置和数据边界只有一套有序语义。
     auto rollbackReady = [this](size_t failed_index) {
         cancelAllRoutes();
         for (size_t n = failed_index + 1; n > 0; --n) {
@@ -182,14 +183,8 @@ bool Graph::ready() {
         }
     };
 
-    // 拓扑顺序保证上游先 publish Caps，下游随后 acquire/校验该 Caps
     for (size_t i = 0; i < topo_order_.size(); ++i) {
-        auto* node = topo_order_[i];
-        if (!node->onReady()) {
-            rollbackReady(i);
-            return false;
-        }
-        if (!node->onStreamInfo()) {
+        if (!topo_order_[i]->onReady()) {
             rollbackReady(i);
             return false;
         }

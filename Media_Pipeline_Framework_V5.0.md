@@ -12,7 +12,7 @@
 - **节点自由组合**：用户随意连接节点，框架负责协商、调度、数据流转，用户不感知内部细节
 - **Pad 一对一，分叉靠多 Pad**：每个 Pad 严格连接一个对端 Pad，分叉通过节点动态创建多个 SrcPad 实现
 - **逻辑流即 Route**：每条逻辑输出流拥有一个有界多订阅者 Route；Edge 持有独立 Subscription，速率差由 Route 保留窗口吸收
-- **两阶段 Caps 协商**：Build 时静态类型检查，Ready 时动态参数传递，不兼容连接在构建期即报错
+- **Build 静态能力 + Running 有序 Caps**：Build 时只检查 MediaType；Running 中 CapsEvent 是完整格式配置边界，不兼容的格式字段由实际消费者在使用点报错
 - **线程归 Pipeline 管**：节点不持有线程，Pipeline 统一创建和销毁所有节点线程
 
 ### 1.3 依赖
@@ -30,8 +30,10 @@
 - 不支持硬件编解码加速（VAAPI / V4L2 M2M）
 - 不支持 DMA-BUF 零拷贝（Buffer 第一阶段全部拷贝）
 - 不支持动态插件加载（.so）
-- 不支持运行时格式变化（CapsEvent 只在 Ready 阶段传递一次）
 - 不支持 Windows / macOS，VideoRenderNode 的 SDL 视频线程模型只面向 Linux / 嵌入式 Linux
+- 不支持 PTS discontinuity、Caps generation 和通用采集 Source 的运行期 Caps 生产模型；这些需要结合 V4L2/音频采集的设备协商语义单独设计
+- 不支持 VIDEO_RAW 的非 YUV420P/YUVJ420P 渲染；VideoRenderNode 当前明确拒绝该类 Caps，swscale 路径后续实现
+- **Mux Header 冻结合同**：所有输入初始 encoded Caps 到齐后建立 Header 并固定 Pad→输出 stream 映射；同一输入 Pad 后续出现 encoded CapsEvent 是协议错误，必须拒绝
 
 ### 1.5 典型链路示例
 
@@ -120,11 +122,11 @@ SourceNode ──publish once──→ [OutputRoute]
 
 Buffer 是框架内所有数据的载体，拥有独立的引用计数体系，与 FFmpeg 的 AVFrame / AVPacket 解耦。节点从 FFmpeg 结构中拷贝数据填入 Buffer 后，立即释放原始 FFmpeg 结构。
 
-BufferMeta 中部分基础格式字段与 CapsEvent 重复，**下游初始化以 Ready 阶段 CapsEvent 为准**，BufferMeta 则更多的是随每个 Buffer 携带 packet/frame 级属性，例如 EncodedMeta::flags、AudioRawMeta::nb_samples。同时此字段也为后续运行时格式变化（STREAM_INFO_CHANGED）预留，届时逐帧携带格式信息可处理同一流中途切换分辨率/采样率等场景
+`CapsEvent` 是流格式的唯一权威，并作为 Running 阶段 Route 中有位置的配置边界：每份 Caps 必须完整、准确地解释其后、至下一份 Caps 前的所有 Buffer。BufferMeta 不重复流级格式，只保留逐 Buffer 变化的事实与存储布局：例如 EncodedMeta::flags、AudioRawMeta::nb_samples；当前紧密连续 VideoRaw Buffer 没有额外的逐帧 layout。Buffer 在任何 active Caps 之前到达，或其 media_type 与 active Caps 不一致，都是协议错误。
 
-Buffer 层只忠实承载 FFmpeg 时间戳：pts/dts 无效时保留 AV_NOPTS_VALUE，duration 无效时为 0，不在此处推算时间；stream_index/pos/side_data 当前不进入 Buffer：流身份由 SrcPad/Edge 表达，seek/HDR/rotation/SEI 等后续单独设计
+Buffer 层只忠实承载 FFmpeg 时间戳：pts/dts 无效时保留 AV_NOPTS_VALUE，duration 无效时为 0，不在此处推算时间；stream_index/pos/side_data 当前不进入 Buffer：流身份由 SrcPad/Edge 表达，seek/HDR/rotation/SEI 等后续单独设计。
 
-AudioRaw Buffer 保持 FFmpeg sample_fmt 对应的原始布局；planar 数据按 plane 顺序拼接，下游通过 sample_fmt/channels/nb_samples 解释
+AudioRaw Buffer 保持 FFmpeg sample_fmt 对应的原始布局；planar 数据按 plane 顺序拼接，消费者使用 active AudioRaw Caps 的 sample_fmt/channel_layout 和逐 Buffer 的 nb_samples 解释。
 
 ```cpp
 enum class MediaType {
@@ -136,26 +138,15 @@ enum class MediaType {
 };
 
 struct VideoRawMeta {
-    int           width, height;
-    AVPixelFormat pix_fmt;
-    // framerate 不存在这里，由 fromAVFrame() 的参数传入用于计算 duration，
-    // meta 本身只保留这一帧的固有属性
+    // 当前由 fromAVFrame() 生成紧密连续存储；流格式由 active VIDEO_RAW Caps 描述。
 };
 
 struct AudioRawMeta {
-    int             sample_rate;
-    int             channels;
-    int             nb_samples;
-    AVSampleFormat  sample_fmt;
+    int nb_samples;   // 逐帧属性；采样率、sample_fmt、channel_layout 属于 active Caps
 };
 
 struct EncodedMeta {
-    AVCodecID              codec_id;
-    int                    width, height;       // 视频
-    int                    sample_rate;         // 音频
-    int                    channels;            // 音频
-    int                    flags;               // AVPacket flags，如 AV_PKT_FLAG_KEY
-    std::vector<uint8_t>   extradata;           // SPS/PPS 等
+    int flags;        // 逐 Packet 属性；codec、extradata、流参数属于 active Caps
 };
 
 using BufferMeta = std::variant<VideoRawMeta, AudioRawMeta, EncodedMeta>;
@@ -214,7 +205,16 @@ private:
 
 ### 3.2 Caps（能力描述）
 
-Caps 分两种：TemplateCaps 是节点在定义时静态声明的能力范围（Build 阶段用于类型检查），CapsEvent 是运行时携带真实参数的动态事件（Ready 阶段顺流传递）。
+Caps 分两种：TemplateCaps 是节点在定义时静态声明的能力范围，只在 Build 阶段用于 MediaType 兼容性检查；CapsEvent 是 Running 阶段在 Route 中有序传递的真实流配置边界。
+
+Caps 字段是否足够由真正使用它的生产者或消费者在自己的边界判断：例如 Decode 至少需要 encoded 的 codec_id，VideoRender 需要 RAW 视频的 width/height/pix_fmt，AudioPlay 需要 RAW 音频的 sample_rate/sample_fmt/受支持 channel_layout，具体 Mux 后端可对写 Header 所需参数再作容器特定校验
+
+需要注意的是，**CapsEvent 完整并不代表着所有字段非零**，正确的定义应该是**该 MediaType 的消费者为了配置自己、正确解释后续 Buffer 所必需的字段都已存在且准确**。而"必需字段集"是逐 MediaType 不同的:
+- RAW 视频: 没有 w/h/pix_fmt 消费者连 Buffer 的字节都读不了，所以 RAW 视频要求 w>0/h>0/pix_fmt 天经地义。(RAW 视频没要求 framerate,因为它只影响 duration、不影响布局)
+- ENCODED 视频:解码器根本不依赖 caps 里的 w/h。H.264/HEVC 的尺寸在码流的 SPS/VPS 里,avcodec_open2 时 ctx_->width=0 完全合法,解码器解出第一帧时自己从 SPS 填出真实尺寸，所以对 encoded 视频,codec_id 才是唯一普遍必需的字段(挑哪个解码器);w/h 只是描述性提示
+所以 **CapsEvent 完整”是指它对于特定节点，特定场景下就是一个完整的格式表达，能够完整的解释后续 Buffer 所必须的格式**，未知的 encoded 提示字段不是传输层错误，这也**绝对不等同于 best-effort**
+
+`VIDEO_ENCODED.framerate` 保留为 Demux 提供给 Decode 的 nominal timing hint，当前用于推导输出视频 Buffer 的 duration。它不属于 payload 格式，不传播到 VIDEO_RAW Caps，不参与 `hasSameFormat()`，其单独变化不构成 Caps 配置边界。
 
 ```cpp
 // 静态能力描述：只声明能接受/产出的 MediaType 集合
@@ -235,26 +235,48 @@ struct TemplateCaps {
     }
 };
 
-// 动态参数事件：携带运行时确定的真实参数
+// 可复制的框架声道布局值类型；转换到 FFmpeg 时临时 materialize AVChannelLayout。
+struct ChannelLayout {
+    AVChannelOrder order = AV_CHANNEL_ORDER_UNSPEC;
+    int channels = 0;
+    uint64_t mask = 0;
+    std::vector<AVChannel> custom_order;
+
+    static bool fromAV(const AVChannelLayout& source, ChannelLayout* out);
+    bool toAV(AVChannelLayout* out) const;
+    bool isValid() const;
+};
+
+// Running Route 中有位置的真实流配置边界
 struct CapsEvent {
-    MediaType   media_type;
-    // 视频字段
-    int         width       = 0;
-    int         height      = 0;
-    AVPixelFormat pix_fmt   = AV_PIX_FMT_NONE;
-    AVRational  framerate   = {0, 1};
-    // 音频字段
-    int         sample_rate = 0;
-    int         channels    = 0;
+    MediaType media_type;
+
+    // VIDEO_RAW / VIDEO_ENCODED 的 payload 格式字段
+    int width = 0;
+    int height = 0;
+    AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
+
+    // VIDEO_ENCODED 的 nominal timing hint；Decode 仅用它推导输出 Buffer duration。
+    // 它不是格式字段，不传播到 VIDEO_RAW Caps，也不参与 hasSameFormat()。
+    AVRational framerate = {0, 1};
+
+    // AUDIO_RAW / AUDIO_ENCODED
+    int sample_rate = 0;
     AVSampleFormat sample_fmt = AV_SAMPLE_FMT_NONE;
-    // 编码字段（encoded 类型时有效）
-    AVCodecID   codec_id    = AV_CODEC_ID_NONE;
-    std::vector<uint8_t> extradata;   // SPS/PPS 等
+    ChannelLayout channel_layout;
+
+    // VIDEO_ENCODED / AUDIO_ENCODED
+    AVCodecID codec_id = AV_CODEC_ID_NONE;
+    std::vector<uint8_t> extradata;
+
+    // 比较同一 MediaType 下的 Caps 声明值；不替代节点自己的重配决策。
+    bool hasSameFormat(const CapsEvent& other) const;
 };
 ```
 
-+ isCompatibleWith 函数检验两端 TemplateCaps 是否有交集，Graph::link 阶段使用
-+ contains 函数检验某具体类型是否属于本能力集合，主要是 requestPad 里做"hint_type 是否落在已有 pad 能力集合内"的分叉检查，以及 send/receiveCapsEvent 里做"CapsEvent.media_type 是否落在 pad 能力集合内"的校验
++ `isCompatibleWith` 检验两端 TemplateCaps 是否有交集，Graph::link 阶段使用。
++ `contains` 检验具体 MediaType 是否落在 Pad 能力集合内，用于 requestPad 的 hint_type 校验和 Running Caps 经过 Pad 时的类型校验。
++ `hasSameFormat` 只比较同一 MediaType 下需要重新解释 payload 或重配节点的字段：VIDEO_RAW 比较 width/height/pix_fmt，AUDIO_RAW 比较 sample_rate/sample_fmt/channel_layout，VIDEO_ENCODED 比较 codec_id/width/height/extradata，AUDIO_ENCODED 比较 codec_id/sample_rate/channel_layout/extradata。VIDEO_ENCODED 的 framerate 是 duration 推导 hint，不参与比较；该函数不决定任何节点是否必须重配。
 
 ### 3.3 Event（事件）
 
@@ -332,10 +354,10 @@ struct Edge {
 
 Pad 承载两层类型信息：
 
-- **`template_caps_`（TemplateCaps，能力集合，静态）**：构造 / requestPad 时确立，声明"本 pad 可承载的 MediaType 集合"。Build 阶段 `Graph::link` 用它做粗粒度的交集兼容性检查。
-- **`actual_type_`（optional<MediaType>，实际类型，动态）**：Ready 阶段 CapsEvent 流经 pad 时由 `BaseNode::sendCapsEvent` / `receiveCapsEvent` 内部设置，代表本 pad 实际承载的具体类型。Ready 之前查询得 `nullopt` 是契约的一部分；Ready 之后所有已连接 pad 的 `actualType()` 必有值。
+- **`template_caps_`（TemplateCaps，能力集合，静态）**：构造 / requestPad 时确立，声明“本 Pad 可承载哪些 MediaType”。Build 阶段 `Graph::link` 只用它做交集兼容性检查。
+- **`actual_type_`（optional<MediaType>，实际类型，运行期冻结）**：Ready 前及 Running 中首份 Caps 到达前为 `nullopt`。首份 Caps 通过 TemplateCaps 校验后选定本次运行中该 Pad/逻辑 Route 实际承载的 MediaType，并在后续生命周期内保持不变；后续 Caps 只能在该固定 MediaType 内更新格式字段，跨 MediaType 是协议错误。后续 Buffer 的完整格式解释始终以该输入 Pad 最近成功应用的 active Caps 为准。
 
-两者严格分层：`template_caps_` 是能力声明，`actual_type_` 是运行时事实。runLoop 阶段的类型分发一律读 `actualType()`，绝不把能力集合的其中某一个成员单独作为"实际类型"来使用
+两者严格分层：`template_caps_` 是能力声明，`actual_type_` 是首份 Caps 选定并冻结的运行期事实。运行中的类型分发只能读 `actualType()`，不得从 TemplateCaps 中任选一个类型冒充实际类型。
 
 ```cpp
 enum class PadDir { SRC, SINK };
@@ -363,17 +385,16 @@ protected:
     friend class Graph;  // Graph::link 里写 edge_
 
 private:
-    // actual_type 的唯一设值时机就是 BaseNode 的 send/receiveCapsEvent 内部，CapsEvent 流经 pad 且通过 TemplateCaps 校验时
-    // 其他任何路径（子类节点、Graph、requestPad 等）都不得直接设置
+    // BaseNode 仅在首份 Caps 选定实际类型时写入；之后该值冻结。
     void setActualType(MediaType t) { actual_type_ = t; }
 
     std::optional<MediaType> actual_type_;
 
-    friend class BaseNode;  // 仅为 send/receiveCapsEvent 授权设置 actual_type_
+    friend class BaseNode;
 };
 ```
 
-此处 `setActualType` 设计为 private + friend BaseNode，是因为 actual_type 的唯一合法写入路径就是 BaseNode 的 send/receiveCapsEvent，所以此处通过代码组织让契约在源码层面可见
+`setActualType` 为 private + friend BaseNode：首份 Caps 通过 TemplateCaps 校验后，由 BaseNode 将对应 Pad/逻辑 Route 的实际 MediaType 选定并冻结。后续 Caps 只能先比对该固定值是否相同；不得通过新 Caps 改写 actualType。
 
 ### 4.2 SrcPad
 
@@ -420,31 +441,30 @@ protected:
 
     // === 子类实现的生命周期回调 ===
 
-    // Ready 阶段第一步：初始化自身资源
-    // 返回 true 表示成功，false 表示失败（失败时应先往 MessageBus 发 ERROR 消息）
+    // Ready 阶段：只初始化不依赖上游格式的资源。
     virtual bool onReady() = 0;
 
-    // Ready 阶段：发送/接收 CapsEvent（Route 已在 build 时 seal）
-    // 返回 true 表示成功，false 表示失败
-    virtual bool onStreamInfo() { return true; }
-
-    // 节点停止或 Ready 回滚时释放资源；必须支持部分初始化状态
+    // 节点停止或 Ready 回滚时释放资源；必须支持部分初始化状态。
     virtual void onStop() = 0;
 
-    // === 子类的运行循环（由 Pipeline 创建的线程调用）===
-    virtual void runLoop() = 0;
+    // Running 阶段收到完整输入 Caps 时调用；成功后 BaseNode 才更新 active Caps。
+    // Transform 可向 outputs 加入重配前必须先发布的 delayed 输出；Sink 传 nullptr。
+    virtual bool onCaps(const std::string& sink_pad_name, const CapsEvent& caps,
+                        std::vector<QueueItem>* outputs) { return true; }
 
-    // === 基类统一的数据分发（子类调用，不感知下游数量）===
+    // === 基类统一的数据分发 ===
+    // QueueItem 是唯一有序发布项：Buffer、Caps、EOS 使用同一入口。
+    bool publishOutputItem(QueueItem&& item, const std::string& src_pad_name = "");
     bool pushToDownstream(BufferRef&& buf, const std::string& src_pad_name = "");
-
-    // 每条不同的逻辑 Route 只 publish 一次 EOS；同一 Route 的所有订阅者各自 acquire/ack
-    void sendEOSDownstream();
-
-    // 将 CapsEvent 向指定 SrcPad 所属 Route 可靠 publish 一次
     bool sendCapsEvent(const std::string& src_pad_name, const CapsEvent& caps);
+    bool sendEOSDownstream();
 
-    // 从指定 SinkPad acquire、校验并 ack CapsEvent
-    bool receiveCapsEvent(const std::string& sink_pad_name);
+    // 校验 media_type、调用 onCaps，成功后将 Caps 写入指定 SinkPad 的 active Caps。
+    bool applyCapsEvent(const std::string& sink_pad_name, const CapsEvent& caps,
+                        std::vector<QueueItem>* outputs = nullptr);
+
+    // === 节点工作循环（由 Pipeline 创建的线程调用）===
+    virtual void runLoop() = 0;
 
     // 动态创建 Pad（节点构造时声明固定 Pad 时调用，子类构造函数里直接调用）
     SrcPad*  addSrcPad(const std::string& name, TemplateCaps caps);
@@ -467,9 +487,8 @@ protected:
     Pipeline*                                pipeline_ = nullptr;
     std::vector<std::unique_ptr<SrcPad>>     src_pads_;
     std::vector<std::unique_ptr<SinkPad>>    sink_pads_;
-    // 收到的 CapsEvent（key: SinkPad 名字，value: 从上游收到的 CapsEvent）
-    // 非源节点在 onStreamInfo() 中从 RouteSubscription acquire、校验并 ack 后存入
-    std::unordered_map<std::string, CapsEvent> negotiated_caps_;
+    // 每个 SinkPad 最近一次成功应用的完整 Caps，是其后续 Buffer 的唯一格式权威。
+    std::unordered_map<std::string, CapsEvent> active_caps_;
     std::atomic<bool>                     stop_requested_{false};
 
     friend class Pipeline;
@@ -478,113 +497,53 @@ protected:
 ```
 
 几点注意事项：
-1. 所有具体节点子类必须在初始化列表里调用 BaseNode 构造函数，将 name 传给 name_，因为 BaseNode 节点没有默认构造函数，所以子类忘记调用会直接编译报错，这样子就不会出现某个节点忘记设置名字导致 name_ 是空字符串的情况
-2. 子类的 onReady 函数具体实现取决于自身需要，比如 Source/DemuxNode 就是打开设备/文件，探测流信息，但不发送 CapsEvent；Transform/SinkNode 只做基础初始化，因为此时尚未收到 CapsEvent，还无法确定具体的参数
-3. 子类的 onStreamInfo 函数具体实现也是取决于自身需要，比如 Source/DemuxNode 就是构造并发送 CapsEvent；Transform/SinkNode 收到上游 CapsEvent 后初始化处理器，再发出自己的 CapsEvent；默认实现返回 true；Sink 节点无需发送
-4. `pushToDownstream` 向一个逻辑 OutputRoute 可靠 publish 一次；同源多个 SrcPad 共享 Route，因此节点不再逐 Pad 分发，也不存在“单路阻塞、多路 tryPush”的分支。不同逻辑流（例如 Demux video/audio）必须显式选择各自 Route。
-5. `pushToDownstream(BufferRef&&)` 是唯一 Buffer 发布入口：调用方必须显式 `std::move`，入口立即接管该引用。publish 成功时引用进入 Route Entry；Route 缺失、输出歧义、无订阅或 cancel 等失败路径同样由入口内 RAII 释放。框架不保留拥有型 `Buffer*` 发布重载。
+1. 所有具体节点子类必须在初始化列表里调用 BaseNode 构造函数，将 name 传给 name_；BaseNode 没有默认构造函数，遗漏会直接编译失败。
+2. `onReady()` 只初始化不依赖输入格式的资源：例如 Demux 打开并探测文件，AudioPlay 建立固定 canonical SDL 提交端，Mux 建立容器上下文；不得在此阶段收发 Caps。
+3. `onCaps()` 在对应节点的 Running worker 内串行执行。生产者必须先发布完整 Caps，再发布受其管辖的 Buffer；消费者只有 `onCaps()` 成功后才 ack 该 Caps Delivery 并更新 active Caps。首份 Caps 同时选定 actualType；后续 Caps 只能在该固定 MediaType 内更新格式字段。
+4. `publishOutputItem()` 是唯一有序发布入口，负责 Route 定位、首份 Caps 的 TemplateCaps 类型校验、后续 Caps 的 actualType 一致性校验、Route 容量选择，以及 `QueueItem` 的 RAII 所有权转移。传输层不判断字段是否足够解释流格式。
+5. `pushToDownstream(BufferRef&&)` 是 Buffer 的便捷发布入口：调用方显式 `std::move` 交出引用；成功时引用进入 Route Entry，Route 缺失、输出歧义、无订阅或 cancel 等失败路径同样由入口内 RAII 释放。
 6. Route Entry 只保存一份共享只读 BufferRef；每个订阅者 acquire 时复制句柄、引用计数加一，不复制 payload。所有订阅者 ack 后 Entry 才回收，最后一个 BufferRef 析构后底层 Buffer 才释放。
-7. `sendCapsEvent` 与 `receiveCapsEvent` 是 Ready 阶段 CapsEvent 收发的标准封装：发送端校验同一 Route 上所有 Pad 的 TemplateCaps、设置 actualType 并只 publish 一次；接收端 acquire、校验、存入 negotiated_caps_ 后 ack。校验失败会 postMessage(ERROR)，未完成 Delivery 不推进游标，Ready 回滚随后 cancel 全部 Route。
-    + 同一逻辑 Route 的多个 SrcPad 共享一条 Caps 序列，`sendCapsEvent` 通过任一该 Route 的 src_pad_name 定位后只 publish 一次；接收方分别通过各自 Subscription acquire/ack
-    + `receiveCapsEvent` 失败场景包括 Route cancel、取得的不是 CapsEvent、或 caps.media_type 不属于 SinkPad.templateCaps
-8. 动态请求 Pad 只在 link 时，目标 Pad 不存在时调用，节点构造时已声明的固定 Pad（比如 TransformNode 的 "in"）不走这条路，link 会优先查找已存在的 Pad，只有当 Pad 不存在时，才调用这两个方法，由节点自己决定是否允许动态创建、创建出来的 Pad 应该是什么类型。**需要支持分叉的节点（Source/Transform 的多路输出）和多路输入的节点（DemuxNode、MuxNode）一定需要重写对应的方法**。requestPad 有两种不同的语义模型，各自对应不同的 TemplateCaps 处理方式：
+7. `sendCapsEvent()` 只定位指定的已连接逻辑 Route，随后委托 `publishOutputItem()` 对整条共享 Route 执行首份 TemplateCaps 校验或后续 actualType 冻结校验；`applyCapsEvent()` 对 SinkPad 执行同样的首份选择/后续比对，并把字段充分性判断委托给节点 `onCaps()`。Buffer 在 active Caps 之前到达，或 media_type 与 active Caps 不一致，节点必须 postMessage(ERROR)。
+8. 动态请求 Pad 只在 link 时，目标 Pad 不存在时调用，节点构造时已声明的固定 Pad（比如 TransformNode 的 "in"）不走这条路，固定 Pad 优先命中，只有当 Pad 不存在时，才调用这两个方法，节点决定是否允许创建以及新 Pad 的 TemplateCaps。**需要支持分叉的节点（Source/Transform 的多路输出）和多路输入的节点（DemuxNode、MuxNode）一定需要重写对应的方法**。requestPad 有两种不同的语义模型，各自对应不同的 TemplateCaps 处理方式：
     + Source / Transform 分叉：属于再多一路同源输出，新 pad 的 TemplateCaps 必须和已经存在的 pad 的 TemplateCaps 一致，其最终的 ActualType 自然也落在已有 pad 的能力集合内，因为这种情况本质是同一份处理结果的多路拷贝，所以一个 SourceNode/TransformNode 内所有 SrcPad 的能力声明应当一致，所有 SinkPad 的能力声明应当一致
     + Demux / Mux 多路：属于开一路服务 hint_type 的具体流端口，新 pad 的 TemplateCaps 就是 `{hint_type}`，一个 pad 服务一种流身份。因为在 Demux/Mux 这种节点中，每个 SinkPad 对应容器里一路流，各 pad 天然可能会承载不同类型
-9. requestPad 中的 hint_type **只用于 Ready 之前的能力校验与决定新 pad 的 TemplateCaps，不代表"实际类型 actual_type"**。实际类型由 Ready 阶段的 CapsEvent 敲定，requestPad 不应调用 `setActualType` 直接设置 actual_type，哪怕传入的 hint_type 和事后敲定的最终类型一致
-10. requestPad 会立即把新 Pad 加入节点，因此 `Graph::link` 后续任一步失败都需要调用 `releaseSrcPad` / `releaseSinkPad` 撤销本次新建 Pad，如果有附属状态的节点必须同步清理，例如 DemuxNode release SrcPad 时同时删除 `pad_to_type_` 项
+9. requestPad 的 hint_type 仅用于 Build 前的能力校验和决定新 Pad 的 TemplateCaps，不代表 actual_type；不得直接设置 actual_type。
+10. requestPad 会立即把新 Pad 加入节点，Graph::link 后续任一步失败都必须 release 本次 request 创建且尚未连接的 Pad；有附属状态的节点同步清理，例如 DemuxNode 的 pad_to_type_。
 
 
 ### 5.2 SourceNode
 
-```cpp
-class SourceNode : public BaseNode {
-public:
-    NodeType nodeType() const override { return NodeType::SOURCE; }
+`SourceNode` 的当前 `capture() -> Buffer*` 默认骨架只能表达 `Buffer* → EOS`，早于 Running Caps 协议，不能独自表达 `Caps → Buffer* → Caps → Buffer*`。本地播放器的 `DemuxNode` 不使用该默认骨架，而是在自己的 worker 中先发布探测到的 encoded Caps。
 
-protected:
-    explicit SourceNode(const std::string& name) : BaseNode(name) {}
-    void runLoop() override {
-        while (!stop_requested_.load()) {
-            // 子类实现：阻塞采集一帧数据
-            auto* buf = capture();
-            if (!buf) {
-                // EOF：发送 EOS 给所有下游
-                sendEOSDownstream();
-                break;
-            }
-            // 基类统一分发，子类不感知下游数量
-            pushToDownstream(buf);
-        }
-    }
+通用采集源尚未落地；V4L2/AudioCapture 接入时必须先根据设备协商、重配和运行期格式变化语义，设计能够生产有序 `QueueItem` 的 Source 抽象。此项在“已知问题与后续优化”中单独保留，当前不得把默认 `capture()` 骨架用于连接要求 Running Caps 的新节点。
 
-    // 子类实现：阻塞采集，返回 nullptr 表示 EOF
-    virtual Buffer* capture() = 0;
+需要注意的是用户可能对同一路输出连接多个下游，比如采集到的画面可以一路直接本地预览，一路编码之后传输，甚至可以有别的路用来作别的格式的编码或者其他的处理，**所以 SourceNode 的 requestSrcPad 需要重写，需要支持分叉**
 
-    // 需要重写，需要支持分叉
-    SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override {
-        if (!src_pads_.empty()) {
-            const auto& existing = src_pads_[0]->templateCaps();
-            if (!existing.contains(hint_type)) {
-                return nullptr;
-            }
-            return addSrcPad(name, existing);   // 复制完整能力集合
-        }
-        // 首个 pad：从 hint_type 建立最初的能力集合
-        return addSrcPad(name, TemplateCaps{{hint_type}});
-    }
-};
-```
-
-需要注意的是用户可能对同一路输出连接多个下游，比如采集到的画面可以一路直接本地预览，一路编码之后传输，甚至可以有别的路用来作别的格式的编码或者其他的处理，**所以 SourceNode 的 requestSrcPad 需要重写，需要支持分叉**，如果`Graph::link` 发现目标 SrcPad 不存在，会调用这里创建
 在 SourceNode 下，新 SrcPad 是已有 SrcPad 的同源多路拷贝，所以能力集合必须和已有 pad 的保持一致，hint_type 只用于校验"这次 link 想承载的类型是否在已有能力集合内"，不参与 TemplateCaps 的构造
 
 
 ### 5.3 SinkNode
 
-SinkNode 的默认工作循环以 `RouteDelivery` 为处理和提交边界：
+SinkNode 在自己的 Route worker 内按序处理 Caps、Buffer、EOS：
 
-```cpp
-class SinkNode : public BaseNode {
-protected:
-    void runLoop() override {
-        auto* sink_pad = sink_pads_[0].get();
-        while (!stop_requested_.load()) {
-            auto delivery = sink_pad->acquireBlocking();
-            if (!delivery) {
-                break;  // Route cancel 唤醒
-            }
+```text
+CapsEvent
+→ applyCapsEvent()：校验 Pad MediaType → Sink::onCaps() → 成功后写 active Caps → ack
 
-            const QueueItem& item = delivery->item();
-            if (std::holds_alternative<BufferRef>(item)) {
-                consume(std::get<BufferRef>(item).get());
-                // consume 完成且节点未停止后才提交 ack。
-                if (stop_requested_.load() || !delivery->ack()) {
-                    break;
-                }
-                continue;
-            }
+BufferRef
+→ 必须已有 active Caps，且 Buffer.media_type 与其一致
+→ consume(Buffer)
+→ consume 成功且未停止后 ack
 
-            Event event = std::get<Event>(item);
-            if (std::holds_alternative<EOSEvent>(event)) {
-                // EOS 先 ack，再向 Pipeline 报告 Sink 完成。
-                if (!delivery->ack()) {
-                    break;
-                }
-                onEvent(event);
-                continue;
-            }
-
-            onEvent(event);
-            if (stop_requested_.load() || !delivery->ack()) {
-                break;
-            }
-        }
-    }
-
-    virtual void consume(const Buffer* buf) = 0;
-    virtual void onEvent(const Event& event);
-};
+EOSEvent
+→ ack（先释放上游 Route）
+→ onDrain()
+→ 未停止时 postMessage(EOS)
 ```
+
+`consume()` 因而只会收到已被最近成功应用的 active Caps 完整解释的 Buffer。格式字段是否足够由该 Sink 的 `onCaps()` 判断；例如 VideoRender 要求 YUV420P/YUVJ420P 的 width/height/pix_fmt，AudioPlay 要求完整且受支持的 AUDIO_RAW 参数。Caps 应用失败或 Buffer 违反顺序/类型合同都不 ack 当前 Delivery，由 RAII 撤销 in-flight 状态，随后通过 ERROR/stop 统一取消。
+
+`onDrain()` 默认为空；AudioPlay 重写它以等待 swr/SDL/设备尾音，VideoRender 保持默认实现。
 
 Buffer 必须在处理完成后才 ack；停止或处理失败时不 ack 当前 Delivery，由 Delivery 的 RAII 析构撤销 in-flight 状态。EOS 在 ack 后才上报 Sink 完成，Route cancel 负责唤醒阻塞中的 `acquireBlocking()`
 
@@ -600,8 +559,8 @@ Buffer 必须在处理完成后才 ack；停止或处理失败时不 ack 当前 
 - 本方案依赖 SDL3 在非 Apple 平台将首次调用 SDL_InitSubSystem(SDL_INIT_VIDEO) 的线程视为 SDL 视频主线程，macOS 暂不适用；未来若支持 Apple 平台，需改用符合平台主线程约束的执行模型
 
 生命周期：
-- Ready 阶段只接收并保存上游 `CapsEvent`，不初始化 SDL 视频子系统，也不创建 Window、Renderer 或 Texture
-- 由于初始化延迟到 Running，SDL 视频资源创建失败无法参加 Ready 阶段的事务性回滚，只能在 Running 阶段由节点通过 `postMessage(ERROR)` 上报
+- Ready 阶段不依赖上游 Caps，只保留空的格式状态；不初始化 SDL VIDEO，也不创建 Window、Renderer 或 Texture
+- Running 中收到 VIDEO_RAW Caps 时，校验完整 width/height/pix_fmt，当前仅接受紧密 YUV420P/YUVJ420P；若已有 Texture 尺寸不匹配则销毁，下一帧按新 Caps 创建
 - 进入 Running 后，工作线程按如下顺序完成资源管理与渲染（`SDL_InitSubSystem(SDL_INIT_VIDEO)`）：
   - SDL_Window / SDL_Renderer 创建
   - 消费 VIDEO_RAW Buffer，创建或更新 SDL_Texture
@@ -630,76 +589,33 @@ SDL 事件处理：
 
 ### 5.4 TransformNode
 
-TransformNode 基类不自动创建 SinkPad；具体 Transform 子类必须在构造函数中声明唯一 SinkPad（通常命名为 `"in"`），并给出自己的输入 TemplateCaps。`runLoop()` 以 `sink_pads_[0]` 作为驱动输入。
+TransformNode 有一个输入 Pad 和动态 SrcPad。其 worker 在同一输入 Route 中串行处理三类 `QueueItem`：
 
-```cpp
-class TransformNode : public BaseNode {
-public:
-    NodeType nodeType() const override { return NodeType::TRANSFORM; }
+```text
+CapsEvent
+→ applyCapsEvent(in, caps, outputs)
+→ 子类 onCaps 可把“旧格式必须先发出的 delayed 输出”填入 outputs
+→ 按顺序发布 outputs
+→ ack 输入 Caps
 
-protected:
-    explicit TransformNode(const std::string& name) : BaseNode(name) {}
-    void runLoop() override {
-        auto* sink_pad = sink_pads_[0].get();
-        std::vector<BufferRef> outputs;   // 复用容量；元素负责持有尚未发布的输出
-        while (!stop_requested_.load()) {
-            auto delivery = sink_pad->acquireBlocking();
-            if (!delivery) break;
+BufferRef
+→ 要求已有 active Caps 且 media_type 匹配
+→ process(input, outputs)
+→ 按顺序发布 outputs
+→ ack 输入 Buffer
 
-            const QueueItem& item = delivery->item();
-            if (std::holds_alternative<BufferRef>(item)) {
-                outputs.clear();
-                process(std::get<BufferRef>(item).get(), outputs);
-                if (stop_requested_.load()) break;
-
-                bool outputs_published = true;
-                for (auto& out : outputs) {
-                    if (!pushToDownstream(std::move(out))) {
-                        outputs_published = false;
-                        break;
-                    }
-                }
-                if (!outputs_published) break;
-            } else if (std::holds_alternative<Event>(item)) {
-                onEvent(std::get<Event>(item));
-                if (stop_requested_.load()) break;
-            }
-
-            if (!delivery->ack()) break;
-        }
-    }
-
-    // 子类实现：一个输入，产出 0 到 N 个由 BufferRef 持有的待发布输出
-    // 调用前 outputs 已 clear；子类得到新 Buffer 后立即 emplace 到 outputs
-    // DecodeNode：一个 packet → 0 到 N 帧
-    // EncodeNode：一帧 → 0 到 1 个 packet
-    virtual void process(const Buffer* input, std::vector<BufferRef>& outputs) = 0;
-
-    virtual void onEvent(const Event& event) {
-        if (std::holds_alternative<EOSEvent>(event)) {
-            sendEOSDownstream();
-            return;
-        }
-
-        postMessage(MessageType::ERROR,
-                    "CapsEvent received in runLoop; transform nodes must consume CapsEvent in onStreamInfo");
-    }
-
-    // 支持分叉，需要重写函数
-    SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override {
-        if (!src_pads_.empty()) {
-            const auto& existing = src_pads_[0]->templateCaps();
-            if (!existing.contains(hint_type)) {
-                return nullptr;
-            }
-            return addSrcPad(name, existing);   // 复制完整能力集合
-        }
-        return addSrcPad(name, TemplateCaps{{hint_type}});
-    }
-};
+EOSEvent
+→ onEOS(outputs) 只收集 delayed Caps/Buffer
+→ 基类无条件在 outputs 末尾追加唯一 EOSEvent
+→ 按顺序发布 outputs
+→ ack 输入 EOS，退出循环
 ```
 
-在 TransformNode 下，requestSrcPad 也要支持分叉，比如编码后用户完全可以一路推流，一路本地存储，语义与 SourceNode 的 requestSrcPad 是基本一致的，新 SrcPad 是已有 SrcPad 的同源多路拷贝，能力集合必须一致，`hint_type` 只是用于校验"这次 link 想承载的类型是否在已有能力集合内"
+`outputs` 的类型是拥有型 `std::vector<QueueItem>`，因此普通处理、Caps 重配 drain、Decoder EOS flush 和唯一终结 EOS 都经过同一个 RAII 发布边界。新 Buffer 必须立刻置入 `BufferRef`；stop 或 cancel 令发布中断时，已发布项由 Route 管理，失败项和未遍历尾项由 outputs 自动释放。
+
+默认 `TransformNode::onCaps()` 是格式保留：将收到的 Caps 原样加入 outputs。DecodeNode 覆盖它：输入 encoded Caps 到达时先 drain 旧 decoder、重建上下文；真实 `AVFrame` 到达时才在该帧之前生成完整 RAW Caps。子类 `onEOS()` 不得追加或转发 EOSEvent，避免遗漏或重复 EOS。
+
+同源分叉仍通过 `requestSrcPad()` 创建共享 Route 的新 SrcPad；新 Pad 复制已有 TemplateCaps，hint_type 只做能力检查。
 
 ### 5.5 DemuxNode
 
@@ -731,11 +647,10 @@ AVDemuxNode(std::string name, std::string url)
 
 当前骨架的职责如下：
 
-1. `requestSrcPad()` 只接受 `VIDEO_ENCODED` / `AUDIO_ENCODED`，Pad 在 `Graph::link()` 阶段创建；同类型多个 Pad 表示同一路流的分叉。
-2. `onReady()` 调用 `openInput(url_)` 和 `probeStreams(&result)`；具体类显式返回一路最佳视频/音频 Caps，基类验证类型并校验用户连接的每种 Pad 都有对应流。
-3. `onStreamInfo()` 按实际媒体类型调整输出 Route 容量并发送 CapsEvent。
-4. `runLoop()` 调用 `readFrame()`，依据 Pad 的 `actualType()` 分发 Buffer；正常 EOF 时广播 EOS。
-5. `onStop()` 是唯一资源释放入口。`onReady()` 失败路径不自行调用 `closeInput()`，由 `Graph::ready()` 回滚统一进入 `onStop()`。
+1. `requestSrcPad()` 只接受 `VIDEO_ENCODED` / `AUDIO_ENCODED`；同类型多个 Pad 表示同一路最佳 Track 的静态可靠分叉。
+2. `onReady()` 调用 `openInput(url_)` 和 `probeStreams(&result)`，缓存一路最佳视频/音频的 encoded Caps；基类只验证 media_type 与 codec_id，并校验用户连接的每种 Pad 都有对应流。encoded 的 width/height、sample_rate、channel_layout 都是允许未知的提示字段。
+3. worker 启动后，在每条逻辑 Route 的首个 Buffer 前发布缓存的完整 encoded Caps；随后依据发布后更新的 `actualType()` 分发 Buffer，正常 EOF 时广播 EOS。
+4. `onStop()` 是唯一资源释放入口。`onReady()` 失败路径不自行调用 `closeInput()`，由 `Graph::ready()` 回滚统一进入 `onStop()`。
 
 当前阶段只要求每种媒体类型选择一路最佳流：一路最佳视频、一路最佳音频；同类型多 Track 的独立选择和路由暂不支持。
 
@@ -913,7 +828,7 @@ protected:
     virtual bool allocateContext(MuxFormat format) = 0;
     virtual bool addStream(const CapsEvent& caps, int* stream_index) = 0;
     virtual bool writeHeader() = 0;
-    virtual bool writePacket(Buffer* buf, int stream_index) = 0;
+    virtual bool writePacket(const Buffer* buf, int stream_index) = 0;
     virtual bool writeTrailer() = 0;
     virtual void closeContext() = 0;
 
@@ -928,16 +843,14 @@ private:
 };
 ```
 
-`onStreamInfo()` 的固定流程：
+`onReady()` 只分配与输入格式无关的输出 context、确认 Pad 已连接并注册 Route 通知；具体 stream、Header 和输出 CONTAINER Caps 全部在 Running 中由输入 Caps 驱动：
 
-1. `allocateContext(format_)`；
-2. 要求至少存在一个 SinkPad，并校验每个 SinkPad 都已连接；
-3. 逐个 `receiveCapsEvent()` 并 `addStream()`，建立 Pad 到输出 stream 的映射；
-4. resize `out_0` 所属 Route 到 CONTAINER 容量；
-5. 向 `out_0` 发送 `MediaType::CONTAINER` CapsEvent；
-6. 调用 `writeHeader()`。
+1. 每个输入 Pad 的首份 encoded Caps 到达时，Mux 先校验 codec_id、Pad 能力和当前 Buffer 类型合同，再调用具体后端 `addStream()`，记录 Pad → stream 映射；容器特有字段（例如是否必须有 width/height）由 `addStream()` 判断。
+2. Mux 必须等全部已连接输入都提供首份 Caps，才依次发布 `CONTAINER` Caps、调用 `writeHeader()`、flush Header 字节；此前先到的有效 encoded Buffer 保留在各自 Route 中等待，不越过 Header。
+3. Header 写入后，每个 Buffer 必须已有该 Pad 的 active Caps 且 media_type 匹配；基类按最小 DTS 选择输入，`writePacket()` 成功后 flush 本次容器字节。
+4. Header 建立后的 encoded Caps 再次到达明确报错；当前 Mux 不支持运行期 encoded 格式重配。
 
-Ready 任一步失败都只返回 `false`，资源由 `Graph::ready()` 回滚后统一通过 `onStop()` / `closeContext()` 释放，不在失败分支重复 close。
+Ready 任一步失败只返回 `false`，资源由 `Graph::ready()` 回滚后统一通过 `onStop()` / `closeContext()` 释放，不在失败分支重复 close。
 
 #### 5.6.3 pending 输出与 Header 死锁规避
 
@@ -947,13 +860,14 @@ FFmpeg 自定义 AVIO callback 得到的是临时容器字节，未来 `AVMuxNod
 appendContainerBytes(data, size);
 ```
 
-该 helper 立即复制字节到 `pending_output_`，但不在 Ready 阶段继续生成任意数量的容器 Buffer。Header 仍暂存到 runLoop，避免 Ready 阶段在有界 Route 达到容量后等待尚未启动的下游线程。
+该 helper 立即复制字节到 `pending_output_`，但不直接在 Ready 阶段生成 Buffer。Header 仍由 Mux worker 在全部输入初始 Caps 到齐后发送；这样既保证 `CONTAINER Caps → Header bytes` 的有序边界，也避免启动前在有界 Route 上阻塞。
 
 发送顺序为：
 
 ```text
-Ready:   CONTAINER Caps → writeHeader() → 字节暂存 pending
-Running: flush Header bytes
+Ready:   allocate output context、注册输入 Route 通知
+Running: 所有输入 initial Caps
+         → CONTAINER Caps → writeHeader() → flush Header bytes
          → 每次 writePacket() 成功后 flush 本次字节
          → 所有有效输入 EOS
          → writeTrailer() → flush trailer bytes → 输出 EOS
@@ -1159,12 +1073,9 @@ private:
 
 ### 6.4 Ready 流程
 
-按拓扑顺序穿插执行：
+Ready 按拓扑顺序只执行 `node->onReady()`，建立不依赖上游格式的资源；此阶段不从 Route acquire 或向 Route publish Caps/Buffer/EOS。若任一步失败，Graph 先 cancel 全部 Route，再按拓扑逆序调用已触及节点的 `onStop()`。
 
-1. `node->onReady()`；
-2. `node->onStreamInfo()`：上游根据实际媒体类型 resize 逻辑 Route 并 publish 一次 CapsEvent；下游 acquire、校验并 ack CapsEvent。
-
-Route 在节点构造时以临时容量 8 建立，并在 onStreamInfo 确定实际类型后 resize。若 Ready 任一步失败，Graph 先 cancel 全部 Route，唤醒可能的 publish/acquire，再按拓扑逆序调用 touched 节点的 `onStop()`。
+进入 Running 后，各节点 worker 才在已经 seal 的 Route 上有序处理 CapsEvent、Buffer 和 EOS。Route 初始容量为 8；每份成功发布的 CapsEvent 在进入对应格式区段前将该 Route resize 到实际 MediaType 的容量。若旧格式前缀尚占用超过新容量的条目，Caps 发布在可靠背压下等待消费者排空，不破坏配置边界顺序。
 
 ### 6.5 stop/cancel
 
@@ -1342,6 +1253,7 @@ bool Pipeline::play() {
     bus_running_ = true;
     bus_thread_ = std::thread([this]() { messageBusLoop(); });
 
+    // Ready 阶段：只初始化格式无关资源；Caps/Buffer/EOS 从 worker 启动后才在 Route 中传递。
     if (!graph_.ready()) {
         // Ready 失败：先把 bus 收干净，保证 Ready 期间的 ERROR 消息全部落入 last_error_，
         // 然后再置 ERROR 返回。bus_running_ 翻为 false 后 notify()，
@@ -1483,159 +1395,81 @@ void Pipeline::messageBusLoop() {
 
 MessageBus 监听线程最后停止，保证节点退出过程中 postMessage 的消息（如 EOS、WARNING）仍能被处理。
 
-**为什么 bus 必须早于 `graph_.ready()`**：`onReady()` / `onStreamInfo()` 可能执行真实设备/文件初始化（DemuxNode 打开 URL、DecodeNode 调 `avcodec_open2` 等），失败时会 `postMessage(ERROR, "...")`。bus 若尚未启动，消息只落到 queue 无人消费，`last_error_` 永远为空，§7.3 承诺的 `pipeline.lastError()` 就不可用。
+**为什么 bus 必须早于 `graph_.ready()`**：`onReady()` 可能执行真实设备/文件初始化（DemuxNode 打开 URL、AudioPlay 打开 SDL 音频设备、Mux 分配容器 context 等），失败时会 `postMessage(ERROR, "...")`。bus 若尚未启动，消息只落到 queue 无人消费，`last_error_` 永远为空，§7.3 承诺的 `pipeline.lastError()` 就不可用。
 
 ---
 
-## 8. Caps 两阶段协商
+## 8. Caps 协商与运行期格式边界
 
-### 8.1 第一阶段：静态协商（Build 时）
+### 8.1 静态能力协商（Build 时）
 
-每个 Pad 声明 TemplateCaps（支持的 MediaType 集合）。`link()` 时检查两端 TemplateCaps 是否有交集，无交集则 `link()` 返回 false。
+每个 Pad 声明 TemplateCaps（支持的 MediaType 集合）。`Graph::link()` 只检查两端集合是否有交集；它不判断 codec、尺寸、像素格式、采样率或声道布局，也不设置 Pad 的 actualType。
 
-各节点 TemplateCaps 声明示例：
-
-```
-DecodeNode
-  SinkPad：{ VIDEO_ENCODED, AUDIO_ENCODED }   // 接受编码后的音频或视频
-  SrcPad： { VIDEO_RAW, AUDIO_RAW }           // 产出解码后的原始数据
-
-EncodeNode
-  SinkPad：{ VIDEO_RAW, AUDIO_RAW }           // 接受原始音频或视频
-  SrcPad： { VIDEO_ENCODED, AUDIO_ENCODED }   // 产出编码后的数据
-
-MuxNode
-  SinkPad：{ VIDEO_ENCODED, AUDIO_ENCODED }   // 接受编码后的音频或视频
-  SrcPad： { CONTAINER }                      // 产出容器封装流
-
-DemuxNode
-  SrcPad： { VIDEO_ENCODED, AUDIO_ENCODED }   // 产出编码后的音频或视频（具体类型由文件决定）
-
-VideoRenderNode
-  SinkPad：{ VIDEO_RAW }                      // 只接受原始视频帧
-
-AudioPlayNode
-  SinkPad：{ AUDIO_RAW }                      // 只接受原始音频帧
-
-FileSinkNode / RTSPPushNode
-  SinkPad：{ CONTAINER }                      // 只接受容器封装流
+```text
+DecodeNode     SinkPad { VIDEO_ENCODED, AUDIO_ENCODED }
+               SrcPad  { VIDEO_RAW, AUDIO_RAW }
+MuxNode        SinkPad { VIDEO_ENCODED, AUDIO_ENCODED }
+               SrcPad  { CONTAINER }
+DemuxNode      SrcPad  { VIDEO_ENCODED, AUDIO_ENCODED }
+VideoRender    SinkPad { VIDEO_RAW }
+AudioPlay      SinkPad { AUDIO_RAW }
 ```
 
-静态协商只做粗粒度的 MediaType 交集检查，无法在 Build 阶段区分"这个 DecodeNode 是视频解码器还是音频解码器"，具体类型由 Ready 阶段收到的 CapsEvent 决定。这是设计上的合理取舍。
+`actual_type` 的唯一写入者是 BaseNode：生产侧首份 Caps 经 TemplateCaps 校验后，选定共享 Route 全部 SrcPad 的实际类型；消费侧首份 Caps 的 `onCaps()` 成功后，选定对应 SinkPad 的实际类型。它在 Ready 前、及 Running 中首份 Caps 到达前都可以为 `nullopt`；后续 Caps 的 media_type 必须等于该冻结值，运行期类型分发只能读取它，不能从 TemplateCaps 推测。
 
-```
-错误示例：
-  EncodeNode 的 SrcPad 声明 { VIDEO_ENCODED, AUDIO_ENCODED }
-  VideoRenderNode 的 SinkPad 声明 { VIDEO_RAW }
-  → 无交集 → Build 报错：
-    "EncodeNode.out_0 (VIDEO_ENCODED|AUDIO_ENCODED) is incompatible with
-     VideoRenderNode.in (VIDEO_RAW)"
-```
+### 8.2 Running 阶段的有序动态 Caps
 
-**Pad 的两层类型信息**：
+Build 后 Route 的订阅集合 seal，随后 Ready 只建立格式无关资源。节点 worker 启动后，每条逻辑 Route 的唯一数据协议为：
 
-| 层次 | 存储 | 生效时机 | 用途 |
-|-----|-----|--------|-----|
-| 能力集合 | `Pad::template_caps_`（TemplateCaps） | 构造 / requestPad 时确立 | Build 阶段 `Graph::link` 的粗粒度兼容性检查、Ready 阶段 send/receiveCapsEvent 的精确校验 |
-| 实际类型 | `Pad::actual_type_`（optional<MediaType>） | Ready 阶段 CapsEvent 流经 pad 时 | Ready 阶段完成后 runLoop 里的类型分发判断（如 DemuxNode 按 media_type 分发） |
-
-分层规则：
-1. `actual_type` 的**唯一设值时机 = Ready 阶段 send/receiveCapsEvent 中 CapsEvent 流经时**（`setActualType` 是 Pad 的 private 方法 + friend BaseNode 授权）
-2. Ready 之前 `pad->actualType()` 一律返回 `nullopt`，是契约的一部分，任何代码不得依赖"Ready 前 actualType 有值"
-3. Ready 之后所有**已连接**的 pad 的 `actualType()` 必有值；如果 Ready 走完某个 pad 依然是 nullopt，说明该 pad 未连接或该 pad 从未收/发过 CapsEvent，视为节点作者违约
-4. runLoop 阶段的类型判断**只查 `actualType()`**，绝对不能从 TemplateCaps 里取某个元素当实际类型用
-5. **requestPad 里不调 `setActualType`**
-
-### 8.2 第二阶段：动态协商（Ready 时）
-
-Ready 阶段的 CapsEvent 传递按拓扑顺序逐节点完成。每个节点只在自己的 `onStreamInfo()` 中消费上游 CapsEvent、完成本节点初始化，并在需要时向下游发送新的 CapsEvent，顺流传递
-
-VideoRenderNode 线程亲和资源例外：其 `onStreamInfo()` 只收取并保存 Caps，SDL 视频资源延迟到 Running 阶段由工作线程初始化
-
-比如 DemuxNode：
-1. 在 onReady() 中 avformat_open_input，获取真实参数，随后将 CapsEvent 内容记录到成员变量，暂不发送
-2. build 已为每条 Edge 建立静态 Subscription 并 seal Route
-3. 在 onStreamInfo() 中按逻辑流 resize VIDEO/AUDIO OutputRoute，并且每条不同 Route 只处理一次
-4. sendCapsEvent("video_0", {...}) 定位 VIDEO Route 并只 publish 一次 CapsEvent；该 Route 的所有静态订阅者分别 acquire/ack
-
-又比如 DecodeNode：
-1. onReady() 无特殊操作，就是等待 CapsEvent
-2. build 已建立输入 Subscription 和逻辑输出 Route
-3. 在 onStreamInfo() 中，首先从 SinkPad Subscription acquire 并 ack CapsEvent，然后用 codec_id 查找解码器
-4. 然后分配上下文：avcodec_alloc_context3(codec)，并填充 extradata（SPS/PPS）到 ctx_->extradata
-5. 调用 avcodec_open2(ctx_, codec, nullptr)
-6. **必须等 avcodec_open2() 完成后，才能从 ctx_ 中读取输出参数，因为输出的 pix_fmt、width、height、sample_fmt 由解码器决定，不能直接透传输入 CapsEvent 的值**
-7. 从 ctx_ 读取实际输出参数，构造输出 CapsEvent
-    + 视频：{ VIDEO_RAW, pix_fmt=ctx_->pix_fmt, width=ctx_->width, height=ctx_->height }
-    + 音频：{ AUDIO_RAW, sample_fmt=ctx_->sample_fmt, sample_rate=ctx_->sample_rate, channels=ctx_->ch_layout.nb_channels }
-8. resize 自己的逻辑输出 Route 到 selectRouteCapacity(media_type)
-9. 最后 sendCapsEvent("out_0", out_caps) 向逻辑输出 Route publish 一次 CapsEvent
-
-VideoRenderNode 在 Ready 阶段只完成上游 Caps 收取：
-1. 在 `onStreamInfo()` 中，从 SinkPad Subscription acquire/ack CapsEvent
-2. 保存 width / height / pix_fmt 等参数，不初始化 SDL 视频子系统，不创建窗口、Renderer 或 Texture
-3. 进入 Running 后由 VideoRender 工作线程初始化 SDL VIDEO 并管理全部视频资源
-4. 它没有下游，没有 SrcPad，不需要构造输出 CapsEvent
-
-**BaseNode 的两个 CapsEvent helper**：
-- `bool sendCapsEvent(src_pad_name, caps)`：定位 SrcPad 所属 Route，校验共享该 Route 的所有 Pad TemplateCaps，设置 actualType 后可靠 publish 一次。
-- `bool receiveCapsEvent(sink_pad_name)`：**popBlocking → 校验取到的是 Event 且是 CapsEvent → 校验 caps.media_type ∈ SinkPad.templateCaps → setActualType → 存入 negotiated_caps_**。任一步失败 postMessage(ERROR) 并返回 false。
-
-两个 helper 对称、返回 bool。**上游节点的 onStreamInfo 里凡是需要发/收 CapsEvent 的位置一律通过它们**（不要绕开自己 popBlocking 手写"取 + 校验"），保证：
-- Pad 的 actual_type 在唯一路径下被设置
-- CapsEvent 与 Pad 能力集合的匹配错误一律在 Ready 阶段抓住
-- helper 返回 false 时 `onStreamInfo` 直接把 false 传出去触发 Ready 事务性回滚，`lastError()` 可查
-
-DecodeNode::onStreamInfo() 参考实现：
-
-```cpp
-bool DecodeNode::onStreamInfo() override {
-    // 1. 用 receiveCapsEvent 从 SinkPad Subscription acquire/ack CapsEvent
-    //    内部完成：popBlocking → 校验类型 → setActualType → 存入 negotiated_caps_["in"]
-    if (!receiveCapsEvent("in")) return false;
-    const CapsEvent& in_caps = negotiated_caps_["in"];
-
-    // 2. 打开解码器
-    codec_ = avcodec_find_decoder(in_caps.codec_id);
-    ctx_   = avcodec_alloc_context3(codec_);
-    // 填充 extradata
-    if (!in_caps.extradata.empty()) {
-        ctx_->extradata = (uint8_t*)av_malloc(in_caps.extradata.size());
-        memcpy(ctx_->extradata, in_caps.extradata.data(), in_caps.extradata.size());
-        ctx_->extradata_size = (int)in_caps.extradata.size();
-    }
-    if (avcodec_open2(ctx_, codec_, nullptr) < 0) {
-        postMessage(MessageType::ERROR, "DecodeNode: failed to open decoder");
-        return false;
-    }
-
-    // 3. 解码器打开成功后，才能构造输出 CapsEvent
-    //    输出参数由解码器决定，不能直接透传输入 CapsEvent 的值
-    CapsEvent out_caps;
-    out_caps.media_type  = (in_caps.media_type == MediaType::VIDEO_ENCODED)
-                           ? MediaType::VIDEO_RAW : MediaType::AUDIO_RAW;
-    out_caps.width       = ctx_->width;
-    out_caps.height      = ctx_->height;
-    out_caps.pix_fmt     = ctx_->pix_fmt;        // 解码器决定，不是输入指定的
-    out_caps.sample_rate = ctx_->sample_rate;
-    out_caps.channels    = ctx_->ch_layout.nb_channels;
-    out_caps.sample_fmt  = ctx_->sample_fmt;
-
-    // 4. resize 逻辑输出 Route，再 publish 一次 CapsEvent
-    auto* output_pad = getSrcPad("out_0");
-    output_pad->route()->resize(selectRouteCapacity(out_caps.media_type));
-    if (!sendCapsEvent("out_0", out_caps)) return false;
-    return true;
-}
+```text
+CapsEvent → Buffer* → CapsEvent → Buffer* → EOSEvent
 ```
 
-### 8.3 CapsEvent 传递链路示意
+- 谁先获得完整流格式，谁必须在第一个受该格式解释的 Buffer 前发布 Caps。
+- 每份 Caps 必须完整、准确地解释它之后、直到下一份 Caps 之前的全部 Buffer；Caps 可在同一 Route 出现多次。
+- Buffer 在 active Caps 之前到达，或其 media_type 与 active Caps 不一致，是协议错误。
+- Caps 的应用与 Delivery ack 是同一边界：消费者的 `onCaps()` 成功后才更新 active Caps 并 ack；失败时不 ack，由 ERROR/stop 的 Route cancel 统一收尾。
+- `sendCapsEvent()` 只定位指定的已连接 SrcPad/Route，随后由 `publishOutputItem()` 对共享 Route 执行类型规则：首份 Caps 用全部共享 SrcPad 的 TemplateCaps 选定并固定 actualType，后续 Caps 只允许与该冻结类型相同。`applyCapsEvent()` 对 SinkPad 执行对应的首份选择/后续比对。字段是否足够由实际生产/消费节点检查。
+- `hasSameFormat()` 只比较 Caps 声明值，不能作为全局“是否必须重配”的闸门；是否重建 decoder、texture、swr 或拒绝变化由节点自己定义。
 
-```
-DemuxNode ──[VIDEO_ENCODED CapsEvent]──→ DecodeNode ──[VIDEO_RAW CapsEvent]──→ VideoRenderNode
-          ──[AUDIO_ENCODED CapsEvent]──→ DecodeNode ──[AUDIO_RAW CapsEvent]──→ AudioPlayNode
+字段责任按使用点划分：
 
-DemuxNode ──[VIDEO_ENCODED CapsEvent]──→ MuxNode    （直接推流，无需解码，Mux 用 CapsEvent 初始化输出容器）
+| 使用者/生产者 | 本地要求 |
+|---|---|
+| Decode 输入 encoded Caps | `codec_id` 必须存在；VIDEO_ENCODED 的 width/height、AUDIO_ENCODED 的 sample_rate/channel_layout 是可选提示。已提供的合法提示写入 AVCodecContext；未知提示留给 FFmpeg 从 extradata/bitstream 确定。 |
+| Decode 输出 RAW Caps | 从真实 AVFrame 生成；VIDEO_RAW 必须有 width/height/pix_fmt，AUDIO_RAW 必须有 sample_rate/sample_fmt/有效 channel_layout。 |
+| VideoRender | 只接受完整 YUV420P/YUVJ420P VIDEO_RAW Caps。 |
+| AudioPlay | 只接受完整、标准 native channel layout 的 AUDIO_RAW Caps，并重采样为固定 canonical SDL 格式。 |
+| Mux 基类 | 初始 encoded Caps 至少需要 `codec_id`；具体容器 Header 所需的尺寸/采样率等由 `addStream()` 后端校验。 |
+
+### 8.3 节点边界
+
+**DemuxNode** 在 Ready 探测并缓存 encoded Caps；其 worker 对每条已连接逻辑 Route 先发布 Caps，再发布 Packet Buffer。对于同类型分叉，只发布一次，所有订阅者通过共享 Route 看到相同序列。
+
+**DecodeNode** 在输入 encoded Caps 到达时：若已有旧上下文，先把 delayed AVFrame 加入本地有序 outputs，再释放旧上下文并配置新 decoder。它不以 `avcodec_open2()` 后的 context 字段声明 RAW 格式；许多视频 decoder 此时仍没有 pix_fmt。每取得一帧真实 AVFrame，Decode 先比较其真实 RAW 格式：首帧或格式变化帧先将完整 RAW Caps 加入 outputs，随后加入该帧 Buffer。EOS flush 使用同一 outputs 序列，基类最后追加唯一 EOSEvent。
+
+**VideoRenderNode** 在 Running 应用 Caps，记录格式并在尺寸变化时销毁旧 Texture；SDL VIDEO/Window/Renderer/Texture 仍由 worker 持有完整生命周期。
+
+**AudioPlayNode** 在 Ready 建立固定 canonical SDL 提交端：S16 packed、默认设备派生采样率、stereo FL/FR。Running 中每份 AudioRaw Caps 先排空旧 swr 的 canonical 尾部，再重建 `input → canonical` swr；不会清空 canonical SDL 队列，故背压、提交账本和 Clock 始终使用 canonical 帧量纲。
+
+**MuxNode** 等全部输入初始 encoded Caps 后才建立 Header；先到的 Packet 保留在各自 Route。Header 后同一输入 Pad 的 encoded Caps 变化明确报错，当前不支持容器运行期重配。
+
+### 8.4 传递链路示意
+
+```text
+Demux worker:
+VIDEO_ENCODED Caps → Packet* → EOS
+                    ↓
+Decode worker:
+VIDEO_RAW Caps (由首个真实 AVFrame 定案) → Frame* → EOS
+                    ↓
+VideoRender worker
+
+AUDIO_ENCODED Caps → Packet* → EOS
+                    ↓
+AUDIO_RAW Caps (由真实 AVFrame 定案) → Frame* → EOS
+                    ↓
+AudioPlay worker
 ```
 
 ---
@@ -1707,71 +1541,70 @@ private:
 
 ### 9.3 AudioPlayNode 更新时钟
 
-AudioPlayNode 以 SDL3 设备真实消费进度更新主时钟，而不是写入量或 `SDL_GetAudioStreamAvailable`。
+AudioPlayNode 以 SDL3 设备真实消费进度更新主时钟，而不是写入量或 `SDL_GetAudioStreamAvailable`。Ready 阶段先建立固定 application-side canonical 提交格式：S16 packed、默认播放设备派生的采样率、stereo FL/FR。输入 AUDIO_RAW Caps 在 Running 中只重建 `input → canonical` 的 swr；设备周期、背压、SDL queued 查询和 Clock 账本始终使用 canonical 帧量纲。
 
-音频输出维护一个完整提交账本和首个有效 PTS 的显式基线：
+音频输出维护完整提交账本和首个有效 PTS 的显式基线：
 
 ```text
 submitted_frames_
-    所有成功提交给 SDL 的输出 PCM 总帧数
+    所有成功提交给 SDL 的 canonical PCM 总帧数
 frames_before_anchor_
-    首个有效 PTS 所在 Buffer 的输出帧提交前，已经提交的输出帧数
+    首个有效 PTS 所在输入 Buffer 送入 swr 前，已进入 SDL 队列的前缀
+    加上 swr 内仍属于 NOPTS 前缀的 canonical delay
 anchor_pts_us_
     首个有效 PTS
 ```
 
-`SDL_GetAudioStreamQueued` 返回**输入队列中尚未被设备读路径取走**的字节数（输入侧单位）。因此首个有效 PTS 锚定后，消费进度必须扣除锚定前已经提交的 NOPTS 前缀：
+`SDL_GetAudioStreamQueued` 返回输入队列中尚未被设备读路径取走的 canonical 字节数，因此：
 
 ```text
-queued_frames = SDL_GetAudioStreamQueued(stream) / bytes_per_sample
+queued_frames = SDL_GetAudioStreamQueued(stream) / canonical_bytes_per_frame
 consumed_from_anchor =
     submitted_frames - frames_before_anchor - queued_frames
 ```
 
-- `consumed_from_anchor < 0`：设备仍在消费锚定帧之前的 NOPTS 前缀，Clock 保持
-  `kUnanchored`；VideoRender 仍按未锚定策略呈现，此窗口内可能短暂不同步，这是该边界定义下的预期结果。
+- `consumed_from_anchor < 0`：设备仍在消费锚定帧之前的 NOPTS 前缀，Clock 保持 `kUnanchored`；VideoRender 按未锚定策略呈现。
 - `consumed_from_anchor >= 0`：设备已经消费到锚定帧，才允许更新 Clock。
-- 锚定后继续遇到 NOPTS Buffer 时照常提交和计数，不改变锚点；后续有效 PTS 也不重新锚定。
+- 锚定后继续遇到 NOPTS Buffer 时照常转换、提交和计数，不改变锚点；后续有效 PTS 也不重新锚定。
 - 如果整条音频流没有有效 PTS，Audio Clock 保持未锚定。
 
 设备已经到达锚定帧后：
 
 ```text
-audible = max(0, consumed_from_anchor - device_period_frames)
-clock = anchor_pts_us + audible / sample_rate
+audible = max(0, consumed_from_anchor - canonical_device_period_frames)
+clock = anchor_pts_us + audible / canonical_rate
 ```
 
-当 `consumed_from_anchor` 位于 `[0, device_period_frames]` 时，采样点上的 `audible` 被钳为 0，音频位置不早于 `anchor_pts_us`；两次采样之间 Clock 仍按墙钟插值。这是设备周期补偿造成的正常启动阶段行为，不是卡顿。
+当 `consumed_from_anchor` 位于 `[0, canonical_device_period_frames]` 时，采样点上的 `audible` 被钳为 0，位置不早于 `anchor_pts_us`；两次采样之间仍按墙钟插值。
 
-正常 `consume()` 和 `onDrain()` 的 swr 尾部输出都经过同一个提交入口：
+正常 `consume()`、运行期 Caps 重配前的旧 swr drain 和最终 EOS drain 都经过同一个 canonical 提交入口：
 
 ```text
 SDL_PutAudioStreamData 成功
-→ submitted_frames_ 增加输出帧数
+→ submitted_frames_ 增加 canonical 输出帧数
 → 根据锚定状态查询 queued 并刷新 Clock
 ```
 
-在 `onDrain()` 等待 `queued_frames` 清空期间，仍持续刷新 Clock，以覆盖
-`consumed_from_anchor < 0` 转为非负的状态边界；不能只在最后一次 PCM 提交后刷新一次。
-
-以上公式假设 swr 不改变采样率，输出帧与媒体 PTS 的映射为 1:1。真正进行采样率转换时，必须重新定义输出帧到媒体 PTS 的换算关系。
+重配前只排空旧 swr 的 canonical 尾部，不 flush 或清空 SDL canonical 队列，因此旧新两段 PCM 连续播放，账本和 Clock 不换量纲。在最终 `onDrain()` 等待 queued 清空期间，仍持续刷新 Clock，以覆盖 `consumed_from_anchor` 由负转非负的边界。
 
 ### 9.4 AudioPlayNode 提交背压
 
-SDL AudioStream 内部缓冲对 App 无界；AudioPlayNode 在 `consume()` 内、`SDL_PutAudioStreamData` 之前设置双阈值迟滞闸门，借"晚 ack"把背压沿 Route 传导到上游：
+SDL AudioStream 内部缓冲对 App 无界；AudioPlayNode 在每次 canonical PCM `SDL_PutAudioStreamData` 前设置双阈值迟滞闸门，借“晚 ack”把背压沿 Route 传导到上游：
 
-- 查询设备周期 `P = sample_frames / freq`（`SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream))`）。
-- `LOW = N_low × P`（欠载安全下限，带 ms 级绝对下限兜底）。
-- `HIGH = LOW + N_band × P`（迟滞带，保证每次开闸成批提交，避免逐块抖动）。
-- 若 `queued > HIGH`，取消感知地轮询等待到 `queued ≤ LOW`；被 stop 打断则不 put、不更新时钟。
+- 从打开后的物理设备取得周期，再一次性换算为 canonical 帧周期 `P`。
+- `LOW = N_low × P`，并有 canonical 毫秒下限。
+- `HIGH = LOW + N_band × P`，同样有 canonical 毫秒带宽下限。
+- 若 canonical queued 帧数超过 HIGH，取消感知地轮询等待到 `queued ≤ LOW`；被 stop 打断则不 put、不更新时钟。
+
+输入 AudioRaw Caps 改变只会重建 input→canonical swr，不改变水位、SDL 队列换算或 Clock 的量纲。
 
 ### 9.5 EOS Drain
 
 SinkNode 收到输入 EOS 后，先 ack（释放上游 Route，不占背压窗口），再调用 `onDrain()`，最后才上报最终 EOS。`onDrain()` 默认空实现（VideoRenderNode 不受影响）。AudioPlayNode 的 `onDrain()`：
 
-1. swr 尾部排空（按 `swr_get_delay` 估算容量）；
-2. `SDL_FlushAudioStream` 把 SDL 内部残留转换出来；
-3. 取消感知等待 `SDL_GetAudioStreamQueued()` 归零（返回值 -1 视为失败）；
+1. swr 尾部排空（最终 EOS，或新 AudioRaw Caps 到达前的旧输入格式）；
+2. 最终 EOS 时调用 `SDL_FlushAudioStream` 把 SDL 内部残留转换出来；运行期 Caps 重配不 flush SDL canonical 队列；
+3. 最终 EOS 时取消感知等待 `SDL_GetAudioStreamQueued()` 归零（返回值 -1 视为失败）；
 4. 再等待 3 个设备周期，覆盖设备周期缓冲与后端硬件缓冲的尾音；
 5. `onDrain()` 内出错或被打断（`stop_requested_` 置位）时，不再上报 EOS。
 
@@ -2001,7 +1834,9 @@ EOS 一般只作用于读取/播放本地音视频文件，通常只从 DemuxNod
 DemuxNode 读到文件末尾调用 sendEOSDownstream()，每条视频/音频逻辑 Route 各 publish 一次 EOS；同一 Route 的所有静态订阅者按自己的游标有序取得 EOS
 
 TransformNode 的 runLoop 收到 EOS
-  → onEvent(EOSEvent{}) → sendEOSDownstream() → 继续往下传
+  → 子类 onEOS() 仅收集 delayed Caps/Buffer（例如 Decode flush 帧）
+  → 基类在输出序列末尾追加唯一 EOSEvent
+  → 依序发布后 ack 输入 EOS
 
 诸如 VideoRenderNode 和 AudioPlayNode 这些 SinkNode 收到 EOS，`SinkNode::runLoop` 会按以下顺序处理：
 
@@ -2026,17 +1861,19 @@ Pipeline::waitEOS
 1. **Route 容量与内存预算**：当前 Route 先按条目数硬限，`VIDEO_RAW=4`、`VIDEO_ENCODED=32`、`AUDIO_RAW=50`、`AUDIO_ENCODED=32`、`CONTAINER=32`。ENCODED 已从旧 tryPush 时代的 128 下调到 32；RAW audio 和 CONTAINER 要等 AudioPlay/Mux 的设备缓冲与实际输出块大小确定后再调。后续增加 payload 字节上限、节点级总内存预算和高低水位监控。
 2. **分叉可靠传输已完成，但端到端零拷贝未完成**：同源分叉已共享只读 BufferRef，Route Entry 只保存一份 payload；FFmpeg AVPacket/AVFrame 与框架 Buffer、以及未来 V4L2/硬件 surface 之间仍会复制。后续需要 DMA-BUF/硬件帧等外部存储模型。
 3. **有损订阅策略暂不支持**：当前所有静态订阅者都可靠。未来实时预览、统计等确需丢帧时，应在 EdgePolicy 中显式表达 `LATEST_ONLY`/drop 策略；Caps、EOS、格式变化等控制事件仍必须可靠。
-4. **Route 通知回调限制**：当前只在 Ready/onStreamInfo 阶段注册，用于唤醒 Mux 多输入调度；若未来需要运行期变更，必须定义通知列表的线程安全边界。
+4. **Route 通知回调限制**：当前只在 Mux Ready 阶段注册，用于唤醒多输入调度；若未来需要运行期变更，必须定义通知列表的线程安全边界。
 5. **link/build 错误报告**：核心库当前只返回 bool，不直接 fprintf，也不适合走运行期 MessageBus；详细错误报告机制仍需独立设计。
-6. **Caps/动态格式变化**：Decoder 首帧前可能不知道真实 pix_fmt；当前两阶段 Caps 一次性协商不足以覆盖运行期分辨率/格式变化，需单独设计 preroll 或 generation Caps。
-7. 音视频同步丢帧阈值（落后多少丢帧）待定；完整 channel layout 传递待补。
-8. **媒体兼容性**：Packet side data、`pkt_timebase`、`best_effort_timestamp`、send/receive EAGAIN、非 YUV420P swscale、色彩空间/HDR 等仍需按具体节点补全。
-9. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
-10. **Demux/Mux 边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`，虽 Route 已支持可靠多订阅者输出，但动态 Mux 输出 Pad、最终交织策略、阻塞网络 I/O interrupt callback 和具体 AVMuxNode 仍待实现。
-11. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4；需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
-12. **启动时序对齐（栅栏，暂缓）**：当前多呈现 Sink 启动时首次输出延迟不对称（如音频设备在 Ready 阶段即出声，而视频窗口创建需数秒），造成 A/V 起跑不齐。完整的启动栅栏设计需让共享主时钟的呈现型 Sink 在全部就绪后才同时出首份输出；已讨论但暂缓，待后续实现。
-13. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
-14. **第三方 GUI LeakSanitizer 基线**：当前 Linux/X11 环境的 SDL3 2D software renderer 在 window surface 呈现时会内部尝试 GPU texture framebuffer，加载 Mesa/GLX；即使独立最小程序完整销毁 Texture、Renderer、Window，退出 VIDEO 并调用 `SDL_Quit()`，LeakSanitizer 仍报告 Mesa/GLX 约 1464B/16 allocations。强制直接 X11 framebuffer 可避免 Mesa 报告，但会出现约 33066B/572 allocations 的 X11/XKB 报告。两者均可由独立 SDL 最小程序复现，不属于 Pipeline、Buffer、Route 或节点资源泄漏；不为消除报告而改 renderer/backend。player 的 LeakSanitizer 验证应将该 Mesa/GLX 基线与项目自身泄漏区分，框架单测仍无 suppression 严格运行。
+6. **Caps 运行期边界的剩余限制**：Decoder 首帧真实格式定案、同一 Route 多份 Caps、VideoRender 尺寸变化和 AudioPlay 输入重配已支持；尚不支持 PTS discontinuity、Caps generation、非 YUV420P swscale。
+7. **采集 Source 的 Caps 生产模型**：默认 `SourceNode::capture() -> Buffer*` 不能表达 `Caps → Buffer* → Caps → Buffer*`。V4L2/AudioCapture 落地前必须先结合设备 open、协商、重配及运行期格式变化，设计有序 `QueueItem` 的 Source 生产接口；当前不得用该旧默认骨架接入要求 Running Caps 的新节点。
+8. 音视频同步丢帧阈值（落后多少丢帧）待定。
+9. **媒体兼容性**：Packet side data、`best_effort_timestamp`、send/receive EAGAIN、非 YUV420P swscale、色彩空间/HDR 等仍需按具体节点补全；`pkt_timebase` 已设置为框架微秒时间基，完整 channel layout 已以 Caps 的 `ChannelLayout` 值类型传递，但 AudioPlay 当前只承诺标准 native layout 到 stereo 的转换。
+10. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
+11. **Demux/Mux 边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`，虽 Route 已支持可靠多订阅者输出，但动态 Mux 输出 Pad、最终交织策略、阻塞网络 I/O interrupt callback 和具体 AVMuxNode 仍待实现。
+12. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4；需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
+13. **启动时序对齐（栅栏，暂缓）**：当前多呈现 Sink 启动时首次输出延迟不对称（如音频设备在 Ready 阶段即出声，而视频窗口创建需数秒），造成 A/V 起跑不齐。完整的启动栅栏设计需让共享主时钟的呈现型 Sink 在全部就绪后才同时出首份输出；已讨论但暂缓，待后续实现。
+14. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
+15. **第三方 GUI LeakSanitizer 基线**：当前 Linux/X11 环境的 SDL3 2D software renderer 在 window surface 呈现时会内部尝试 GPU texture framebuffer，加载 Mesa/GLX；即使独立最小程序完整销毁 Texture、Renderer、Window，退出 VIDEO 并调用 `SDL_Quit()`，LeakSanitizer 仍报告 Mesa/GLX 约 1464B/16 allocations。强制直接 X11 framebuffer 可避免 Mesa 报告，但会出现约 33066B/572 allocations 的 X11/XKB 报告。两者均可由独立 SDL 最小程序复现，不属于 Pipeline、Buffer、Route 或节点资源泄漏；不为消除报告而改 renderer/backend。player 的 LeakSanitizer 验证应将该 Mesa/GLX 基线与项目自身泄漏区分，框架单测仍无 suppression 严格运行。
+16. SDL_GetAudioDeviceFormat 查询已打开设备偶发返回空错误失败,而当前它被当硬 ERROR 直接毙掉整个 Ready。将来或可对这个查询加一次重试/容忍,但现在按硬失败处理也说得过去,先不动。
 
 ---
 
