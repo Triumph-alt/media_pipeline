@@ -5,12 +5,16 @@
 
 extern "C" {
 #include <SDL3/SDL.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/mem.h>
 #include <libavutil/pixfmt.h>
+#include <libswscale/swscale.h>
 }
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <iterator>
 #include <thread>
 #include <variant>
 
@@ -38,15 +42,18 @@ bool VideoRenderNode::onReady() {
 // ===================================================================
 bool VideoRenderNode::onCaps(const std::string&, const CapsEvent& caps,
                              std::vector<QueueItem>*) {
+    // 验证 VideoRender 最低限度需要的 Caps 字段
     if (caps.media_type != MediaType::VIDEO_RAW ||
-        caps.width <= 0 || caps.height <= 0 ||
-        (caps.pix_fmt != AV_PIX_FMT_YUV420P && caps.pix_fmt != AV_PIX_FMT_YUVJ420P)) {
-        return failRender("VideoRenderNode: only complete YUV420P/YUVJ420P Caps are supported before swscale");
+        caps.width <= 0 || caps.height <= 0 || caps.pix_fmt == AV_PIX_FMT_NONE) {
+        return failRender("VideoRenderNode: VIDEO_RAW Caps require width, height and pix_fmt");
     }
 
-    // Runtime Caps may arrive before this worker has created SDL resources. Record the complete format now;
-    // consume() will create/recreate the Texture after openRenderer succeeds. If a later Caps arrives while
-    // rendering, destroy the old Texture here so no stale dimensions survive the configuration boundary.
+    // 根据真实输入格式准备本地消费路径
+    if (!configureConversion(caps)) {
+        return false;
+    }
+
+    // 若后续 Caps 改变尺寸且已有 Texture，则销毁旧 Texture，由下一帧按新尺寸延迟创建
     if (texture_ && (texture_width_ != caps.width || texture_height_ != caps.height)) {
         SDL_DestroyTexture(static_cast<SDL_Texture*>(texture_));
         texture_ = nullptr;
@@ -55,8 +62,117 @@ bool VideoRenderNode::onCaps(const std::string&, const CapsEvent& caps,
     }
     width_ = caps.width;
     height_ = caps.height;
-    fprintf(stderr, "[%s] applied video caps: %dx%d pix_fmt=%d\n",
-            name_.c_str(), width_, height_, caps.pix_fmt);
+    fprintf(stderr, "[%s] applied video caps: %dx%d pix_fmt=%d%s\n",
+            name_.c_str(), width_, height_, caps.pix_fmt,
+            direct_yuv420p_ ? " (direct IYUV)" : " (swscale to IYUV)");
+    return true;
+}
+
+bool VideoRenderNode::configureConversion(const CapsEvent& caps) {
+    const bool direct_yuv420p = caps.pix_fmt == AV_PIX_FMT_YUV420P ||
+                                caps.pix_fmt == AV_PIX_FMT_YUVJ420P;
+    if (direct_yuv420p) {
+        // 直传格式不保留旧的转换资源，防止格式切回时让已失效的 sws 缓冲跨越 Caps 边界。
+        releaseConversion();
+        input_pix_fmt_ = caps.pix_fmt;
+        direct_yuv420p_ = true;
+        return true;
+    }
+
+    const int buffer_size = av_image_get_buffer_size(AV_PIX_FMT_YUV420P,
+                                                     caps.width, caps.height, 1);
+    if (buffer_size <= 0) {
+        return failRender("VideoRenderNode: invalid YUV420P conversion buffer size");
+    }
+
+    // 输入格式由当前真实 Caps 决定，输出格式固定为 SDL_PIXELFORMAT_IYUV 所需的 YUV420P
+    SwsContext* replacement_context = sws_getContext(
+        caps.width, caps.height, caps.pix_fmt,
+        caps.width, caps.height, AV_PIX_FMT_YUV420P,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!replacement_context) {
+        return failRender("VideoRenderNode: sws_getContext failed for input pix_fmt");
+    }
+
+    uint8_t* replacement_buffer = static_cast<uint8_t*>(av_malloc(buffer_size));
+    if (!replacement_buffer) {
+        sws_freeContext(replacement_context);
+        return failRender("VideoRenderNode: YUV420P conversion buffer allocation failed");
+    }
+
+    uint8_t* replacement_planes[4]{};
+    int replacement_linesize[4]{};
+    if (av_image_fill_arrays(replacement_planes, replacement_linesize, replacement_buffer,
+                             AV_PIX_FMT_YUV420P, caps.width, caps.height, 1) < 0) {
+        av_free(replacement_buffer);
+        sws_freeContext(replacement_context);
+        return failRender("VideoRenderNode: failed to describe YUV420P conversion buffer");
+    }
+
+    // 所有 replacement 都已成功构造后再替换旧资源，失败不会破坏仍有效的上一份 Caps 配置
+    releaseConversion();
+    sws_ctx_ = replacement_context;
+    sws_buffer_ = replacement_buffer;
+    sws_buffer_size_ = buffer_size;
+    std::copy(std::begin(replacement_linesize), std::end(replacement_linesize),
+              std::begin(sws_linesize_));
+    input_pix_fmt_ = caps.pix_fmt;
+    direct_yuv420p_ = false;
+    return true;
+}
+
+void VideoRenderNode::releaseConversion() {
+    if (sws_ctx_) {
+        sws_freeContext(sws_ctx_);
+        sws_ctx_ = nullptr;
+    }
+    av_free(sws_buffer_);
+    sws_buffer_ = nullptr;
+    sws_buffer_size_ = 0;
+    std::fill(std::begin(sws_linesize_), std::end(sws_linesize_), 0);
+}
+
+bool VideoRenderNode::convertFrameToYuv420p(const Buffer* buffer, const CapsEvent& caps,
+                                             uint8_t* output_data[4], int output_linesize[4]) {
+    uint8_t* source_data[4]{};
+    int source_linesize[4]{};
+    // Buffer::fromAVFrame 使用 align=1 保存紧密连续 payload；按当前 active Caps 重建平面
+    // 不依赖 Y/U/V 的手工偏移，NV12、YUV422P、RGB 和高位深格式才能被正确解释
+    const int source_size = av_image_fill_arrays(source_data, source_linesize, buffer->data,
+                                                 caps.pix_fmt, caps.width, caps.height, 1);
+    if (source_size <= 0 || static_cast<size_t>(source_size) != buffer->size) {
+        return failRender("VideoRenderNode: video buffer size does not match active Caps pixel layout");
+    }
+
+    if (direct_yuv420p_) {
+        // YUV420P/YUVJ420P 已是 SDL IYUV 兼容的平面布局，直接沿用紧密 source planes
+        std::copy(std::begin(source_data), std::end(source_data), output_data);
+        std::copy(std::begin(source_linesize), std::end(source_linesize), output_linesize);
+        return true;
+    }
+
+    if (!sws_ctx_ || !sws_buffer_ || caps.pix_fmt != input_pix_fmt_) {
+        return failRender("VideoRenderNode: missing swscale configuration for active Caps");
+    }
+
+    const int output_size = av_image_fill_arrays(
+        output_data, output_linesize, sws_buffer_, AV_PIX_FMT_YUV420P,
+        caps.width, caps.height, 1);
+    if (output_size <= 0 || output_size != sws_buffer_size_) {
+        return failRender("VideoRenderNode: YUV420P conversion output layout is invalid");
+    }
+    if (!std::equal(output_linesize, output_linesize + 4, sws_linesize_)) {
+        return failRender("VideoRenderNode: YUV420P conversion output layout changed unexpectedly");
+    }
+
+    const uint8_t* source_planes[4] = {
+        source_data[0], source_data[1], source_data[2], source_data[3]
+    };
+    const int converted_height = sws_scale(sws_ctx_, source_planes, source_linesize,
+                                           0, caps.height, output_data, output_linesize);
+    if (converted_height != caps.height) {
+        return failRender("VideoRenderNode: sws_scale did not convert a complete frame");
+    }
     return true;
 }
 
@@ -139,6 +255,9 @@ void VideoRenderNode::closeRenderer() {
     texture_width_ = 0;
     texture_height_ = 0;
 
+    // 转换资源也只属于 VideoRender worker，须在该线程退出前释放
+    releaseConversion();
+
     if (renderer_) {
         SDL_DestroyRenderer(static_cast<SDL_Renderer*>(renderer_));
         renderer_ = nullptr;
@@ -154,10 +273,12 @@ void VideoRenderNode::closeRenderer() {
 }
 
 bool VideoRenderNode::ensureTexture(int width, int height) {
+    // 已有 Texture，宽高一致，不创建新的，直接复用
     if (texture_ && texture_width_ == width && texture_height_ == height) {
         return true;
     }
 
+    // 已有 Texture，但宽高不一致，销毁并重建
     if (texture_) {
         SDL_DestroyTexture(static_cast<SDL_Texture*>(texture_));
         texture_ = nullptr;
@@ -165,6 +286,7 @@ bool VideoRenderNode::ensureTexture(int width, int height) {
         texture_height_ = 0;
     }
 
+    // 原本就没有 Texture，跳过销毁逻辑直接创建
     if (!SDL_SetWindowSize(static_cast<SDL_Window*>(window_), width, height)) {
         return failRender(std::string("VideoRenderNode: SDL_SetWindowSize failed: ") +
                           SDL_GetError());
@@ -257,7 +379,8 @@ bool VideoRenderNode::waitForStartupBarrier() {
 // ===================================================================
 // consume: 工作线程等待目标 PTS、处理自身窗口关闭请求后直接呈现当前帧
 //
-// 当前只支持紧密排列的 YUV420P。其他格式留待正式 swscale 路径实现
+// active Caps 如实描述 Decode 产出的紧密像素布局；YUV420P/YUVJ420P 直传 SDL，
+// 其他格式先经本节点的 swscale 转为 IYUV，再复用同一上传和 Present 路径。
 // SDL 事件队列由本节点工作线程消费；当前只处理自身窗口关闭请求。
 // ===================================================================
 void VideoRenderNode::consume(const Buffer* buf) {
@@ -279,36 +402,30 @@ void VideoRenderNode::consume(const Buffer* buf) {
         return;
     }
 
-    // VideoRaw Buffer 当前约定为由 Buffer::fromAVFrame 生成的紧密连续 YUV420P payload；
-    // width/height/pix_fmt 只从最近成功应用的 active Caps 读取，不能再双重相信 BufferMeta。
+    // active Caps 是 Buffer 紧密存储布局的唯一权威；转换 helper 依据它重建 source planes，
+    // 并统一给出 SDL IYUV 所需的 Y/U/V 平面与 stride。
     const int width = caps.width;
     const int height = caps.height;
-    const size_t y_size = static_cast<size_t>(width) * height;
-    const int chroma_width = (width + 1) / 2;
-    const int chroma_height = (height + 1) / 2;
-    const size_t chroma_size = static_cast<size_t>(chroma_width) * chroma_height;
-    const size_t required_size = y_size + 2 * chroma_size;
-    if (buf->size < required_size) {
-        failRender("VideoRenderNode: YUV420P frame buffer is truncated");
-        return;
-    }
-
+    // 先完成同步判断：已过期帧不值得再执行 swscale，正常晚帧丢弃仍由 SinkNode ack 当前 Delivery。
     if (!waitForPresentationTime(buf->pts, buf->duration)) {
         return;
     }
+
+    uint8_t* yuv420p_data[4]{};
+    int yuv420p_linesize[4]{};
+    if (!convertFrameToYuv420p(buf, caps, yuv420p_data, yuv420p_linesize)) {
+        return;
+    }
+
     if (!ensureTexture(width, height)) {
         return;
     }
 
-    const uint8_t* y_plane = buf->data;
-    const uint8_t* u_plane = y_plane + y_size;
-    const uint8_t* v_plane = u_plane + chroma_size;
-
     if (!SDL_UpdateYUVTexture(
             static_cast<SDL_Texture*>(texture_), nullptr,
-            y_plane, width,
-            u_plane, chroma_width,
-            v_plane, chroma_width)) {
+            yuv420p_data[0], yuv420p_linesize[0],
+            yuv420p_data[1], yuv420p_linesize[1],
+            yuv420p_data[2], yuv420p_linesize[2])) {
         failRender(std::string("VideoRenderNode: SDL_UpdateYUVTexture failed: ") +
                    SDL_GetError());
         return;

@@ -74,21 +74,19 @@ Buffer* Buffer::fromAVPacket(const AVPacket* pkt, MediaType type, AVRational tim
 
 // ===================================================================
 // Buffer::fromAVFrame: 从解码后的 AVFrame 拷入数据
-//
-// 支持 planar 格式（YUV420P 等）和 packed 格式。
-// 调用者负责在调用后 av_frame_unref(frame) 或 av_frame_free。
-// 输出 Buffer 的 media_type 由调用者指定（VIDEO_RAW / AUDIO_RAW）。
+// 调用者负责在调用后 av_frame_unref(frame) 或 av_frame_free
 // ===================================================================
 Buffer* Buffer::fromAVFrame(const AVFrame* frame, MediaType type,
                              AVRational time_base, AVRational framerate) {
     if (!frame) {
+        // 调用方错误或 FFmpeg 没有给出有效输出，直接失败
         return nullptr;
     }
 
     bool valid_time_base = time_base.num > 0 && time_base.den > 0;
 
     if (type == MediaType::VIDEO_RAW) {
-        // 视频帧
+        // 从 Frame 中取得真实格式
         int width = frame->width;
         int height = frame->height;
         AVPixelFormat pix_fmt = static_cast<AVPixelFormat>(frame->format);
@@ -102,22 +100,32 @@ Buffer* Buffer::fromAVFrame(const AVFrame* frame, MediaType type,
             return nullptr;
         }
 
+        // 分配紧密连续的视频数据区
         auto* buf = new Buffer();
         size_t totalSize = static_cast<size_t>(required);
         buf->data = new uint8_t[totalSize];
         buf->size = totalSize;
 
         // 拷贝
-        int copied = av_image_copy_to_buffer(buf->data, required,
-                                             frame->data, frame->linesize,
-                                             pix_fmt, width, height, 1);
+        const int copied = av_image_copy_to_buffer(buf->data, required,
+                                                   frame->data, frame->linesize,
+                                                   pix_fmt, width, height, 1);
         if (copied < 0) {
+            // 拷贝失败不能直接 delete buf，因为 Buffer 析构函数私有，只能 unref() 回收
             buf->unref();
             return nullptr;
         }
 
-        buf->pts = (valid_time_base && frame->pts != AV_NOPTS_VALUE)
-                 ? av_rescale_q(frame->pts, time_base, {1, 1000000})
+        // best_effort_timestamp 是 FFmpeg 推导出的这个 Frame 最适合在媒体时间轴的展示时间
+        // 只有它无效时才保留 frame->pts，两个都无效才把 NOPTS 原样传给后续 Clock/渲染策略
+        const int64_t presentation_timestamp =
+            frame->best_effort_timestamp != AV_NOPTS_VALUE
+                ? frame->best_effort_timestamp
+                : frame->pts;
+
+        // 统一转换成微秒
+        buf->pts = (valid_time_base && presentation_timestamp != AV_NOPTS_VALUE)
+                 ? av_rescale_q(presentation_timestamp, time_base, {1, 1000000})
                  : AV_NOPTS_VALUE;
 
         // 视频帧 duration = 1 / framerate
@@ -128,13 +136,13 @@ Buffer* Buffer::fromAVFrame(const AVFrame* frame, MediaType type,
         }
         buf->media_type = MediaType::VIDEO_RAW;
 
-        // 视频流格式由先于本帧发送的 CapsEvent 唯一描述；当前紧密连续存储没有逐帧 layout。
+        // 视频流格式由先于本帧发送的 CapsEvent 唯一描述，当前紧密连续存储没有逐帧 layout
         buf->meta = VideoRawMeta{};
         return buf;
     }
 
     if (type == MediaType::AUDIO_RAW) {
-        // 音频帧
+        // 获取音频帧信息
         int sample_rate = frame->sample_rate;
         int channels = frame->ch_layout.nb_channels;
         AVSampleFormat sfmt = static_cast<AVSampleFormat>(frame->format);
@@ -143,12 +151,16 @@ Buffer* Buffer::fromAVFrame(const AVFrame* frame, MediaType type,
             return nullptr;
         }
 
+        // 计算每帧的大小
         int bytes_per_sample = av_get_bytes_per_sample(sfmt);
         if (bytes_per_sample <= 0) {
             return nullptr;
         }
 
+        // 判断是 planar 还是 packed
         bool is_planar_audio = av_sample_fmt_is_planar(sfmt);
+
+        // 优先使用 extended_data，可支持更多平面
         const uint8_t* const* audio_data = frame->extended_data
                                          ? frame->extended_data
                                          : const_cast<const uint8_t* const*>(frame->data);
@@ -156,12 +168,15 @@ Buffer* Buffer::fromAVFrame(const AVFrame* frame, MediaType type,
             return nullptr;
         }
 
+        // 先检查 nb_samples × bytes_per_sample 是否溢出
         size_t bytes = static_cast<size_t>(bytes_per_sample);
         size_t samples = static_cast<size_t>(nb_samples);
-        size_t channel_count = static_cast<size_t>(channels);
         if (samples > SIZE_MAX / bytes) {
             return nullptr;
         }
+
+        // 再检查 channel_count × 每声道字节数是否溢出
+        size_t channel_count = static_cast<size_t>(channels);
         size_t chSize = samples * bytes;
         if (channel_count > SIZE_MAX / chSize) {
             return nullptr;
@@ -192,8 +207,14 @@ Buffer* Buffer::fromAVFrame(const AVFrame* frame, MediaType type,
             memcpy(buf->data, audio_data[0], totalSize);
         }
 
-        buf->pts = (valid_time_base && frame->pts != AV_NOPTS_VALUE)
-                 ? av_rescale_q(frame->pts, time_base, {1, 1000000})
+        // 音频同样优先使用 best_effort_timestamp
+        // 对于没有可用推导的 codec，再回退保留 frame->pts
+        const int64_t presentation_timestamp =
+            frame->best_effort_timestamp != AV_NOPTS_VALUE
+                ? frame->best_effort_timestamp
+                : frame->pts;
+        buf->pts = (valid_time_base && presentation_timestamp != AV_NOPTS_VALUE)
+                 ? av_rescale_q(presentation_timestamp, time_base, {1, 1000000})
                  : AV_NOPTS_VALUE;
 
         // 音频帧 duration = nb_samples / sample_rate
@@ -201,7 +222,7 @@ Buffer* Buffer::fromAVFrame(const AVFrame* frame, MediaType type,
         buf->media_type = MediaType::AUDIO_RAW;
 
         AudioRawMeta meta;
-        // sample_rate/sample_fmt/layout 属于 active AudioRaw Caps；nb_samples 是逐帧属性。
+        // sample_rate/sample_fmt/layout 属于 active AudioRaw Caps；nb_samples 是逐帧属性
         meta.nb_samples = nb_samples;
         buf->meta = meta;
         return buf;

@@ -4,14 +4,16 @@
 
 #include <cstdint>
 
+struct SwsContext;
+
 namespace pipeline {
 
 // ===================================================================
 // VideoRenderNode: SDL3 视频渲染 Sink
 //
 // SDL VIDEO、Window、Renderer、Texture 全部由节点 worker 创建、使用和销毁。
-// 视频格式由 Running Route 上的完整 CapsEvent 唯一描述；当前只接受紧密 YUV420P，
-// 非 YUV420P 的 swscale 路径作为后续独立工作。
+// 视频格式由 Running Route 上的完整 CapsEvent 唯一描述；YUV420P/YUVJ420P 直传 SDL IYUV，
+// 其他 CPU 可访问格式由本节点在 SDL 提交前经 swscale 转为紧密 YUV420P。
 // ===================================================================
 class VideoRenderNode final : public SinkNode {
 public:
@@ -30,9 +32,17 @@ protected:
     void onStop() override;
 
 private:
+    // 仅供不创建 SDL 窗口的转换单元测试访问；生产路径仍只通过 onCaps()/consume() 调用。
+    friend struct VideoRenderNodeTestAccess;
+
     bool openRenderer();
     void closeRenderer();
     bool ensureTexture(int width, int height);
+    // onCaps 为非直传格式准备 swscale；实际逐帧转换仍在 consume 中执行。
+    bool configureConversion(const CapsEvent& caps);
+    void releaseConversion();
+    bool convertFrameToYuv420p(const Buffer* buffer, const CapsEvent& caps,
+                               uint8_t* output_data[4], int output_linesize[4]);
     bool failRender(const std::string& message);
     bool pollWindowCloseRequested();
     // 返回 true 表示当前帧应呈现；返回 false 表示当前帧应跳过或等待被 stop 打断。
@@ -41,6 +51,15 @@ private:
 
     int width_ = 0;
     int height_ = 0;
+    AVPixelFormat input_pix_fmt_ = AV_PIX_FMT_NONE;
+    bool direct_yuv420p_ = false;
+
+    // 非 YUV420P 输入只在节点 worker 内转换为 SDL IYUV 所需的紧密 YUV420P；
+    // context 和缓冲随 Caps 重配替换，并在 worker 退出前与 SDL 资源一起释放。
+    SwsContext* sws_ctx_ = nullptr;
+    uint8_t* sws_buffer_ = nullptr;
+    int sws_buffer_size_ = 0;
+    int sws_linesize_[4]{};
 
     // 只允许节点工作线程访问；窗口关闭请求也在该线程轮询处理。
     void* window_ = nullptr;

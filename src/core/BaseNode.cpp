@@ -216,8 +216,8 @@ bool BaseNode::applyCapsEvent(const std::string& sink_pad_name, const CapsEvent&
                     "applyCapsEvent: sink pad '" + sink_pad_name + "' not found or not connected");
         return false;
     }
-    // 首份 Caps 用 TemplateCaps 选择 SinkPad 的实际类型；后续 Caps 只能在已固定的
-    // MediaType 内重配格式，不能把同一条输入 Route 改成另一种媒体类型。
+    // 首份 Caps 用 TemplateCaps 选择 SinkPad 的实际类型
+    // 后续 Caps 只能在已固定的 MediaType 内重配格式，不允许运行中媒体类型改变
     const auto actual_type = pad->actualType();
     if (actual_type) {
         if (*actual_type != caps.media_type) {
@@ -233,7 +233,7 @@ bool BaseNode::applyCapsEvent(const std::string& sink_pad_name, const CapsEvent&
         return false;
     }
 
-    // 字段是否足够由具体消费者 onCaps 判断；成功前不更新 active_caps_，也不允许 ack。
+    // 字段是否足够由具体消费者 onCaps 判断；成功前不更新 active_caps_，也不允许 ack
     if (!onCaps(sink_pad_name, caps, outputs)) {
         return false;
     }

@@ -32,7 +32,7 @@
 - 不支持动态插件加载（.so）
 - 不支持 Windows / macOS，VideoRenderNode 的 SDL 视频线程模型只面向 Linux / 嵌入式 Linux
 - 不支持 PTS discontinuity、Caps generation 和通用采集 Source 的运行期 Caps 生产模型；这些需要结合 V4L2/音频采集的设备协商语义单独设计
-- 不支持 VIDEO_RAW 的非 YUV420P/YUVJ420P 渲染；VideoRenderNode 当前明确拒绝该类 Caps，swscale 路径后续实现
+- VideoRender 将 CPU 可访问的 VIDEO_RAW 非 YUV420P/YUVJ420P 格式经 swscale 转为 SDL IYUV 所需 YUV420P；当前仍不支持色彩空间/range/primaries/transfer/HDR 的显式 Caps 传递与严格色彩管理
 - **Mux Header 冻结合同**：所有输入初始 encoded Caps 到齐后建立 Header 并固定 Pad→输出 stream 映射；同一输入 Pad 后续出现 encoded CapsEvent 是协议错误，必须拒绝
 
 ### 1.5 典型链路示例
@@ -124,7 +124,7 @@ Buffer 是框架内所有数据的载体，拥有独立的引用计数体系，�
 
 `CapsEvent` 是流格式的唯一权威，并作为 Running 阶段 Route 中有位置的配置边界：每份 Caps 必须完整、准确地解释其后、至下一份 Caps 前的所有 Buffer。BufferMeta 不重复流级格式，只保留逐 Buffer 变化的事实与存储布局：例如 EncodedMeta::flags、AudioRawMeta::nb_samples；当前紧密连续 VideoRaw Buffer 没有额外的逐帧 layout。Buffer 在任何 active Caps 之前到达，或其 media_type 与 active Caps 不一致，都是协议错误。
 
-Buffer 层只忠实承载 FFmpeg 时间戳：pts/dts 无效时保留 AV_NOPTS_VALUE，duration 无效时为 0，不在此处推算时间；stream_index/pos/side_data 当前不进入 Buffer：流身份由 SrcPad/Edge 表达，seek/HDR/rotation/SEI 等后续单独设计。
+Buffer 层只忠实承载 FFmpeg 时间戳：Packet 的 pts/dts 无效时保留 AV_NOPTS_VALUE，duration 无效时为 0；解码 Frame 的展示时间优先使用 FFmpeg 已按重排推导的 `best_effort_timestamp`，其无效时保留 `frame->pts`，两者都无效才保留 AV_NOPTS_VALUE，不在此处继续推算。stream_index/pos/side_data 当前不进入 Buffer：流身份由 SrcPad/Edge 表达，seek/HDR/rotation/SEI 等后续单独设计。
 
 AudioRaw Buffer 保持 FFmpeg sample_fmt 对应的原始布局；planar 数据按 plane 顺序拼接，消费者使用 active AudioRaw Caps 的 sample_fmt/channel_layout 和逐 Buffer 的 nb_samples 解释。
 
@@ -541,7 +541,7 @@ EOSEvent
 → 未停止时 postMessage(EOS)
 ```
 
-`consume()` 因而只会收到已被最近成功应用的 active Caps 完整解释的 Buffer。格式字段是否足够由该 Sink 的 `onCaps()` 判断；例如 VideoRender 要求 YUV420P/YUVJ420P 的 width/height/pix_fmt，AudioPlay 要求完整且受支持的 AUDIO_RAW 参数。Caps 应用失败或 Buffer 违反顺序/类型合同都不 ack 当前 Delivery，由 RAII 撤销 in-flight 状态，随后通过 ERROR/stop 统一取消。
+`consume()` 因而只会收到已被最近成功应用的 active Caps 完整解释的 Buffer。格式字段是否足够由该 Sink 的 `onCaps()` 判断；例如 VideoRender 要求可描述紧密布局的 VIDEO_RAW width/height/pix_fmt，并将非 YUV420P/YUVJ420P 的 CPU 可访问格式在本地转换为 SDL IYUV；AudioPlay 要求完整且受支持的 AUDIO_RAW 参数。Caps 应用失败或 Buffer 违反顺序/类型合同都不 ack 当前 Delivery，由 RAII 撤销 in-flight 状态，随后通过 ERROR/stop 统一取消。
 
 `onDrain()` 默认为空；AudioPlay 重写它以等待 swr/SDL/设备尾音；VideoRender 仅在首帧前自然 EOS 时撤销启动 rendezvous 席位，其他情况保持空收尾。
 
@@ -560,7 +560,7 @@ Buffer 必须在处理完成后才 ack；停止或处理失败时不 ack 当前 
 
 生命周期：
 - Ready 阶段不依赖上游 Caps，只保留空的格式状态；不初始化 SDL VIDEO，也不创建 Window、Renderer 或 Texture
-- Running 中收到 VIDEO_RAW Caps 时，校验完整 width/height/pix_fmt，当前仅接受紧密 YUV420P/YUVJ420P；若已有 Texture 尺寸不匹配则销毁，下一帧按新 Caps 创建
+- Running 中收到 VIDEO_RAW Caps 时，校验完整 width/height/pix_fmt；YUV420P/YUVJ420P 按紧密平面直传 SDL IYUV，其他 CPU 可访问格式在本节点以 swscale 转为紧密 YUV420P。输入像素格式变化时重建转换 context/缓冲，只有尺寸变化才销毁 Texture，下一帧按新尺寸创建
 - 进入 Running 后，工作线程按如下顺序完成资源管理与渲染（`SDL_InitSubSystem(SDL_INIT_VIDEO)`）：
   - SDL_Window / SDL_Renderer 创建
   - 消费 VIDEO_RAW Buffer，创建或更新 SDL_Texture
@@ -1457,7 +1457,7 @@ CapsEvent → Buffer* → CapsEvent → Buffer* → EOSEvent
 |---|---|
 | Decode 输入 encoded Caps | `codec_id` 必须存在；VIDEO_ENCODED 的 width/height、AUDIO_ENCODED 的 sample_rate/channel_layout 是可选提示。已提供的合法提示写入 AVCodecContext；未知提示留给 FFmpeg 从 extradata/bitstream 确定。 |
 | Decode 输出 RAW Caps | 从真实 AVFrame 生成；VIDEO_RAW 必须有 width/height/pix_fmt，AUDIO_RAW 必须有 sample_rate/sample_fmt/有效 channel_layout。 |
-| VideoRender | 只接受完整 YUV420P/YUVJ420P VIDEO_RAW Caps。 |
+| VideoRender | 要求完整的 VIDEO_RAW width/height/pix_fmt。YUV420P/YUVJ420P 直传 SDL IYUV；其他 CPU 可访问格式经 swscale 转为 YUV420P 后上传。 |
 | AudioPlay | 只接受完整、标准 native channel layout 的 AUDIO_RAW Caps，并重采样为固定 canonical SDL 格式。 |
 | Mux 基类 | 初始 encoded Caps 至少需要 `codec_id`；具体容器 Header 所需的尺寸/采样率等由 `addStream()` 后端校验。 |
 
@@ -1467,7 +1467,7 @@ CapsEvent → Buffer* → CapsEvent → Buffer* → EOSEvent
 
 **DecodeNode** 在输入 encoded Caps 到达时：若已有旧上下文，先把 delayed AVFrame 加入本地有序 outputs，再释放旧上下文并配置新 decoder。它不以 `avcodec_open2()` 后的 context 字段声明 RAW 格式；许多视频 decoder 此时仍没有 pix_fmt。每取得一帧真实 AVFrame，Decode 先比较其真实 RAW 格式：首帧或格式变化帧先将完整 RAW Caps 加入 outputs，随后加入该帧 Buffer。EOS flush 使用同一 outputs 序列，基类最后追加唯一 EOSEvent。
 
-**VideoRenderNode** 在 Running 应用 Caps，记录格式并在尺寸变化时销毁旧 Texture；SDL VIDEO/Window/Renderer/Texture 仍由 worker 持有完整生命周期。
+**VideoRenderNode** 在 Running 应用 Caps，忠实保存上游真实像素格式：YUV420P/YUVJ420P 直接上传 SDL IYUV，其他 CPU 可访问格式在该消费端通过 swscale 转为紧密 YUV420P。像素格式重配只替换转换资源，尺寸变化时再销毁旧 Texture，下一帧重建。SDL VIDEO/Window/Renderer/Texture 仍由 worker 持有完整生命周期。
 
 **AudioPlayNode** 在 Ready 建立固定 canonical SDL 提交端：S16 packed、默认设备派生采样率、stereo FL/FR。Running 中每份 AudioRaw Caps 先排空旧 swr 的 canonical 尾部，再重建 `input → canonical` swr；不会清空 canonical SDL 队列，故背压、提交账本和 Clock 始终使用 canonical 帧量纲。
 
@@ -1657,7 +1657,7 @@ SinkNode 收到输入 EOS 后，先 ack（释放上游 Route，不占背压窗�
 1. Ready 阶段，参与同一同步域首次起跑的呈现型 Sink 调用 `registerStartupParticipant()`；`Pipeline::play()` 在 `graph.ready()` 全部成功后调用 `sealStartupParticipants()`，先固定参与人数，再启动 worker。
 2. AudioPlay 在第一段 canonical PCM、首次 `SDL_PutAudioStreamData()` 之前到达；VideoRender 在首帧已完成 Texture 创建和上传、首次 `SDL_RenderPresent()` 之前到达。栅栏只挡首次外部输出，不预填 SDL，也不等待 Clock 锚定。
 3. 最后到达者将 `StartupBarrierState` 从 `WAITING` 切到 `RELEASED` 并唤醒全部先到者。单参与者在自己到达时立即释放；无参与者在 seal 时直接进入 `RELEASED`。
-4. 若已登记参与者在首次输出前自然 EOS，Sink 的 `onDrain()` 调用 `withdrawStartupParticipant()` 撤销席位；当其余已到达人数等于剩余登记人数时正常释放。AudioPlay withdraw 后仍按既有 swr/SDL drain 收尾；若该尾部首次产生 canonical PCM，它面对已释放栅栏提交，当前不把该罕见尾部路径提升为第二轮 rendezvous。stop、ERROR、STOP_REQUESTED 以及 Ready/封闭失败均调用 `cancelStartupBarrier()`，状态进入 `CANCELLED` 并唤醒全部等待者。
+4. 若已登记参与者在首次外部输出前自然 EOS，Sink 的 `onDrain()` 调用 `withdrawStartupParticipant()` 撤销的只是“启动时必须到场”的栅栏席位；当其余已到达人数等于剩余登记人数时，栅栏正常释放，另一侧不再永久等待。withdraw 不表示该 Sink 已完成，也不清除 AudioPlay 已记录的 PTS 锚点、提交账本或设备消费 Clock。AudioPlay 仍按既有 swr/SDL drain 收尾：若仅在 swr 尾部才首次产生 canonical PCM，它面对已经 `RELEASED` 的栅栏直接提交，不建立第二轮 rendezvous；此前已见有效音频 PTS 时，尾部 PCM 的设备消费仍照常刷新 Audio Clock，只是不再保证首次音频提交与 Video 首次 Present 共同起跑。整条音频始终没有有效 PTS 时，Clock 保持未锚定是既有时间戳语义，与 withdraw 无关。stop、ERROR、STOP_REQUESTED 以及 Ready/封闭失败均调用 `cancelStartupBarrier()`，状态进入 `CANCELLED` 并唤醒全部等待者。
 5. 有自身事件循环的参与者使用限时 `arriveAndWaitForStartupFor(timeout, bool& arrived)`：`TIMEOUT` 不改变 Clock 的持久 `WAITING` 状态，调用者可处理自己的事件后带同一 `arrived` 标记重试，绝不重复计入到达人数。当前 VideoRender 每 10ms 醒来轮询自身窗口关闭请求；普通无限等待版本适合不需要额外事务的参与者。
 
 栅栏释放后，既有规则完全不变：AudioPlay 仍按首个有效 PTS 与 NOPTS 前缀账本刷新 Audio Clock；VideoRender 在 Clock 未锚定时立即呈现，已锚定后再按本节以下的呈现节奏规则运行。
@@ -1936,9 +1936,9 @@ Pipeline::waitEOS
 3. **有损订阅策略暂不支持**：当前所有静态订阅者都可靠。未来实时预览、统计等确需丢帧时，应在 EdgePolicy 中显式表达 `LATEST_ONLY`/drop 策略；Caps、EOS、格式变化等控制事件仍必须可靠。
 4. **Route 通知回调限制**：当前只在 Mux Ready 阶段注册，用于唤醒多输入调度；若未来需要运行期变更，必须定义通知列表的线程安全边界。
 5. **link/build 错误报告**：核心库当前只返回 bool，不直接 fprintf，也不适合走运行期 MessageBus；详细错误报告机制仍需独立设计。
-6. **Caps 运行期边界的剩余限制**：Decoder 首帧真实格式定案、同一 Route 多份 Caps、VideoRender 尺寸变化和 AudioPlay 输入重配已支持；尚不支持 PTS discontinuity、Caps generation、非 YUV420P swscale。
+6. **Caps 运行期边界的剩余限制**：Decoder 首帧真实格式定案、同一 Route 多份 Caps、VideoRender 尺寸变化、CPU 可访问非 YUV420P swscale 和 AudioPlay 输入重配已支持；尚不支持 PTS discontinuity、Caps generation，以及色彩空间/range/primaries/transfer/HDR 的显式格式协商与严格色彩管理。
 7. **采集 Source 的 Caps 生产模型**：默认 `SourceNode::capture() -> Buffer*` 不能表达 `Caps → Buffer* → Caps → Buffer*`。V4L2/AudioCapture 落地前必须先结合设备 open、协商、重配及运行期格式变化，设计有序 `QueueItem` 的 Source 生产接口；当前不得用该旧默认骨架接入要求 Running Caps 的新节点。
-8. **媒体兼容性**：Packet side data、`best_effort_timestamp`、send/receive EAGAIN、非 YUV420P swscale、色彩空间/HDR 等仍需按具体节点补全；`pkt_timebase` 已设置为框架微秒时间基，完整 channel layout 已以 Caps 的 `ChannelLayout` 值类型传递，但 AudioPlay 当前只承诺标准 native layout 到 stereo 的转换。
+8. **媒体兼容性**：解码 Frame 已优先使用 `best_effort_timestamp`，Decoder 的 `send_packet(EAGAIN)` 已按 drain 后重发同一 Packet 的合同处理，CPU 可访问的非 YUV420P 视频已在 VideoRender 通过 swscale 转为 IYUV；`pkt_timebase` 已设置为框架微秒时间基，完整 channel layout 已以 Caps 的 `ChannelLayout` 值类型传递，但 AudioPlay 当前只承诺标准 native layout 到 stereo 的转换。Packet side data（例如 DISPLAYMATRIX、HDR/动态 metadata）当前仍在 Packet→Buffer 转换时丢弃，未接入 CapsEvent：目前没有消费端，尤其 VideoRender 没有旋转/HDR 应用路径。若素材来源出现手机直拍等必须按旋转矩阵显示的竖版视频，再单独确定“CapsEvent 的 rotation 字段 + Render 应用”设计；不得预先将所有逐 Packet side data 伪装为流级 Caps。色彩空间/HDR 的显式协商也仍待具体消费端语义确定。
 9. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
 10. **Demux/Mux 边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`，虽 Route 已支持可靠多订阅者输出，但动态 Mux 输出 Pad、最终交织策略、阻塞网络 I/O interrupt callback 和具体 AVMuxNode 仍待实现。
 11. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4；需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。

@@ -341,3 +341,30 @@ remaining >= -threshold
 - `Buffer.duration == 0` 时阈值为 40ms；当前 duration 来自 encoded nominal framerate hint，尚不等于完整逐帧 VFR 时长模型。
 - 不复刻 ffplay 的“确认后面还有下一帧才丢当前帧” lookahead，因为当前 Subscription 在持有 in-flight Delivery 时不能窥视后项；改变 Route in-flight/peek 合同不应混入本轮。
 - 记录 rendered/dropped 计数但不逐帧输出日志；真实 MV 自然 EOS 验证为 `5703 rendered + 3 dropped = 5706` 解码帧。
+
+
+---
+
+## Decoder 时间戳、send/receive EAGAIN 与 VideoRender swscale 收尾
+
+### 决策背景
+
+第三阶段剩余的三个媒体兼容性缺口都已有明确边界，不需要再引入新的 Route、Caps 或 Buffer 所有权模型：
+
+- Decode 输出 Buffer 以前只读取 `frame->pts`，遗漏 FFmpeg 在帧重排后提供的展示时间；
+- `avcodec_send_packet()` 返回 `EAGAIN` 时以前直接报 ERROR，未遵守“先 receive drain、再重发同一 Packet”的 API 合同；
+- Decoder 已经在 Running Caps 诚实发布真实 `pix_fmt`，但 VideoRender 只接受 YUV420P/YUVJ420P，其他格式虽不再被误读却不能播放。
+
+### 时间戳与 EAGAIN 合同
+
+- `Buffer::fromAVFrame()` 对视频和音频统一选择展示时间：优先 `frame->best_effort_timestamp`，其无效时保留 `frame->pts`，两者都无效才传递 `AV_NOPTS_VALUE`。时间基换算仍由调用方传入的 frame time base 完成；Buffer 不继续猜测时间戳。
+- `DecodeNode` 把 `avcodec_send_packet()` 和紧随其后的 `receive_frame()` 收敛为同一 helper。首次 send 返回 `EAGAIN` 时，先 drain 现有可输出帧到当前本地 `outputs` 序列，再以**同一个仍存活的 AVPacket**重发一次；重发仍失败才上报 ERROR。
+- 普通输入 Packet、输入 Caps 重配前对旧 decoder 的 null-packet flush、EOS null-packet flush全部复用该 helper，避免任一路径重新把 `EAGAIN` 误判为致命错误。Packet 仅在 helper 完成后释放。
+
+### VideoRender 非 YUV420P 转换合同
+
+- Decode 输出 Caps 始终忠实保留真实 `width`、`height`、`pix_fmt`；不把上游格式伪装成 YUV420P，也不在 Buffer 层做面向特定 Sink 的转换。
+- VideoRender 在 `onCaps()` 根据真实输入格式选择本地消费路径：紧密 YUV420P/YUVJ420P 直传 SDL IYUV；其他 CPU 可访问格式建立新的 `SwsContext` 和紧密 YUV420P 输出缓冲。所有 replacement 构造成功后才替换旧转换资源。
+- 每帧 `consume()` 依据 active Caps 用 FFmpeg image 工具从紧密 Buffer 重建 source plane/linesize；非直传格式在此执行 `sws_scale()`，随后与直传格式共用 SDL IYUV 上传、Texture 和 Present 路径。晚帧先完成 Clock 判断，过期帧不浪费转换成本。
+- 像素格式重配只替换 swscale context/缓冲，尺寸变化才销毁并重建 SDL Texture。转换资源和 SDL 视频资源同属 VideoRender worker，在 worker 统一退出尾部释放。
+- 本轮目标是让 NV12、YUV422P、YUV444P、常规 10-bit、RGB 等 CPU 可访问格式可转换播放；Caps 当前不承载 color range、matrix、primaries、transfer 或 HDR metadata，因此不宣称完成严格色彩管理或 HDR 呈现。

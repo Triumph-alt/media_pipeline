@@ -29,8 +29,13 @@ protected:
     void onEOS(std::vector<QueueItem>& outputs) override;
 
 private:
+    // 仅供不依赖 Route 的 FFmpeg EAGAIN 状态机单元测试访问；生产路径仍从 process/onEOS 进入。
+    friend struct DecodeNodeTestAccess;
+
     AVPacket* toAVPacket(const Buffer* buf);
     bool configureDecoder(const CapsEvent& caps);
+    // send_packet(EAGAIN) 时先取空 decoder 内部已就绪帧，再重试同一 Packet；nullptr 用于 flush。
+    bool sendPacketAndDrain(AVPacket* packet, std::vector<QueueItem>& outputs);
     bool drainDecoder(std::vector<QueueItem>& outputs);
     bool appendFrame(AVFrame* frame, std::vector<QueueItem>& outputs);
     bool appendOutputCapsForFrame(const AVFrame* frame, std::vector<QueueItem>& outputs);

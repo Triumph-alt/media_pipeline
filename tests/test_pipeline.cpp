@@ -1,6 +1,8 @@
 #include "pipeline/core/Pipeline.h"
 #include "pipeline/core/Buffer.h"
 #include "pipeline/core/Caps.h"
+#include "pipeline/nodes/DecodeNode.h"
+#include "pipeline/nodes/VideoRenderNode.h"
 
 #include <atomic>
 #include <cassert>
@@ -15,6 +17,42 @@
 #include <vector>
 
 using namespace pipeline;
+
+namespace pipeline {
+
+struct DecodeNodeTestAccess {
+    static void setContext(DecodeNode& node, AVCodecContext* context) {
+        node.ctx_ = context;
+        node.is_video_ = true;
+    }
+
+    static bool sendPacketAndDrain(DecodeNode& node, AVPacket* packet,
+                                   std::vector<QueueItem>& outputs) {
+        return node.sendPacketAndDrain(packet, outputs);
+    }
+
+    static void releaseContext(DecodeNode& node) {
+        avcodec_free_context(&node.ctx_);
+    }
+};
+
+struct VideoRenderNodeTestAccess {
+    static bool configureConversion(VideoRenderNode& node, const CapsEvent& caps) {
+        return node.configureConversion(caps);
+    }
+
+    static bool convertFrameToYuv420p(VideoRenderNode& node, const Buffer* buffer,
+                                      const CapsEvent& caps, uint8_t* output_data[4],
+                                      int output_linesize[4]) {
+        return node.convertFrameToYuv420p(buffer, caps, output_data, output_linesize);
+    }
+
+    static void releaseConversion(VideoRenderNode& node) {
+        node.releaseConversion();
+    }
+};
+
+} // namespace pipeline
 
 namespace {
 
@@ -595,6 +633,151 @@ void test_buffer_metadata_is_frame_scoped() {
     printf(" OK\n");
 }
 
+void test_buffer_prefers_best_effort_timestamp() {
+    printf("  test_buffer_prefers_best_effort_timestamp...");
+    fflush(stdout);
+
+    AVFrame* video = av_frame_alloc();
+    assert(video);
+    video->format = AV_PIX_FMT_YUV420P;
+    video->width = 2;
+    video->height = 2;
+    assert(av_frame_get_buffer(video, 1) >= 0);
+    video->pts = 11;
+    video->best_effort_timestamp = 17;
+    BufferRef video_buffer(Buffer::fromAVFrame(video, MediaType::VIDEO_RAW, AVRational{1, 1000}));
+    assert(video_buffer);
+    // best_effort_timestamp 是 Decoder 已完成重排后的展示时间，必须优先于仍存在的原始 PTS。
+    assert(video_buffer->pts == 17000);
+
+    video->best_effort_timestamp = AV_NOPTS_VALUE;
+    video->pts = 23;
+    BufferRef pts_fallback(Buffer::fromAVFrame(video, MediaType::VIDEO_RAW, AVRational{1, 1000}));
+    assert(pts_fallback);
+    // 某些 codec 不提供 best-effort 时仍保留 frame->pts，而不是把可用时间戳降级为 NOPTS。
+    assert(pts_fallback->pts == 23000);
+    av_frame_free(&video);
+
+    AVFrame* audio = av_frame_alloc();
+    assert(audio);
+    audio->format = AV_SAMPLE_FMT_S16;
+    audio->sample_rate = 48000;
+    audio->ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+    audio->nb_samples = 4;
+    assert(av_frame_get_buffer(audio, 1) >= 0);
+    audio->pts = 29;
+    audio->best_effort_timestamp = 31;
+    BufferRef audio_buffer(Buffer::fromAVFrame(audio, MediaType::AUDIO_RAW, AVRational{1, 1000}));
+    assert(audio_buffer);
+    assert(audio_buffer->pts == 31000);
+    av_frame_free(&audio);
+    printf(" OK\n");
+}
+
+void test_decode_send_packet_eagain_drains_and_retries() {
+    printf("  test_decode_send_packet_eagain_drains_and_retries...");
+    fflush(stdout);
+
+    const AVCodec* decoder = avcodec_find_decoder(AV_CODEC_ID_RAWVIDEO);
+    assert(decoder);
+    AVCodecContext* context = avcodec_alloc_context3(decoder);
+    assert(context);
+    context->codec_type = AVMEDIA_TYPE_VIDEO;
+    context->codec_id = AV_CODEC_ID_RAWVIDEO;
+    context->pix_fmt = AV_PIX_FMT_YUV420P;
+    context->width = 2;
+    context->height = 2;
+    context->coded_width = 2;
+    context->coded_height = 2;
+    context->pkt_timebase = AVRational{1, 1000};
+    assert(avcodec_open2(context, decoder, nullptr) >= 0);
+
+    DecodeNode decoder_node("decode-eagain-test");
+    pipeline::DecodeNodeTestAccess::setContext(decoder_node, context);
+    AVPacket* packet = av_packet_alloc();
+    assert(packet);
+    assert(av_new_packet(packet, 6) >= 0);
+    // rawvideo 的 2×2 YUV420P payload 恰为 4 个 Y + 1 个 U + 1 个 V 字节。
+    memset(packet->data, 128, static_cast<size_t>(packet->size));
+    packet->pts = 7;
+
+    std::vector<QueueItem> outputs;
+    // 有意连续 send 三次且不在前两次 receive，让第三次进入 FFmpeg 规定的 EAGAIN 分支。
+    assert(avcodec_send_packet(context, packet) >= 0);
+    assert(avcodec_send_packet(context, packet) >= 0);
+    assert(pipeline::DecodeNodeTestAccess::sendPacketAndDrain(decoder_node, packet, outputs));
+
+    size_t output_frames = 0;
+    for (const QueueItem& item : outputs) {
+        if (std::holds_alternative<BufferRef>(item)) {
+            ++output_frames;
+        }
+    }
+    // helper 先 drain 前两帧、再成功重发第三帧并再次 drain，三帧不能因 EAGAIN 丢失。
+    assert(output_frames == 3);
+
+    av_packet_free(&packet);
+    pipeline::DecodeNodeTestAccess::releaseContext(decoder_node);
+    printf(" OK\n");
+}
+
+void test_video_render_converts_yuv422p_to_yuv420p() {
+    printf("  test_video_render_converts_yuv422p_to_yuv420p...");
+    fflush(stdout);
+
+    AVFrame* source = av_frame_alloc();
+    assert(source);
+    source->format = AV_PIX_FMT_YUV422P;
+    source->width = 4;
+    source->height = 2;
+    assert(av_frame_get_buffer(source, 1) >= 0);
+
+    for (int row = 0; row < source->height; ++row) {
+        for (int column = 0; column < source->width; ++column) {
+            source->data[0][row * source->linesize[0] + column] =
+                static_cast<uint8_t>(16 + row * source->width + column);
+        }
+        for (int column = 0; column < (source->width + 1) / 2; ++column) {
+            // 常量 chroma 让 4:2:2 -> 4:2:0 的垂直抽样结果可精确验证。
+            source->data[1][row * source->linesize[1] + column] = 90;
+            source->data[2][row * source->linesize[2] + column] = 200;
+        }
+    }
+
+    BufferRef packed(Buffer::fromAVFrame(source, MediaType::VIDEO_RAW, AVRational{1, 1000}));
+    assert(packed);
+    av_frame_free(&source);
+
+    CapsEvent caps;
+    caps.media_type = MediaType::VIDEO_RAW;
+    caps.width = 4;
+    caps.height = 2;
+    caps.pix_fmt = AV_PIX_FMT_YUV422P;
+
+    VideoRenderNode renderer("conversion-test");
+    assert(pipeline::VideoRenderNodeTestAccess::configureConversion(renderer, caps));
+    uint8_t* output_data[4]{};
+    int output_linesize[4]{};
+    assert(pipeline::VideoRenderNodeTestAccess::convertFrameToYuv420p(
+        renderer, packed.get(), caps, output_data, output_linesize));
+
+    assert(output_linesize[0] == 4);
+    assert(output_linesize[1] == 2);
+    assert(output_linesize[2] == 2);
+    for (int row = 0; row < 2; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            assert(output_data[0][row * output_linesize[0] + column] ==
+                   static_cast<uint8_t>(16 + row * 4 + column));
+        }
+    }
+    for (int column = 0; column < 2; ++column) {
+        assert(output_data[1][column] == 90);
+        assert(output_data[2][column] == 200);
+    }
+    pipeline::VideoRenderNodeTestAccess::releaseConversion(renderer);
+    printf(" OK\n");
+}
+
 void test_output_route_shared_delivery() {
     printf("  test_output_route_shared_delivery...");
     fflush(stdout);
@@ -1101,6 +1284,9 @@ int main() {
     test_channel_layout_value_semantics();
     test_caps_format_comparison_excludes_framerate();
     test_buffer_metadata_is_frame_scoped();
+    test_buffer_prefers_best_effort_timestamp();
+    test_decode_send_packet_eagain_drains_and_retries();
+    test_video_render_converts_yuv422p_to_yuv420p();
     test_output_route_shared_delivery();
     test_output_route_ack_controls_backpressure();
     test_output_route_delivery_abandon_retries();

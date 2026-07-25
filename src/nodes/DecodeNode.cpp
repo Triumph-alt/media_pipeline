@@ -113,8 +113,8 @@ bool DecodeNode::onCaps(const std::string&, const CapsEvent& caps,
     // 新 encoded Caps 不能越过旧 decoder 尚未取出的延迟帧
     // 必须把它们加入同一有序输出序列，再 ack 当前输入 Caps 并替换 decoder context
     if (ctx_ && !flushed_) {
-        // 向 FFmpeg 发送空 Packet 开始旧 Decoder flush
-        if (avcodec_send_packet(ctx_, nullptr) < 0 || !drainDecoder(*outputs)) {
+        // 空 Packet 触发旧 decoder flush；send_packet(EAGAIN) 仍必须先取走可输出帧后重试。
+        if (!sendPacketAndDrain(nullptr, *outputs)) {
             return false;
         }
         flushed_ = true;
@@ -194,6 +194,7 @@ bool DecodeNode::drainDecoder(std::vector<QueueItem>& outputs) {
 
         const int ret = avcodec_receive_frame(ctx_, frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            // 当前 decoder 内部已经没有完成的 Frame 了，需要再送输入
             av_frame_free(&frame);
             return true;
         }
@@ -211,6 +212,27 @@ bool DecodeNode::drainDecoder(std::vector<QueueItem>& outputs) {
     }
 }
 
+bool DecodeNode::sendPacketAndDrain(AVPacket* packet, std::vector<QueueItem>& outputs) {
+    int ret = avcodec_send_packet(ctx_, packet);
+    if (ret == AVERROR(EAGAIN)) {
+        // EAGAIN 表示 decoder 仍保留可接收的输出，要先取出来加入当前同一有序 outputs
+        if (!drainDecoder(outputs)) {
+            return false;
+        }
+
+        // 随后重发一次这个 Packet
+        ret = avcodec_send_packet(ctx_, packet);
+    }
+
+    if (ret < 0) {
+        postMessage(MessageType::ERROR, "DecodeNode: avcodec_send_packet failed");
+        return false;
+    }
+
+    // send 成功后立即接收所有当前已产出的帧；下次 send 即使仍报告 EAGAIN，也有 helper 兜底
+    return drainDecoder(outputs);
+}
+
 void DecodeNode::process(const Buffer* input, std::vector<QueueItem>& outputs) {
     if (!ctx_) {
         postMessage(MessageType::ERROR, "DecodeNode: input Buffer received without configured decoder");
@@ -223,14 +245,12 @@ void DecodeNode::process(const Buffer* input, std::vector<QueueItem>& outputs) {
         return;
     }
 
-    const int ret = avcodec_send_packet(ctx_, packet);
+    // Packet 在 EAGAIN drain/retry 期间必须保持有效；helper 返回后才允许 FFmpeg payload 释放。
+    const bool decoded = sendPacketAndDrain(packet, outputs);
     av_packet_free(&packet);
-    if (ret < 0) {
-        postMessage(MessageType::ERROR, "DecodeNode: avcodec_send_packet failed");
+    if (!decoded) {
         return;
     }
-
-    drainDecoder(outputs);
 }
 
 void DecodeNode::onEOS(std::vector<QueueItem>& outputs) {
@@ -238,11 +258,8 @@ void DecodeNode::onEOS(std::vector<QueueItem>& outputs) {
         return;
     }
 
-    if (avcodec_send_packet(ctx_, nullptr) < 0) {
-        postMessage(MessageType::ERROR, "DecodeNode: avcodec_send_packet flush failed");
-        return;
-    }
-    if (!drainDecoder(outputs)) {
+    // EOS flush 与普通 Packet 共用同一 EAGAIN 合同，避免重排帧仍在 decoder 内部时把 flush 误判为错误。
+    if (!sendPacketAndDrain(nullptr, outputs)) {
         return;
     }
     flushed_ = true;

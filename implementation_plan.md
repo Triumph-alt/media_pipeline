@@ -205,8 +205,8 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 | 节点 | 关键内容 |
 |------|---------|
 | DemuxNode | av_read_frame、时间戳转微秒、多路分发、worker 在每条 Route 首个 Packet 前发布 encoded Caps、EOF 发 EOS |
-| DecodeNode | Running encoded Caps 驱动 decoder 配置；真实 AVFrame 前发布 RAW Caps；重配前 drain、send/receive、EOS flush |
-| VideoRenderNode | Running Caps 应用格式边界；仅支持紧密 YUV420P/YUVJ420P；SDL VIDEO、Window、Renderer、Texture 在 VideoRender 工作线程中初始化、使用和销毁；worker 退出前清理 SDL TLS；按帧处理自身窗口关闭请求并通过 `STOP_REQUESTED` 请求 Pipeline 停止；Clock 启动 rendezvous 与基于 `max(Buffer.duration, 40ms)` 的动态晚帧丢弃 |
+| DecodeNode | Running encoded Caps 驱动 decoder 配置；真实 AVFrame 前发布 RAW Caps；重配前 drain、完整 send/receive EAGAIN 状态机、EOS flush；Frame PTS 优先使用 FFmpeg `best_effort_timestamp` |
+| VideoRenderNode | Running Caps 应用格式边界；YUV420P/YUVJ420P 紧密帧直传 SDL IYUV，其余 CPU 可访问格式按真实 Caps 通过 swscale 转为 YUV420P；SDL VIDEO、Window、Renderer、Texture 和转换资源在 VideoRender 工作线程中初始化、使用和销毁；worker 退出前清理 SDL TLS；按帧处理自身窗口关闭请求并通过 `STOP_REQUESTED` 请求 Pipeline 停止；Clock 启动 rendezvous 与基于 `max(Buffer.duration, 40ms)` 的动态晚帧丢弃 |
 | AudioPlayNode | Ready 建固定 canonical SDL 提交端；Running AudioRaw Caps 重建 input→canonical swr；canonical Clock、背压、EOS drain；音频 worker 退出前清理 SDL TLS |
 | Demo | Pipeline 内部管理 SDL 基础设施生命周期（同一进程同一时刻至多一个 Pipeline 存活）+ Demux → Decode×2 → VideoRender + AudioPlay |
 
@@ -282,7 +282,7 @@ FFmpeg 需额外开启 encoder 和 muxer（见第一阶段 1.3 配置）。
 | RTSP 推流 | RTSPPushNode |
 | 线程绑核 | pthread_setaffinity_np |
 | AV Sync 自适应 | 丢帧阈值动态调整 |
-| 媒体兼容性 | Packet side data、best_effort_timestamp、send/receive EAGAIN、非 YUV420P swscale、色彩空间/HDR 等按具体节点补全 |
+| 媒体兼容性 | 已完成：`pkt_timebase`、完整 channel layout、解码 Frame `best_effort_timestamp`、Decoder send/receive EAGAIN、VideoRender CPU 可访问非 YUV420P swscale。暂缓：Packet side data（当前无消费者；手机直拍等出现 DISPLAYMATRIX 旋转需求时，再设计 CapsEvent rotation + Render 应用），以及色彩空间/HDR 语义。 |
 | Running Caps 的剩余边界 | PTS discontinuity、Caps generation；Mux Header 后拒绝 encoded Caps 是已确定的冻结合同，不列为待支持重配 |
 | 采集 Source Caps 模型 | 默认 `SourceNode::capture() -> Buffer*` 无法表达有序 `Caps → Buffer* → Caps → Buffer*`；V4L2/AudioCapture 实现前结合设备协商和重配语义设计新的生产接口 |
 | VideoRender 事件轮询 | 当前只在取得视频帧并进入 `consume()` 时检查窗口关闭；上游无帧期间的及时响应待优化 |
