@@ -111,30 +111,100 @@ BufferRef makeBuffer(MediaType type, uint8_t value = 1, size_t size = 1) {
 }
 
 // ===================================================================
-// CapsScriptSource emits an explicit Running sequence. It deliberately does not rely on Ready Caps;
-// each script item passes through the same Route publish machinery as production nodes.
+// CapsScriptProducer 是有限输入的测试夹具，不继承 SourceNode。它刻意模拟文件等有自然
+// EOF 的通用上游，以便为 Transform / Sink / Mux 的 EOS 合同提供输入；真实采集
+// SourceNode 不具备此语义。
 // ===================================================================
-class CapsScriptSource final : public SourceNode {
+class CapsScriptProducer final : public BaseNode {
 public:
-    CapsScriptSource(const std::string& name, std::vector<QueueItem> script)
-        : SourceNode(name), script_(std::move(script)) {}
+    CapsScriptProducer(const std::string& name, std::vector<QueueItem> script)
+        : BaseNode(name), script_(std::move(script)) {
+        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW, MediaType::AUDIO_RAW,
+                                        MediaType::VIDEO_ENCODED, MediaType::AUDIO_ENCODED}});
+    }
+
+    NodeType nodeType() const override { return NodeType::DEMUX; }
 
 protected:
     bool onReady() override { return true; }
     void onStop() override {}
-    Buffer* capture() override { return nullptr; }
 
-    void runLoop() override {
+    void runLoop() override final {
         for (auto& item : script_) {
             if (stop_requested_.load() || !publishOutputItem(std::move(item))) {
                 return;
             }
         }
-        sendEOSDownstream();
+        if (!stop_requested_.load()) {
+            sendEOSDownstream();
+        }
+    }
+
+    SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override final {
+        const auto& existing = src_pads_[0]->templateCaps();
+        if (!existing.contains(hint_type)) {
+            return nullptr;
+        }
+        return addBranchedSrcPad(name, *src_pads_[0]);
     }
 
 private:
     std::vector<QueueItem> script_;
+};
+
+// CaptureScriptSource 通过真实 SourceNode::produce() 合同模拟持续采集：脚本项耗尽后
+// 等待外部 stop，不会发送自然 EOS。
+class CaptureScriptSource final : public SourceNode {
+public:
+    CaptureScriptSource(const std::string& name, std::vector<QueueItem> script)
+        : SourceNode(name), script_(std::move(script)) {
+        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW, MediaType::AUDIO_RAW,
+                                        MediaType::VIDEO_ENCODED, MediaType::AUDIO_ENCODED}});
+    }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+
+    void produce(std::vector<QueueItem>& outputs) override {
+        if (next_item_ < script_.size()) {
+            outputs.emplace_back(std::move(script_[next_item_]));
+            ++next_item_;
+            return;
+        }
+
+        while (!stop_requested_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+private:
+    std::vector<QueueItem> script_;
+    size_t next_item_ = 0;
+};
+
+// 未声明首个输出 Pad 的具体 Source 不得由 link hint 反向创造能力。
+class UndeclaredOutputSource final : public SourceNode {
+public:
+    explicit UndeclaredOutputSource(const std::string& name) : SourceNode(name) {}
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+    void produce(std::vector<QueueItem>&) override {}
+};
+
+// 普通 Transform 也必须在构造期声明首个输出能力，不能由 requestSrcPad() 临时补造。
+class UndeclaredOutputTransform final : public TransformNode {
+public:
+    explicit UndeclaredOutputTransform(const std::string& name) : TransformNode(name) {
+        addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+    }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+    void process(const Buffer*, std::vector<QueueItem>&) override {}
 };
 
 class CapsTrackingSink final : public SinkNode {
@@ -181,6 +251,7 @@ class ForwardTransform final : public TransformNode {
 public:
     explicit ForwardTransform(const std::string& name) : TransformNode(name) {
         addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW}});
     }
 
     int processed() const { return processed_.load(); }
@@ -216,6 +287,7 @@ class StopAfterProduceTransform final : public TransformNode {
 public:
     explicit StopAfterProduceTransform(const std::string& name) : TransformNode(name) {
         addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW}});
     }
 
     bool waitUntilOutputsReady() {
@@ -277,6 +349,7 @@ class EosAfterFlushTransform final : public TransformNode {
 public:
     explicit EosAfterFlushTransform(const std::string& name) : TransformNode(name) {
         addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW}});
     }
 
 protected:
@@ -397,6 +470,7 @@ class BurstTransform final : public TransformNode {
 public:
     explicit BurstTransform(const std::string& name) : TransformNode(name) {
         addSinkPad("in", TemplateCaps{{MediaType::VIDEO_RAW}});
+        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_RAW}});
     }
 
     bool waitUntilOutputRouteFull() {
@@ -1006,7 +1080,7 @@ void test_pipeline_stop_cancels_startup_barrier() {
     fflush(stdout);
 
     Pipeline pipeline;
-    auto* source = pipeline.addNode<CapsScriptSource>("source", std::vector<QueueItem>{});
+    auto* source = pipeline.addNode<CapsScriptProducer>("source", std::vector<QueueItem>{});
     auto* waiting = pipeline.addNode<StartupBarrierSink>("waiting", true);
     auto* absent = pipeline.addNode<StartupBarrierSink>("absent", false);
     assert(pipeline.link(source, "out", waiting, "in", MediaType::VIDEO_RAW));
@@ -1017,6 +1091,97 @@ void test_pipeline_stop_cancels_startup_barrier() {
 
     pipeline.stop();
     assert(!waiting->released());
+    printf(" OK\n");
+}
+
+void test_source_and_transform_require_declared_output_caps() {
+    printf("  test_source_and_transform_require_declared_output_caps...");
+    fflush(stdout);
+
+    {
+        Pipeline pipeline;
+        auto* source = pipeline.addNode<UndeclaredOutputSource>("source");
+        auto* sink = pipeline.addNode<MockSink>("sink");
+        assert(!pipeline.link(source, "out", sink, "in", MediaType::VIDEO_RAW));
+    }
+
+    {
+        Pipeline pipeline;
+        auto* source = pipeline.addNode<CapsScriptProducer>("source", std::vector<QueueItem>{});
+        auto* transform = pipeline.addNode<UndeclaredOutputTransform>("transform");
+        auto* sink = pipeline.addNode<MockSink>("sink");
+        assert(pipeline.link(source, "out", transform, "in", MediaType::VIDEO_RAW));
+        assert(!pipeline.link(transform, "out", sink, "in", MediaType::VIDEO_RAW));
+    }
+
+    printf(" OK\n");
+}
+
+void test_capture_source_stops_without_eos() {
+    printf("  test_capture_source_stops_without_eos...");
+    fflush(stdout);
+
+    std::vector<QueueItem> script;
+    script.emplace_back(Event{makeVideoCaps()});
+    script.emplace_back(makeBuffer(MediaType::VIDEO_RAW, 42));
+
+    Pipeline pipeline;
+    auto* source = pipeline.addNode<CaptureScriptSource>("source", std::move(script));
+    auto* sink = pipeline.addNode<OrderedVideoSink>("sink");
+    assert(pipeline.link(source, "out", sink, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+    assert(pipeline.play());
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (sink->values().empty() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert((sink->values() == std::vector<uint8_t>{42}));
+
+    // 采集脚本耗尽后 Source 仍阻塞等待外部停止；Pipeline cancel 不能被伪装成自然 EOS。
+    pipeline.stop();
+    assert(!sink->sawEOS());
+    assert(pipeline.lastError().empty());
+    printf(" OK\n");
+}
+
+void test_source_rejects_buffer_before_caps() {
+    printf("  test_source_rejects_buffer_before_caps...");
+    fflush(stdout);
+
+    std::vector<QueueItem> script;
+    script.emplace_back(makeBuffer(MediaType::VIDEO_RAW));
+
+    Pipeline pipeline;
+    auto* source = pipeline.addNode<CaptureScriptSource>("source", std::move(script));
+    auto* sink = pipeline.addNode<MockSink>("sink");
+    assert(pipeline.link(source, "out", sink, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+    assert(pipeline.play());
+    pipeline.waitEOS();
+
+    assert(pipeline.lastError().find("SourceNode: Buffer produced before initial CapsEvent") !=
+           std::string::npos);
+    printf(" OK\n");
+}
+
+void test_source_rejects_eos_item() {
+    printf("  test_source_rejects_eos_item...");
+    fflush(stdout);
+
+    std::vector<QueueItem> script;
+    script.emplace_back(Event{EOSEvent{}});
+
+    Pipeline pipeline;
+    auto* source = pipeline.addNode<CaptureScriptSource>("source", std::move(script));
+    auto* sink = pipeline.addNode<MockSink>("sink");
+    assert(pipeline.link(source, "out", sink, "in", MediaType::VIDEO_RAW));
+    assert(pipeline.build());
+    assert(pipeline.play());
+    pipeline.waitEOS();
+
+    assert(pipeline.lastError().find("SourceNode: produce must not emit EOSEvent") !=
+           std::string::npos);
     printf(" OK\n");
 }
 
@@ -1032,7 +1197,7 @@ void test_pipeline_running_caps_and_dynamic_boundary() {
     script.emplace_back(makeBuffer(MediaType::VIDEO_RAW, 3));
 
     Pipeline pipeline;
-    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* source = pipeline.addNode<CapsScriptProducer>("source", std::move(script));
     auto* sink = pipeline.addNode<CapsTrackingSink>("sink");
     assert(pipeline.link(source, "out", sink, "in", MediaType::VIDEO_RAW));
     assert(pipeline.build());
@@ -1055,7 +1220,7 @@ void test_transform_preserves_caps_before_buffer() {
     script.emplace_back(makeBuffer(MediaType::VIDEO_RAW));
 
     Pipeline pipeline;
-    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* source = pipeline.addNode<CapsScriptProducer>("source", std::move(script));
     auto* transform = pipeline.addNode<ForwardTransform>("transform");
     auto* sink = pipeline.addNode<CapsTrackingSink>("sink");
     assert(pipeline.link(source, "out", transform, "in", MediaType::VIDEO_RAW));
@@ -1079,7 +1244,7 @@ void test_buffer_before_caps_is_protocol_error() {
     script.emplace_back(makeBuffer(MediaType::VIDEO_RAW));
 
     Pipeline pipeline;
-    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* source = pipeline.addNode<CapsScriptProducer>("source", std::move(script));
     auto* sink = pipeline.addNode<MockSink>("sink");
     assert(pipeline.link(source, "out", sink, "in", MediaType::VIDEO_RAW));
     assert(pipeline.build());
@@ -1098,7 +1263,7 @@ void test_transform_eos_follows_flush_sequence() {
     script.emplace_back(makeBuffer(MediaType::VIDEO_RAW, 1));
 
     Pipeline pipeline;
-    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* source = pipeline.addNode<CapsScriptProducer>("source", std::move(script));
     auto* transform = pipeline.addNode<EosAfterFlushTransform>("transform");
     auto* sink = pipeline.addNode<OrderedVideoSink>("sink");
     assert(pipeline.link(source, "out", transform, "in", MediaType::VIDEO_RAW));
@@ -1122,7 +1287,7 @@ void test_transform_stop_releases_unpublished_outputs() {
     script.emplace_back(makeBuffer(MediaType::VIDEO_RAW));
 
     Pipeline pipeline;
-    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* source = pipeline.addNode<CapsScriptProducer>("source", std::move(script));
     auto* transform = pipeline.addNode<StopAfterProduceTransform>("transform");
     auto* sink = pipeline.addNode<MockSink>("sink");
     assert(pipeline.link(source, "out", transform, "in", MediaType::VIDEO_RAW));
@@ -1145,7 +1310,7 @@ void test_transform_cancel_releases_partial_outputs() {
     script.emplace_back(makeBuffer(MediaType::VIDEO_RAW));
 
     Pipeline pipeline;
-    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* source = pipeline.addNode<CapsScriptProducer>("source", std::move(script));
     auto* transform = pipeline.addNode<BurstTransform>("transform");
     auto* sink = pipeline.addNode<BlockingSink>("sink");
     assert(pipeline.link(source, "out", transform, "in", MediaType::VIDEO_RAW));
@@ -1172,7 +1337,7 @@ void test_pipeline_concurrent_stop() {
     }
 
     Pipeline pipeline;
-    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* source = pipeline.addNode<CapsScriptProducer>("source", std::move(script));
     auto* sink = pipeline.addNode<CapsTrackingSink>("sink");
     assert(pipeline.link(source, "out", sink, "in", MediaType::VIDEO_RAW));
     assert(pipeline.build());
@@ -1196,7 +1361,7 @@ void test_pipeline_forked_backpressure() {
     }
 
     Pipeline pipeline;
-    auto* source = pipeline.addNode<CapsScriptSource>("source", std::move(script));
+    auto* source = pipeline.addNode<CapsScriptProducer>("source", std::move(script));
     auto* fast = pipeline.addNode<CapsTrackingSink>("fast");
     auto* slow = pipeline.addNode<SlowVideoSink>("slow", 500);
     assert(pipeline.link(source, "out", fast, "in", MediaType::VIDEO_RAW));
@@ -1224,8 +1389,8 @@ void test_mux_waits_for_all_initial_caps() {
     audio_script.emplace_back(makeBuffer(MediaType::AUDIO_ENCODED, 2));
 
     Pipeline pipeline;
-    auto* video = pipeline.addNode<CapsScriptSource>("video", std::move(video_script));
-    auto* audio = pipeline.addNode<CapsScriptSource>("audio", std::move(audio_script));
+    auto* video = pipeline.addNode<CapsScriptProducer>("video", std::move(video_script));
+    auto* audio = pipeline.addNode<CapsScriptProducer>("audio", std::move(audio_script));
     auto* mux = pipeline.addNode<FakeMux>("mux");
     auto* sink = pipeline.addNode<ContainerSink>("sink");
     assert(pipeline.link(video, "out", mux, "video", MediaType::VIDEO_ENCODED));
@@ -1257,7 +1422,7 @@ void test_pipeline_ready_failure_rolls_back() {
             return false;
         }
         void onStop() override { ++stopped_; }
-        Buffer* capture() override { return nullptr; }
+        void produce(std::vector<QueueItem>&) override {}
     private:
         int stopped_ = 0;
     };
@@ -1298,6 +1463,10 @@ int main() {
     test_clock_startup_barrier_withdraw_releases_arrival();
 
     printf("\n[Pipeline Caps Tests]\n");
+    test_source_and_transform_require_declared_output_caps();
+    test_capture_source_stops_without_eos();
+    test_source_rejects_buffer_before_caps();
+    test_source_rejects_eos_item();
     test_pipeline_running_caps_and_dynamic_boundary();
     test_transform_preserves_caps_before_buffer();
     test_buffer_before_caps_is_protocol_error();

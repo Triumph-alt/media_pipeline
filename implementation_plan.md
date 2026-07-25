@@ -234,15 +234,15 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 
 | 模块 | 关键内容 |
 |---|---|
-| SourceNode | 定义并实现有序生产 `CapsEvent → BufferRef → … → EOSEvent` 的接口与统一发布边界；保持 Source 分叉共享 Route、可靠背压、stop/cancel 唤醒和 BufferRef RAII 合同 |
+| SourceNode | 已完成：定义并实现有序生产 `CapsEvent → BufferRef → …` 的 `produce(outputs)` 接口与统一发布边界；采集 Source 没有自然 EOS，只能由外部 stop/cancel 或 ERROR 结束；普通 Source/Transform 的首个输出 Pad 和完整 TemplateCaps 已收紧为具体类构造期显式声明，后续 Pad 仅能同源分叉；保持共享 Route、可靠背压、stop/cancel 唤醒和 BufferRef RAII 合同。 |
 | V4L2CaptureNode | 打开 V4L2 设备、枚举/选择输入格式、协商固定 width/height/pix_fmt、申请并 mmap 驱动 Buffer、`VIDIOC_QBUF/DQBUF` 采集；首个 Buffer 前发布真实 VIDEO_RAW Caps；本阶段将帧深拷贝入框架 Buffer，DQBUF 后及时归还驱动 Buffer；不要求设备运行期格式重配 |
 | 时间戳 | 明确 V4L2 buffer timestamp 到框架微秒 PTS 的映射；无有效设备时间戳时保留 NOPTS，不伪造媒体时间 |
 | 预览 Demo | `V4L2CaptureNode → VideoRenderNode`；复用 VideoRender 的真实 pix_fmt/swscale、窗口关闭 STOP_REQUESTED 和单参与者启动栅栏语义 |
-| 验证 | 无设备时至少覆盖 Source 有序 Caps/Buffer/EOS、分叉、stop/cancel 的单测；有设备时进行真实摄像头预览、窗口关闭和 SIGINT 验证 |
+| 验证 | 无设备时至少覆盖 Source 有序 Caps/Buffer、无自然 EOS、分叉、stop/cancel 的单测；有设备时进行真实摄像头预览、窗口关闭和 SIGINT 验证 |
 
 ### 验收标准
 
-- [ ] SourceNode 能在同一 Route 上可靠发布 `CapsEvent → Buffer* → EOSEvent`，Buffer 不会越过 active Caps；现有 Source 分叉、Route 背压、cancel/stop 语义保持成立
+- [x] SourceNode 能在同一 Route 上可靠发布 `CapsEvent → Buffer*`，Buffer 不会越过 active Caps，采集 Source 不生成自然 EOS；普通 Source/Transform 的首个输出能力仅能在具体类构造期声明，分叉、Route 背压、cancel/stop 语义保持成立（普通与 ASAN 单测通过）
 - [ ] V4L2CaptureNode 能打开指定设备并协商、发布与实际 DQBUF 图像一致的 VIDEO_RAW Caps
 - [ ] `V4L2CaptureNode → VideoRenderNode` 在真实设备上持续预览；YUV420P 直传，其他 CPU 可访问协商格式经现有 swscale 正确显示
 - [ ] 采集帧在拷贝后立即归还 V4L2 driver buffer；持续预览期间无驱动 Buffer 耗尽、框架内存单调增长或 Buffer 所有权错误

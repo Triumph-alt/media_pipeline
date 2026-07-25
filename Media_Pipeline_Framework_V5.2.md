@@ -31,7 +31,7 @@
 - 不支持 DMA-BUF 零拷贝（Buffer 第一阶段全部拷贝）
 - 不支持动态插件加载（.so）
 - 不支持 Windows / macOS，VideoRenderNode 的 SDL 视频线程模型只面向 Linux / 嵌入式 Linux
-- 不支持 PTS discontinuity、Caps generation 和通用采集 Source 的运行期 Caps 生产模型；这些需要结合 V4L2/音频采集的设备协商语义单独设计
+- 不支持 PTS discontinuity、Caps generation 和采集设备的运行期格式重配；通用采集 Source 已具备 Running 有序 Caps 生产模型，但 V4L2/音频采集的设备协商、阻塞取消和重配语义仍需由具体节点单独实现
 - VideoRender 将 CPU 可访问的 VIDEO_RAW 非 YUV420P/YUVJ420P 格式经 swscale 转为 SDL IYUV 所需 YUV420P；当前仍不支持色彩空间/range/primaries/transfer/HDR 的显式 Caps 传递与严格色彩管理
 - **Mux Header 冻结合同**：所有输入初始 encoded Caps 到齐后建立 Header 并固定 Pad→输出 stream 映射；同一输入 Pad 后续出现 encoded CapsEvent 是协议错误，必须拒绝
 
@@ -513,9 +513,19 @@ protected:
 
 ### 5.2 SourceNode
 
-`SourceNode` 的当前 `capture() -> Buffer*` 默认骨架只能表达 `Buffer* → EOS`，早于 Running Caps 协议，不能独自表达 `Caps → Buffer* → Caps → Buffer*`。本地播放器的 `DemuxNode` 不使用该默认骨架，而是在自己的 worker 中先发布探测到的 encoded Caps。
+`SourceNode` 使用与 `TransformNode` 同构的有序生产接口：具体类在 worker 内的每次 `produce(outputs)` 调用向拥有型 `std::vector<QueueItem>` 放入本轮准备好的 `CapsEvent` 和/或 `BufferRef`。采集 Source 是实时、无界输入，不存在文件式自然 EOF；`produce()` 不返回 EOS 状态，也不得放入 `EOSEvent`。同一 Source Route 的 Running 序列因而是无终结的：
 
-通用采集源尚未落地；V4L2/AudioCapture 接入时必须先根据设备协商、重配和运行期格式变化语义，设计能够生产有序 `QueueItem` 的 Source 抽象。此项在“已知问题与后续优化”中单独保留，当前不得把默认 `capture()` 骨架用于连接要求 Running Caps 的新节点。
+```text
+CapsEvent → BufferRef → … → CapsEvent → BufferRef → …
+```
+
+Source 基类按 `outputs` 内的既定顺序逐项调用 `publishOutputItem()`，所以 Caps、Buffer 都经过相同的 Route、可靠背压和 RAII 发布边界。`produce()` 中的 ERROR 或外部 stop/cancel 置位后，基类不再发布本轮尚未交付项；`outputs` 内尚未发布的 `BufferRef` 自动释放。实际阻塞采集后端在 `produce()` 内等待，直到有序项目、设备错误或外部取消之一出现；窗口关闭、SIGINT 和外部 `Pipeline::stop()` 通过 cancel 结束整条链路，不伪装为自然 EOS。
+
+Source 没有输入 Route 可提供 active Caps，故基类单独维护“最近一次**成功发布**的输出 Caps”：Buffer 在初始 Caps 前产生、或其 `media_type` 与该 Caps 不一致，均由 Source 在生产边界 `postMessage(ERROR)`，不得让非法 Buffer 进入 Route。后续同一 `MediaType` 的新 Caps 可在第一份受其解释的 Buffer 前进入 `outputs`；是否产生该边界由具体设备后端的真实协商/重配语义决定。跨 `MediaType` 仍由 `publishOutputItem()` 的 Route actualType 冻结合同拒绝。
+
+普通 Source/Transform 的 `TemplateCaps` 是构造期常量，不得由 `Graph::link()` 的 `hint_type` 反向创造。每个具体 Source/Transform 类必须在构造函数中显式 `addSrcPad()` 创建唯一首个固定输出 Pad 并声明完整能力集合；未声明首 Pad 的类无法经动态创建连接。`requestSrcPad()` 只允许把后续 Pad 创建为首 Pad 的同源分叉：完整复制已有 `TemplateCaps`、共享同一个 `OutputRoute`，并仅用 `hint_type` 验证此次连接所请求的类型落在已有能力集合内。DemuxNode 的按媒体流动态 Route 和 MuxNode 的固定 `out_0` 是各自已定义的特殊模型，不属于该普通同源分叉规则。
+
+V4L2/AudioCapture 的具体设备后端尚未落地。首版 V4L2 只承诺在打开设备并完成固定格式协商后，在首帧前由 `produce()` 输出真实 `VIDEO_RAW Caps`，随后输出深拷贝 `BufferRef`；运行期设备重配、PTS discontinuity 和 Caps generation 仍留待后续单独设计。
 
 需要注意的是用户可能对同一路输出连接多个下游，比如采集到的画面可以一路直接本地预览，一路编码之后传输，甚至可以有别的路用来作别的格式的编码或者其他的处理，**所以 SourceNode 的 requestSrcPad 需要重写，需要支持分叉**
 
@@ -1937,7 +1947,7 @@ Pipeline::waitEOS
 4. **Route 通知回调限制**：当前只在 Mux Ready 阶段注册，用于唤醒多输入调度；若未来需要运行期变更，必须定义通知列表的线程安全边界。
 5. **link/build 错误报告**：核心库当前只返回 bool，不直接 fprintf，也不适合走运行期 MessageBus；详细错误报告机制仍需独立设计。
 6. **Caps 运行期边界的剩余限制**：Decoder 首帧真实格式定案、同一 Route 多份 Caps、VideoRender 尺寸变化、CPU 可访问非 YUV420P swscale 和 AudioPlay 输入重配已支持；尚不支持 PTS discontinuity、Caps generation，以及色彩空间/range/primaries/transfer/HDR 的显式格式协商与严格色彩管理。
-7. **采集 Source 的 Caps 生产模型**：默认 `SourceNode::capture() -> Buffer*` 不能表达 `Caps → Buffer* → Caps → Buffer*`。V4L2/AudioCapture 落地前必须先结合设备 open、协商、重配及运行期格式变化，设计有序 `QueueItem` 的 Source 生产接口；当前不得用该旧默认骨架接入要求 Running Caps 的新节点。
+7. **采集具体节点与运行期重配**：`SourceNode` 已可有序生产 `Caps → Buffer → Caps → Buffer`，并在生产边界阻止 Buffer 越过 active Caps；采集 Source 不具备自然 EOS，必须由外部 stop/cancel 或设备 ERROR 结束。V4L2/AudioCapture 尚未落地。后续具体后端仍须结合设备 open、协商、阻塞取消及运行期格式变化确定 `produce()` 行为；本阶段不支持设备运行期重配、PTS discontinuity 或 Caps generation。
 8. **媒体兼容性**：解码 Frame 已优先使用 `best_effort_timestamp`，Decoder 的 `send_packet(EAGAIN)` 已按 drain 后重发同一 Packet 的合同处理，CPU 可访问的非 YUV420P 视频已在 VideoRender 通过 swscale 转为 IYUV；`pkt_timebase` 已设置为框架微秒时间基，完整 channel layout 已以 Caps 的 `ChannelLayout` 值类型传递，但 AudioPlay 当前只承诺标准 native layout 到 stereo 的转换。Packet side data（例如 DISPLAYMATRIX、HDR/动态 metadata）当前仍在 Packet→Buffer 转换时丢弃，未接入 CapsEvent：目前没有消费端，尤其 VideoRender 没有旋转/HDR 应用路径。若素材来源出现手机直拍等必须按旋转矩阵显示的竖版视频，再单独确定“CapsEvent 的 rotation 字段 + Render 应用”设计；不得预先将所有逐 Packet side data 伪装为流级 Caps。色彩空间/HDR 的显式协商也仍待具体消费端语义确定。
 9. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
 10. **Demux/Mux 边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`，虽 Route 已支持可靠多订阅者输出，但动态 Mux 输出 Pad、最终交织策略、阻塞网络 I/O interrupt callback 和具体 AVMuxNode 仍待实现。
@@ -1945,6 +1955,7 @@ Pipeline::waitEOS
 12. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
 13. **第三方 GUI LeakSanitizer 基线**：当前 Linux/X11 环境的 SDL3 2D software renderer 在 window surface 呈现时会内部尝试 GPU texture framebuffer，加载 Mesa/GLX；即使独立最小程序完整销毁 Texture、Renderer、Window，退出 VIDEO 并调用 `SDL_Quit()`，LeakSanitizer 仍报告 Mesa/GLX 约 1464B/16 allocations。强制直接 X11 framebuffer 可避免 Mesa 报告，但会出现约 33066B/572 allocations 的 X11/XKB 报告。两者均可由独立 SDL 最小程序复现，不属于 Pipeline、Buffer、Route 或节点资源泄漏；不为消除报告而改 renderer/backend。player 的 LeakSanitizer 验证应将该 Mesa/GLX 基线与项目自身泄漏区分，框架单测仍无 suppression 严格运行。
 14. SDL_GetAudioDeviceFormat 查询已打开设备偶发返回空错误失败,而当前它被当硬 ERROR 直接毙掉整个 Ready。将来或可对这个查询加一次重试/容忍,但现在按硬失败处理也说得过去,先不动。
+15. SourceNode 的 active_output_caps_ 私有成员,和 SinkPad/OutputRoute 里已有的 active_caps_/actualType 概念是同一件事在不同层面的第三份实现(Sink 侧、Route 侧、现在 Source 侧各自维护一份"当前生效格式"的状态)。因为 Source 天生没有输入 Route 可以借,只能自己长一份，但如果以后再新增第四个需要类似状态的地方,值得先看看能不能收敛成一个共享的小工具类,而不是继续复制这段"先存副本、发布成功才切换"的逻辑。
 
 ---
 

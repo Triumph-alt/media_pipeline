@@ -263,15 +263,72 @@ void BaseNode::postMessage(MessageType type, const std::string& text, int code) 
 // ===================================================================
 
 void SourceNode::runLoop() {
+    // 局部 outputs 容器
+    std::vector<QueueItem> outputs;
+
     while (!stop_requested_.load()) {
-        // capture() 返回的新建 Buffer 立即进入 RAII，不能跨控制流保存拥有型裸指针。
-        BufferRef buf(capture());
-        if (!buf) {
-            // EOF：发送 EOS 给下游，SinkNode 收到后才上报 Pipeline
-            sendEOSDownstream();
+        // 清理上一轮的 outputs
+        outputs.clear();
+
+        // 调用具体 Source 子类的 produce，将本轮要输出的有序项填入 outputs。采集 Source
+        // 没有自然 EOF；produce 在自身内部等待数据、stop 或 ERROR，不用返回值表达 EOS。
+        produce(outputs);
+
+        // produce() 内的 ERROR 或外部 stop 会同步置位标志
+        // 尚未发布的 BufferRef 由 outputs 的 RAII 所有权自动释放
+        if (stop_requested_.load()) {
             break;
         }
-        if (!pushToDownstream(std::move(buf))) {
+
+        // 按具体 Source 写进 vector 的顺序提交 Route
+        bool outputs_published = true;
+        for (auto& output : outputs) {
+            // 对 Caps 项先复制一份，以便安全地从原对象读取完整字段作为本地 active Caps
+            std::optional<CapsEvent> published_caps;
+            if (std::holds_alternative<BufferRef>(output)) {
+                const BufferRef& buffer = std::get<BufferRef>(output);
+                // Source 没有输入 Route 可借用 active_caps_
+                // 所以必须在输出边界自己维护 active_output_caps_ 避免非法序列进入共享 OutputRoute。
+                if (!buffer || !active_output_caps_) {
+                    postMessage(MessageType::ERROR,
+                                "SourceNode: Buffer produced before initial CapsEvent");
+                    outputs_published = false;
+                    break;
+                }
+                if (buffer->media_type != active_output_caps_->media_type) {
+                    // Buffer 类型必须与当前 Caps 一致
+                    postMessage(MessageType::ERROR,
+                                "SourceNode: Buffer media type does not match active CapsEvent");
+                    outputs_published = false;
+                    break;
+                }
+            } else {
+                const Event& event = std::get<Event>(output);
+                // Source 的终结事件由基类独占，具体 produce() 只能产生 Caps 或 Buffer
+                if (std::holds_alternative<EOSEvent>(event)) {
+                    postMessage(MessageType::ERROR,
+                                "SourceNode: produce must not emit EOSEvent");
+                    outputs_published = false;
+                    break;
+                }
+                // 移动发布后 CapsEvent 的 vector 字段可能已是 moved-from 状态，必须在进入
+                // publishOutputItem() 前保留副本；仅 publish 成功才允许切换生产侧 active Caps。
+                published_caps = std::get<CapsEvent>(event);
+            }
+
+            if (!publishOutputItem(std::move(output))) {
+                outputs_published = false;
+                break;
+            }
+
+            if (published_caps) {
+                active_output_caps_ = std::move(*published_caps);
+            }
+        }
+
+        // 发布失败或 stop 时退出。采集 Source 不发送自然 EOS：实时设备没有文件 EOF，
+        // 窗口关闭、SIGINT 和外部 stop 均通过 Pipeline cancel 结束整条链路。
+        if (!outputs_published || stop_requested_.load()) {
             break;
         }
     }
@@ -425,8 +482,9 @@ void TransformNode::runLoop() {
             continue;
         }
 
-        // onEOS may append delayed decoder Caps/Buffers but never EOS. The framework owns the terminator,
-        // so every Transform forwards exactly one EOSEvent even if a subclass has no context or was flushed.
+        // 子类 onEOS() 只能追加 Decoder flush 等延迟 Caps/Buffer，不能自行追加 EOS。
+        // 基类统一在末尾追加唯一 EOSEvent，因此即使子类没有上下文或没有待 flush 数据，
+        // 输入 Route 的 EOS 也恰好对应输出 Route 的一个 EOS。
         outputs.clear();
         onEOS(outputs);
         if (stop_requested_.load()) {

@@ -132,9 +132,10 @@ protected:
 // ===================================================================
 // SourceNode: 采集源节点
 //
-// 无 SinkPad，只有 SrcPad。
-// runLoop 循环调用 capture() 采集数据，push 到下游。
-// capture() 返回 nullptr 表示 EOF。
+// 无 SinkPad，只有 SrcPad。具体 Source 必须在构造函数中显式 addSrcPad() 声明首个
+// 固定输出能力；后续 SrcPad 只能是该逻辑输出的同源分叉，不能由 link hint 创造能力。
+// produce() 将 CapsEvent / BufferRef 放入同一有序 outputs；基类统一发布这些项目。采集
+// Source 没有自然 EOF，不生产 EOSEvent，只能由外部 stop 或 ERROR 结束。
 // ===================================================================
 class SourceNode : public BaseNode {
 public:
@@ -142,25 +143,29 @@ public:
 
 protected:
     explicit SourceNode(const std::string& name) : BaseNode(name) {}
-    void runLoop() override;
+    void runLoop() override final;
 
-    // 子类实现：阻塞采集一帧数据，返回 nullptr 表示 EOF
-    virtual Buffer* capture() = 0;
+    // 子类产出下一批有序项目：Caps 必须置于受其管辖 Buffer 之前。采集 Source 不会
+    // 使用返回值表示自然结束；具体实现应在内部阻塞至产生项目、观察到 stop，或上报 ERROR。
+    // 子类不得向 outputs 放入 EOSEvent，后端错误应先 postMessage(ERROR) 后返回。
+    virtual void produce(std::vector<QueueItem>& outputs) = 0;
 
-    // 支持分叉，新 SrcPad 是已有 SrcPad 的同源多路拷贝，能力集合必须与已有 pad 一致
-    // hint_type 只用于校验"这次 link 想承载的类型是否落在已有能力集合内"，不参与 TemplateCaps 构造。
-    SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override {
-        if (!src_pads_.empty()) {
-            // 如果已有 SrcPad，复制完整能力集合
-            const auto& existing = src_pads_[0]->templateCaps();
-            if (!existing.contains(hint_type)) {
-                return nullptr;
-            }
-            return addBranchedSrcPad(name, *src_pads_[0]);
+    // 只支持已有逻辑输出的同源分叉。具体 Source 未在构造期声明首个 SrcPad 时，link
+    // 直接失败；hint_type 只校验静态能力，绝不参与 TemplateCaps 构造。
+    SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override final {
+        if (src_pads_.empty()) {
+            return nullptr;
         }
-        // 如果是首个 pad，从 hint_type 建立最初的能力集合
-        return addSrcPad(name, TemplateCaps{{hint_type}});
+        const auto& existing = src_pads_[0]->templateCaps();
+        if (!existing.contains(hint_type)) {
+            return nullptr;
+        }
+        return addBranchedSrcPad(name, *src_pads_[0]);
     }
+
+private:
+    // 仅由 Source worker 在成功发布 Caps 后更新；它是下一份 Buffer 的格式权威。
+    std::optional<CapsEvent> active_output_caps_;
 };
 
 // ===================================================================
@@ -200,7 +205,7 @@ protected:
     explicit TransformNode(const std::string& name) : BaseNode(name) {}
 
 protected:
-    void runLoop() override;
+    void runLoop() override final;
 
     // 一个输入映射为有序 Route 项。Caps 必须排在其管辖 Buffer 的前面；EOS flush
     // 必须把尾帧及其 EOS 都放入同一序列。新建 Buffer 立即由 BufferRef 接管。
@@ -215,17 +220,17 @@ protected:
     // 子类绝不负责转发或追加 EOSEvent，因而不能遗漏终结事件。
     virtual void onEOS(std::vector<QueueItem>& outputs) {}
 
-    // 支持分叉，新 SrcPad 是已有 SrcPad 的同源多路拷贝，能力集合必须与已有 pad 一致
-    // hint_type 只用于校验"这次 link 想承载的类型是否落在已有能力集合内"
-    SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override {
-        if (!src_pads_.empty()) {
-            const auto& existing = src_pads_[0]->templateCaps();
-            if (!existing.contains(hint_type)) {
-                return nullptr;
-            }
-            return addBranchedSrcPad(name, *src_pads_[0]);   // 复制完整能力集合
+    // 支持同源分叉；具体 Transform 必须在构造函数中显式 addSrcPad() 声明首个
+    // 固定输出能力。hint_type 只校验既有能力，绝不参与 TemplateCaps 构造。
+    SrcPad* requestSrcPad(const std::string& name, MediaType hint_type) override final {
+        if (src_pads_.empty()) {
+            return nullptr;
         }
-        return addSrcPad(name, TemplateCaps{{hint_type}});
+        const auto& existing = src_pads_[0]->templateCaps();
+        if (!existing.contains(hint_type)) {
+            return nullptr;
+        }
+        return addBranchedSrcPad(name, *src_pads_[0]);
     }
 };
 

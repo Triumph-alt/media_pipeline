@@ -368,3 +368,30 @@ remaining >= -threshold
 - 每帧 `consume()` 依据 active Caps 用 FFmpeg image 工具从紧密 Buffer 重建 source plane/linesize；非直传格式在此执行 `sws_scale()`，随后与直传格式共用 SDL IYUV 上传、Texture 和 Present 路径。晚帧先完成 Clock 判断，过期帧不浪费转换成本。
 - 像素格式重配只替换 swscale context/缓冲，尺寸变化才销毁并重建 SDL Texture。转换资源和 SDL 视频资源同属 VideoRender worker，在 worker 统一退出尾部释放。
 - 本轮目标是让 NV12、YUV422P、YUV444P、常规 10-bit、RGB 等 CPU 可访问格式可转换播放；Caps 当前不承载 color range、matrix、primaries、transfer 或 HDR metadata，因此不宣称完成严格色彩管理或 HDR 呈现。
+
+---
+
+## SourceNode 有序生产模型与构造期输出能力声明
+
+### 决策背景
+
+旧 `SourceNode::capture() -> Buffer*` 只能把一份裸 Buffer 作为单一输出表达，无法表达采集设备在首帧前发布真实格式，或未来同类格式边界的 `Caps → Buffer → Caps → Buffer`。采集设备是持续、无界的实时输入，不具备文件读取到末尾式的自然 EOS：其停止只能来自外部 stop/cancel，设备失败则是 ERROR。与此同时，普通 Source/Transform 的 `requestSrcPad()` 曾在不存在首个 SrcPad 时用 `Graph::link()` 传入的 `hint_type` 临时构造 `TemplateCaps`；这让下游连接请求反向定义上游节点能力，破坏了 TemplateCaps 的静态声明语义。
+
+### Source 有序生产合同
+
+- `SourceNode` 改用与 `TransformNode` 同构的钩子：`produce(std::vector<QueueItem>& outputs)`。具体 Source 每轮只向 `outputs` 放入有序 `CapsEvent` / `BufferRef`；实际采集实现应在钩子内部阻塞至获得新项目、观察到外部 stop/cancel 或检测到 ERROR。
+- 采集 Source 不生产 `EOSEvent`，基类也不追加 EOS：实时设备没有自然 EOF。窗口关闭、SIGINT、应用调用 `Pipeline::stop()` 均走 stop/cancel；设备拔出、DQBUF/协商等后端失败必须先 `postMessage(ERROR)`，不得伪装为 EOS。
+- 基类逐项使用 `publishOutputItem()` 发布 `outputs`，所以 Caps、Buffer 与 Transform 输出一样经过同一个共享 Route、可靠背压和 RAII 所有权边界。发布中断后已进入 Route 的项由 Route 管理，当前项与未遍历尾项由 `outputs` 自动释放。
+- Source 没有输入 Route 的 active Caps，故基类维护最近一次**成功发布**的输出 Caps：Buffer 在首份 Caps 前产生，或其 media_type 与该 Caps 不一致，立即 ERROR，非法 Buffer 不得进入 Route。后续同类型 Caps 可在对应首 Buffer 前发布；跨 MediaType 仍由 OutputRoute 的 actualType 冻结合同拒绝。
+- `produce()` 允许本轮输出为空；非阻塞后端若使用该语义，必须避免忙等并及时观察 stop。第四阶段 V4L2 预期使用阻塞 DQBUF，在 `produce()` 内等待到有项目、ERROR 或外部取消。
+
+### 构造期静态能力合同
+
+- 普通 SourceNode / TransformNode 的具体类必须在构造函数中显式 `addSrcPad()` 创建唯一首个固定 SrcPad，并以完整 `TemplateCaps` 声明输出能力；不再允许 `requestSrcPad()` 用 link hint 创造首个能力集合。
+- `requestSrcPad()` 仅服务同源分叉：没有构造期首 Pad 时直接拒绝；已有首 Pad 时只验证 hint_type 落在其 TemplateCaps 内，再完整复制该 TemplateCaps 并共享其 OutputRoute。
+- 因而 `hint_type` 始终只是本次 link 的静态能力校验，绝不写入 actualType、也绝不定义节点能力。DecodeNode 已在构造期显式声明 `{VIDEO_RAW, AUDIO_RAW}` 输出；未来 V4L2CaptureNode 必须同样在构造期声明 `{VIDEO_RAW}`。
+- Demux 的按媒体流动态 Route 和 Mux 的固定 `out_0` 是既有特殊模型，不改变。
+
+### 当前边界
+
+该决策只完成 Source 抽象与其单元/ASAN 验证，不实施 V4L2 ioctl、mmap、设备协商或阻塞 DQBUF 取消。第四阶段 V4L2 首版仍只承诺固定协商格式：首帧前产出真实 VIDEO_RAW Caps，之后产出深拷贝 BufferRef；设备运行期重配、PTS discontinuity 和 Caps generation 留待后续独立设计。

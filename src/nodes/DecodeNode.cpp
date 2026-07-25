@@ -16,6 +16,7 @@ namespace pipeline {
 DecodeNode::DecodeNode(const std::string& name)
     : TransformNode(name) {
     addSinkPad("in", TemplateCaps{{MediaType::VIDEO_ENCODED, MediaType::AUDIO_ENCODED}});
+    addSrcPad("out_0", TemplateCaps{{MediaType::VIDEO_RAW, MediaType::AUDIO_RAW}});
 }
 
 bool DecodeNode::configureDecoder(const CapsEvent& caps) {
