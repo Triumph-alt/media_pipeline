@@ -66,20 +66,20 @@ sudo apt install gcc-riscv64-linux-gnu g++-riscv64-linux-gnu   # RISC-V 占位
 --target-os=linux
 ```
 
-**第四阶段需额外开启**：
+**第四阶段不额外依赖 FFmpeg 输入组件**：`V4L2CaptureNode` 直接使用 Linux V4L2 ioctl/mmap API，不通过 FFmpeg `avdevice` 或 v4l2 demuxer。
+
+**第五阶段需额外开启**（按实际选择的编码器、容器和协议启用）：
 
 ```bash
 --enable-encoder=libx264 \
 --enable-encoder=libx265 \
---enable-encoder=aac \
---enable-muxer=mp4 \
 --enable-muxer=flv \
 --enable-muxer=mpegts \
---enable-demuxer=v4l2 \
---enable-indev=v4l2 \
 --enable-protocol=rtmp \
 --enable-protocol=tcp
 ```
+
+传统 MP4 需要回写文件头，不属于当前通用流式 MuxNode 的目标；若未来需要，单独设计专用文件输出节点。
 
 目录结构：
 
@@ -208,81 +208,80 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 | DecodeNode | Running encoded Caps 驱动 decoder 配置；真实 AVFrame 前发布 RAW Caps；重配前 drain、完整 send/receive EAGAIN 状态机、EOS flush；Frame PTS 优先使用 FFmpeg `best_effort_timestamp` |
 | VideoRenderNode | Running Caps 应用格式边界；YUV420P/YUVJ420P 紧密帧直传 SDL IYUV，其余 CPU 可访问格式按真实 Caps 通过 swscale 转为 YUV420P；SDL VIDEO、Window、Renderer、Texture 和转换资源在 VideoRender 工作线程中初始化、使用和销毁；worker 退出前清理 SDL TLS；按帧处理自身窗口关闭请求并通过 `STOP_REQUESTED` 请求 Pipeline 停止；Clock 启动 rendezvous 与基于 `max(Buffer.duration, 40ms)` 的动态晚帧丢弃 |
 | AudioPlayNode | Ready 建固定 canonical SDL 提交端；Running AudioRaw Caps 重建 input→canonical swr；canonical Clock、背压、EOS drain；音频 worker 退出前清理 SDL TLS |
-| Demo | Pipeline 内部管理 SDL 基础设施生命周期（同一进程同一时刻至多一个 Pipeline 存活）+ Demux → Decode×2 → VideoRender + AudioPlay |
+| Demo | `player` 组装完整音视频链路；`player_video_only` / `player_audio_only` 分别独立组图验收单流；均由 Pipeline 管理 SDL 基础设施生命周期（同一进程同一时刻至多一个 Pipeline 存活） |
 
 ### 验收标准
 
 - [x] 播放 H.264/AAC 的 mp4 文件正常（画面 + 声音；《那天下雨了原版MV.mp4》自然 EOS：5703 rendered + 3 dropped = 5706）
-- [ ] 音视频同步误差 ±40ms 以内（已有音频主时钟、启动 rendezvous 与动态晚帧丢弃；尚缺可量化测量）
-- [ ] 纯音频 / 纯视频文件不崩溃
-- [ ] EOS 后正常退出，无线程泄漏（普通回归与真实自然 EOS 通过；仍需本轮最终 ASAN player 覆盖）
-- [ ] Ctrl+C 中断后正常退出（普通路径已验证；仍需本轮最终 ASAN player 覆盖）
+- [x] 纯视频 / 纯音频独立组图正常播放到 EOS（ASAN：H.264/YUV420P 纯视频 75 rendered / 0 dropped；AAC 纯音频完成 SDL drain）
+- [x] EOS 后正常退出，无项目自身内存错误（普通与 ASAN 回归；ASAN player 自然 EOS 覆盖 YUV420P、YUV444P、YUV420P10LE）
+- [x] Ctrl+C 中断后正常退出（ASAN 长音视频素材实测）
 - [x] 当前进程仅使用一个 VideoRenderNode，且无其他模块提前初始化 SDL VIDEO
 - [x] VideoRender 只处理自身的 `SDL_EVENT_WINDOW_CLOSE_REQUESTED`，其他 SDL 输入事件暂不纳入范围
-- [x] 窗口关闭后通过 `STOP_REQUESTED` 唤醒 `waitEOS()` 并正常完成 Pipeline 停止
-- [ ] ASAN 下自然 EOS、SIGINT 和窗口关闭路径无项目自身内存错误；已隔离的 SDL/Mesa GUI LeakSanitizer 基线单独记录
+- [x] 窗口关闭后通过 `STOP_REQUESTED` 唤醒 `waitEOS()` 并正常完成 Pipeline 停止（真实 X11 `WM_DELETE_WINDOW` 实测；ASAN 路径无项目内存错误）
+- [x] ASAN 下自然 EOS、SIGINT 和窗口关闭路径无项目自身内存错误；真实 X11 GUI 仍仅报告已隔离的 Mesa/Gallium LeakSanitizer 基线
 - [x] x86_64 通过
 
 ---
 
-## 第四阶段：编码、复用与文件输出
+## 第四阶段：视频采集预览与 SourceNode 有序生产模型
 
-**前提**：第三阶段验收全部通过。
+**目标**：先完成 V4L2 视频采集到本地预览的最小闭环，并以此将 `SourceNode` 从旧的 `capture() -> Buffer*` 骨架改造成能产生有序 Running `QueueItem` 的正式生产接口。
+
+**设计前提**：采集节点不能沿用“只返回 Buffer”的旧接口，因为 VIDEO_RAW 消费者必须先收到完整 Caps，设备协商或重配也必须在正确的 Buffer 边界插入新的 Caps。首版只承诺设备打开时协商出的固定格式；运行期设备重配、PTS discontinuity、Caps generation 不混入本阶段。
+
+### 任务
+
+| 模块 | 关键内容 |
+|---|---|
+| SourceNode | 定义并实现有序生产 `CapsEvent → BufferRef → … → EOSEvent` 的接口与统一发布边界；保持 Source 分叉共享 Route、可靠背压、stop/cancel 唤醒和 BufferRef RAII 合同 |
+| V4L2CaptureNode | 打开 V4L2 设备、枚举/选择输入格式、协商固定 width/height/pix_fmt、申请并 mmap 驱动 Buffer、`VIDIOC_QBUF/DQBUF` 采集；首个 Buffer 前发布真实 VIDEO_RAW Caps；本阶段将帧深拷贝入框架 Buffer，DQBUF 后及时归还驱动 Buffer；不要求设备运行期格式重配 |
+| 时间戳 | 明确 V4L2 buffer timestamp 到框架微秒 PTS 的映射；无有效设备时间戳时保留 NOPTS，不伪造媒体时间 |
+| 预览 Demo | `V4L2CaptureNode → VideoRenderNode`；复用 VideoRender 的真实 pix_fmt/swscale、窗口关闭 STOP_REQUESTED 和单参与者启动栅栏语义 |
+| 验证 | 无设备时至少覆盖 Source 有序 Caps/Buffer/EOS、分叉、stop/cancel 的单测；有设备时进行真实摄像头预览、窗口关闭和 SIGINT 验证 |
+
+### 验收标准
+
+- [ ] SourceNode 能在同一 Route 上可靠发布 `CapsEvent → Buffer* → EOSEvent`，Buffer 不会越过 active Caps；现有 Source 分叉、Route 背压、cancel/stop 语义保持成立
+- [ ] V4L2CaptureNode 能打开指定设备并协商、发布与实际 DQBUF 图像一致的 VIDEO_RAW Caps
+- [ ] `V4L2CaptureNode → VideoRenderNode` 在真实设备上持续预览；YUV420P 直传，其他 CPU 可访问协商格式经现有 swscale 正确显示
+- [ ] 采集帧在拷贝后立即归还 V4L2 driver buffer；持续预览期间无驱动 Buffer 耗尽、框架内存单调增长或 Buffer 所有权错误
+- [ ] SIGINT、窗口关闭、外部 `Pipeline::stop()` 都能取消阻塞 DQBUF/Route 等待、join 全部线程并正常退出
+- [ ] 单元测试和真实设备路径分别完成 ASAN 验证；真实 GUI 的 Mesa/Gallium 基线与项目自身错误分开报告
+- [ ] x86_64 通过；aarch64 仅在存在目标板与 V4L2 设备时验收
+
+---
+
+## 第五阶段：视频编码、流式复用与推流
+
+**前提**：第四阶段的 SourceNode 有序 Caps 合同与 V4L2 预览闭环通过。
+
+**目标**：将采集到的 RAW 视频编码为 H.264/H.265，经 FLV 或 MPEG-TS 流式复用后输出到可取消的网络推流端；文件录制、音频编码和传统 MP4 不混入本阶段。
 
 ### 任务
 
 | 节点 | 关键内容 |
-|------|---------|
-| EncodeNode | avcodec_find_encoder + sws/swr 转换 + send_frame/receive_packet |
-| MuxNode | 多 SinkPad + 外部 notify + selectMinDtsPad + 自定义 AVIOContext |
-| FileSinkNode | fopen/fwrite/fclose |
-| Demo | 采集编码录制、文件推流（不转码） |
-
-FFmpeg 需额外开启 encoder 和 muxer（见第一阶段 1.3 配置）。
-
-### 验收标准
-
-- [ ] EncodeNode 编码 H264/AAC
-- [ ] MuxNode 多流交织正确
-- [ ] FileSinkNode 写出可播放的 mp4
-- [ ] 端到端 Demo 通过
-- [ ] x86_64 和 aarch64 均通过
-
----
-
-## 第五阶段：采集节点
-
-**前提**：第四阶段验收全部通过。
-
-### 任务
-
-| 节点 | 关键内容 |
-|------|---------|
-| V4L2CaptureNode | open/mmap/VIDIOC_DQBUF，MemoryBlock::fromExternal 零拷贝 |
-| AudioCaptureNode | snd_pcm_open/snd_pcm_readi |
-| Demo | 采集预览、采集录音 |
+|---|---|
+| EncodeNode | 接收有序 VIDEO_RAW Caps，按 encoder 所需 pix_fmt/尺寸建立或重建 swscale 与 AVCodecContext；处理 send_frame/receive_packet、延迟 Packet flush；在首个 encoded Packet 前发布完整 VIDEO_ENCODED Caps（codec、尺寸、extradata 等） |
+| MuxNode / AVMuxNode | 接收有序 encoded Caps，全部输入初始 Caps 到齐后建立 Header 和固定 Pad→stream 映射；按 DTS 交织、写 trailer；Header 后 encoded Caps 改变按既定冻结合同报错 |
+| RTSPPushNode / 网络 Sink | 建立可取消的输出 I/O，处理阻塞写入、网络失败与 stop；本阶段至少打通一种实际启用的流式协议和容器组合（例如 FLV/RTMP 或 MPEG-TS/TCP） |
+| 推流 Demo | `V4L2CaptureNode → EncodeNode → AVMuxNode → 网络 Sink`；可按 Route 分叉扩展到预览，但分叉不是首个闭环的必要条件 |
+| 兼容性 | 必要时在 CMake / FFmpeg 构建中启用编码器、muxer 和 protocol；不将音频编码、传统 MP4 seek-back 输出或运行期 Header 重配混入本阶段 |
 
 ### 验收标准
 
-- [ ] V4L2CaptureNode → VideoRenderNode 实时预览
-- [ ] AudioCaptureNode → AudioPlayNode 实时播放
-- [ ] x86_64 和 aarch64 均通过
+- [ ] EncodeNode 对第四阶段协商出的固定 RAW 视频格式稳定输出 H.264 或 H.265；输出 Packet 可由 ffprobe/ffmpeg 解码，PTS/DTS 合法，EOS 后延迟 Packet 完整输出
+- [ ] AVMuxNode 仅在初始 encoded Caps 全部就绪后写 Header；写出的 FLV 或 MPEG-TS 可被 ffprobe 识别并连续解码；Header 后的 encoded Caps 改变按既定冻结合同明确报错
+- [ ] 网络 Sink 在本地可控接收端完成端到端推流；断连、写失败和外部 stop 可在有限时间内取消并完整回收线程与资源
+- [ ] `V4L2CaptureNode → EncodeNode → AVMuxNode → 网络 Sink` 连续运行时，框架不静默丢弃已获得的 encoded Packet，Route 不发生无界积压；必要时以预览分叉验证最慢可靠订阅者背压
+- [ ] 单测、端到端推流与 ASAN 验证通过；第三方协议库/驱动泄漏与项目自身问题分开报告
+- [ ] x86_64 通过；aarch64 在具备目标板、摄像头和接收端时验收
 
 ---
 
-## 后续优化方向
+## 第六阶段及后续
 
-| 方向 | 说明 |
-|------|------|
-| MemoryPool | 分级内存池减少 malloc 碎片（当前 Buffer 用 new/delete） |
-| 分叉传输零拷贝 | 已完成：Route Entry 单份 BufferRef，订阅者共享只读 payload；端到端 FFmpeg/设备零拷贝另行优化 |
-| Route 字节预算 | 当前按条目数硬限，后续增加 payload 字节上限和节点级总内存预算 |
-| DMA-BUF | V4L2 采集零拷贝 |
-| 硬件编解码 | VAAPI / V4L2 M2M |
-| RTSP 推流 | RTSPPushNode |
-| 线程绑核 | pthread_setaffinity_np |
-| AV Sync 自适应 | 丢帧阈值动态调整 |
-| 媒体兼容性 | 已完成：`pkt_timebase`、完整 channel layout、解码 Frame `best_effort_timestamp`、Decoder send/receive EAGAIN、VideoRender CPU 可访问非 YUV420P swscale。暂缓：Packet side data（当前无消费者；手机直拍等出现 DISPLAYMATRIX 旋转需求时，再设计 CapsEvent rotation + Render 应用），以及色彩空间/HDR 语义。 |
-| Running Caps 的剩余边界 | PTS discontinuity、Caps generation；Mux Header 后拒绝 encoded Caps 是已确定的冻结合同，不列为待支持重配 |
-| 采集 Source Caps 模型 | 默认 `SourceNode::capture() -> Buffer*` 无法表达有序 `Caps → Buffer* → Caps → Buffer*`；V4L2/AudioCapture 实现前结合设备协商和重配语义设计新的生产接口 |
-| VideoRender 事件轮询 | 当前只在取得视频帧并进入 `consume()` 时检查窗口关闭；上游无帧期间的及时响应待优化 |
+- AudioCapture、音频编码、音视频采集同步与音视频复用；
+- FileSink 与传统 MP4 专用文件输出；
+- 采集设备的运行期重配、PTS discontinuity、Caps generation；
+- DMA-BUF / 硬件帧零拷贝、硬件编解码、动态插件与多 Pipeline 模型。
