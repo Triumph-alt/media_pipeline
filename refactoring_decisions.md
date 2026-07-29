@@ -395,3 +395,33 @@ remaining >= -threshold
 ### 当前边界
 
 该决策只完成 Source 抽象与其单元/ASAN 验证，不实施 V4L2 ioctl、mmap、设备协商或阻塞 DQBUF 取消。第四阶段 V4L2 首版仍只承诺固定协商格式：首帧前产出真实 VIDEO_RAW Caps，之后产出深拷贝 BufferRef；设备运行期重配、PTS discontinuity 和 Caps generation 留待后续独立设计。
+
+---
+
+## V4L2 采集取消、时钟域与 Encode configuration 边界
+
+### 决策背景
+
+`SourceNode` 有序生产模型落地后，首个真实设备后端必须补齐三个不能由抽象基类替代的边界：V4L2 阻塞等待如何响应 `Pipeline::stop()`、设备时间戳能否进入以 `steady_clock` 建立的纯视频 Clock，以及 DQBUF 错误帧如何影响实时管线。与此同时，EncodeNode 虽然方向上是 Decode 的逆过程，但输出 encoded Caps 的完整时机不能照搬 Decode：编码器在 `avcodec_open2()` 后未必已经有稳定的 codec configuration，且实时 Source 不允许为等待未来信息无界缓存 Packet。
+
+### V4L2 可取消等待与驱动 buffer 合同
+
+- V4L2CaptureNode 使用 `O_NONBLOCK` 打开设备，并在 `produce()` 内用有限超时 `poll()` 等待可读事件；每次 timeout 或 EINTR 返回 Source 基类，由下一轮自然观察 `stop_requested_`。不另设 eventfd、自管唤醒线程或在 stop 时跨线程 close fd。
+- 否决“等 `onStop()` 关闭 fd 来打断阻塞 DQBUF”的方案：Pipeline 的 stop 顺序是先置节点 stop 标志、cancel Route、join worker，之后才按逆拓扑调用 `onStop()`。若 worker 正在不可中断 DQBUF，它等待 `onStop()`；而 `onStop()` 又等待 worker join，形成生命周期环。短超时 poll 已足以将停止延迟约束在 `poll_timeout_ms` 内，且不扩张核心取消接口。
+- Ready 固定执行 `S_FMT → G_PARM →（若 TIMEPERFRAME 支持）S_PARM → G_PARM → mmap/QBUF/STREAMON`。请求 fps 只是配置意图；第二次 G_PARM 返回的 `timeperframe` 才是驱动最终接受的 nominal interval，写入 `Buffer.duration` 供视频消费侧选择晚帧阈值。它不进入 VIDEO_RAW Caps，也不等同于通过逐帧 PTS 测得的实际交付帧率。
+- 每个成功 DQBUF 的驱动 mmap buffer 都必须在离开本轮处理前重新 QBUF：先深拷贝入框架紧密 Buffer，再 QBUF；拷贝、布局检查或后续 Route 发布失败也不得永久占住驱动 buffer。未压缩固定单平面 capture 的完整布局以 `S_FMT` 返回的 bytesperline/sizeimage 和 QUERYBUF mmap length 为权威，不能仅因部分 UVC 驱动的 `bytesused` 报告而把可访问 buffer 误判为半帧。
+- `V4L2_BUF_FLAG_ERROR` 表示当前 DQBUF buffer 可能损坏，但仍是可恢复 streaming error：丢弃当前帧、QBUF、继续采集；不把单个坏帧上报为 Pipeline ERROR。只有 QBUF/DQBUF/协商等真正无法继续的后端操作失败才走 ERROR。错误帧计数、限频 WARNING 和观测接口留待需要时设计。
+
+### V4L2 时间戳时钟域合同
+
+- 框架纯视频 Clock 的墙钟基准是 `std::chrono::steady_clock`，在当前 Linux 目标上对应单调时钟域。因此 Capture Buffer 的 PTS 只接受明确带 `V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC` 的 timeval，并换算为微秒。
+- 否决“timestamp type 只要不是 UNKNOWN 就接纳”的宽松判断：`V4L2_BUF_FLAG_TIMESTAMP_COPY` 只说明 timestamp 从对应 output buffer 复制，其时钟域来自外部提供者，COPY 本身不证明与 CLOCK_MONOTONIC 同域；UNKNOWN 也可能来自 realtime。两者均保留 `AV_NOPTS_VALUE`，不与 `steady_clock` 混用。
+- `V4L2_BUF_FLAG_TSTAMP_SRC_SOE/EOF` 仅表示帧开始/结束的采样位置，不改变其时钟域；MONOTONIC timestamp 的 SOE 与 EOF 都可被接受。
+
+### Encode configuration 就绪合同
+
+- EncodeNode 的 encoder 名称和 nominal framerate 是构造期 `EncodeConfig`，不是从 VIDEO_RAW Caps 推断。Ready 只查找、验证 encoder；`avcodec_open2()` 必须等待 Running RAW Caps 提供真实 width、height、input pix_fmt 后再执行。
+- 否决“在 `avcodec_open2()` 后立即发布 VIDEO_ENCODED Caps”的方案：encoder 可能直到第一个输出 Packet 才写出 codec configuration；提前发布的空/不完整 extradata 不能完整解释后续 Packet，违反 Running Caps 先于所辖 Buffer 的合同。
+- 当前请求 `AV_CODEC_FLAG_GLOBAL_HEADER`，并只在第一个实际 Packet 前观察到稳定、非空 `ctx_->extradata` 时发布 `VIDEO_ENCODED Caps → 第一个 Packet`。这将 out-of-band codec configuration 固定为 Caps 的可复制字段，避免猜测关键帧是否恰好携带完整 in-band 参数集。
+- 否决“等待第一个未来关键帧或 EOS flush 才决定 configuration、期间暂存所有 Packet”的方案：实时 V4L2 Source 无界，若 configuration 只在未来才出现，该策略会形成无界内存积压并失去流式输出。无法满足 global-header 首 Packet configuration 的 encoder 配置明确报错；未来若要支持 in-band configuration 或运行期 configuration 变化，必须先独立设计其 Caps/event 语义。
+- 每个编码输入都复制或转换到 encoder 自有的 `av_frame_get_buffer()` 存储；不让 encoder 延迟引用 Route delivery 中的 Buffer payload。`send_frame(EAGAIN)` 一律先 receive drain、再以同一个仍存活 AVFrame 重发，Caps 重配 flush 与 EOS flush复用该状态机。

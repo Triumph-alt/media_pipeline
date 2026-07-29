@@ -339,10 +339,12 @@ void SourceNode::runLoop() {
 // ===================================================================
 
 void SinkNode::runLoop() {
+    // 绑定唯一输入 Pad
     auto* sink_pad = sink_pads_[0].get();
     const std::string& sink_pad_name = sink_pad->name();
 
     while (!stop_requested_.load()) {
+        // 阻塞等待上游 Route 的下一项
         auto delivery = sink_pad->acquireBlocking();
         if (!delivery) {
             break;
@@ -350,7 +352,7 @@ void SinkNode::runLoop() {
 
         const QueueItem& item = delivery->item();
         if (std::holds_alternative<BufferRef>(item)) {
-            // Buffer 没有 active Caps 就无法被完整解释；这是上游协议错误而非默认值回退。
+            // Buffer 没有 active Caps 就无法被完整解释；这是上游协议错误而非默认值回退
             const auto active = active_caps_.find(sink_pad_name);
             if (active == active_caps_.end()) {
                 postMessage(MessageType::ERROR,
@@ -358,6 +360,8 @@ void SinkNode::runLoop() {
                                 sink_pad_name + "'");
                 break;
             }
+
+            // Buffer 的 MediaType 必须匹配当前 Caps
             if (std::get<BufferRef>(item)->media_type != active->second.media_type) {
                 postMessage(MessageType::ERROR,
                             "SinkNode: Buffer media type does not match active CapsEvent on pad '" +
@@ -365,7 +369,10 @@ void SinkNode::runLoop() {
                 break;
             }
 
+            // 调用具体 Sink 的 consume()
             consume(std::get<BufferRef>(item).get());
+
+            // consume() 完成后才 ack
             if (stop_requested_.load() || !delivery->ack()) {
                 break;
             }
@@ -374,21 +381,25 @@ void SinkNode::runLoop() {
 
         const Event& event = std::get<Event>(item);
         if (std::holds_alternative<CapsEvent>(event)) {
-            // 重配在当前 Route worker 内串行完成；只有 onCaps 成功后才能提交此格式边界。
+            // 重配在当前 Route worker 内串行完成；只有 onCaps 成功后才能提交此格式边界
             if (!applyCapsEvent(sink_pad_name, std::get<CapsEvent>(event)) || !delivery->ack()) {
                 break;
             }
             continue;
         }
 
-        // EOS 先释放输入 Route；输出侧 drain 期间不应占住可靠背压窗口。
+        // 先 ack 输入 EOS，输出侧 drain 期间不应占住可靠背压窗口
         if (!delivery->ack()) {
             break;
         }
+
+        // drain 等待输出真正完成
         onDrain();
         if (stop_requested_.load()) {
             break;
         }
+
+        // 向 Pipeline 上报 EOS，表示最终 Sink 已经真正完成
         postMessage(MessageType::EOS, "");
     }
 }
@@ -408,12 +419,13 @@ bool TransformNode::onCaps(const std::string&, const CapsEvent& caps,
 }
 
 void TransformNode::runLoop() {
+    // 先获取 Transform 唯一 sink_pad 输入端口
     auto* sink_pad = sink_pads_[0].get();
     const std::string& sink_pad_name = sink_pad->name();
     std::vector<QueueItem> outputs;
 
     while (!stop_requested_.load()) {
-        // 从唯一输入 SinkPad 取得一个 RouteDelivery
+        // 等上游 Route 出下一个 RouteDelivery
         auto delivery = sink_pad->acquireBlocking();
         if (!delivery) {
             break;
@@ -421,7 +433,7 @@ void TransformNode::runLoop() {
 
         const QueueItem& item = delivery->item();
         if (std::holds_alternative<BufferRef>(item)) {
-            // 必须先有 active Caps
+            // 如果是 Buffer 分支，先检查已有 active Caps
             const auto active = active_caps_.find(sink_pad_name);
             if (active == active_caps_.end()) {
                 postMessage(MessageType::ERROR,
@@ -438,6 +450,7 @@ void TransformNode::runLoop() {
                 break;
             }
 
+            // 调用具体 Transform 的 process，对数据进行处理并把一批有序项目塞进 outputs
             outputs.clear();
             process(std::get<BufferRef>(item).get(), outputs);
 
@@ -446,6 +459,7 @@ void TransformNode::runLoop() {
                 break;
             }
 
+            // 顺序发布 outputs
             bool outputs_published = true;
             for (auto& output : outputs) {
                 // 同一个移动发布边界承载 Caps 和 Buffer；失败项及未遍历尾项仍受 vector RAII 管理
@@ -464,11 +478,15 @@ void TransformNode::runLoop() {
 
         const Event& event = std::get<Event>(item);
         if (std::holds_alternative<CapsEvent>(event)) {
+            // 如果是 CapsEvent 分支
             outputs.clear();
+
+            // 先应用输入的 CapsEvent
             if (!applyCapsEvent(sink_pad_name, std::get<CapsEvent>(event), &outputs)) {
                 break;
             }
 
+            // 发布处理后的输出 Caps
             bool outputs_published = true;
             for (auto& output : outputs) {
                 if (!publishOutputItem(std::move(output))) {
@@ -476,20 +494,23 @@ void TransformNode::runLoop() {
                     break;
                 }
             }
+
+            // 输出全部成功后，才 ack 输入 Buffer
             if (!outputs_published || !delivery->ack()) {
                 break;
             }
             continue;
         }
 
-        // 子类 onEOS() 只能追加 Decoder flush 等延迟 Caps/Buffer，不能自行追加 EOS。
-        // 基类统一在末尾追加唯一 EOSEvent，因此即使子类没有上下文或没有待 flush 数据，
-        // 输入 Route 的 EOS 也恰好对应输出 Route 的一个 EOS。
+        // 子类 onEOS() 只能追加 Decoder flush 等延迟 Caps/Buffer，不能自行追加 EOS
         outputs.clear();
         onEOS(outputs);
         if (stop_requested_.load()) {
             break;
         }
+
+        // 基类统一在末尾追加唯一 EOSEvent，因此即使子类没有上下文或没有待 flush 数据
+        // 输入 Route 的 EOS 也恰好对应输出 Route 的一个 EOS
         outputs.emplace_back(Event{EOSEvent{}});
 
         bool outputs_published = true;
@@ -499,6 +520,8 @@ void TransformNode::runLoop() {
                 break;
             }
         }
+
+        // 最后一个 break 是正常终结，表示 Transform 的工作任务完成
         if (!outputs_published || !delivery->ack()) {
             break;
         }

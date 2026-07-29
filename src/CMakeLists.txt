@@ -15,6 +15,8 @@ set(CORE_SOURCES
 set(NODE_SOURCES
     nodes/AVDemuxNode.cpp
     nodes/DecodeNode.cpp
+    nodes/EncodeNode.cpp
+    nodes/V4L2CaptureNode.cpp
     nodes/VideoRenderNode.cpp
     nodes/AudioPlayNode.cpp
 )

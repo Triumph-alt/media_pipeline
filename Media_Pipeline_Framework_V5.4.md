@@ -31,7 +31,7 @@
 - 不支持 DMA-BUF 零拷贝（Buffer 第一阶段全部拷贝）
 - 不支持动态插件加载（.so）
 - 不支持 Windows / macOS，VideoRenderNode 的 SDL 视频线程模型只面向 Linux / 嵌入式 Linux
-- 不支持 PTS discontinuity、Caps generation 和采集设备的运行期格式重配；通用采集 Source 已具备 Running 有序 Caps 生产模型，但 V4L2/音频采集的设备协商、阻塞取消和重配语义仍需由具体节点单独实现
+- 不支持 PTS discontinuity、Caps generation、采集设备运行期格式重配和多平面/DMA-BUF capture
 - VideoRender 将 CPU 可访问的 VIDEO_RAW 非 YUV420P/YUVJ420P 格式经 swscale 转为 SDL IYUV 所需 YUV420P；当前仍不支持色彩空间/range/primaries/transfer/HDR 的显式 Caps 传递与严格色彩管理
 - **Mux Header 冻结合同**：所有输入初始 encoded Caps 到齐后建立 Header 并固定 Pad→输出 stream 映射；同一输入 Pad 后续出现 encoded CapsEvent 是协议错误，必须拒绝
 
@@ -525,7 +525,29 @@ Source 没有输入 Route 可提供 active Caps，故基类单独维护“最近
 
 普通 Source/Transform 的 `TemplateCaps` 是构造期常量，不得由 `Graph::link()` 的 `hint_type` 反向创造。每个具体 Source/Transform 类必须在构造函数中显式 `addSrcPad()` 创建唯一首个固定输出 Pad 并声明完整能力集合；未声明首 Pad 的类无法经动态创建连接。`requestSrcPad()` 只允许把后续 Pad 创建为首 Pad 的同源分叉：完整复制已有 `TemplateCaps`、共享同一个 `OutputRoute`，并仅用 `hint_type` 验证此次连接所请求的类型落在已有能力集合内。DemuxNode 的按媒体流动态 Route 和 MuxNode 的固定 `out_0` 是各自已定义的特殊模型，不属于该普通同源分叉规则。
 
-V4L2/AudioCapture 的具体设备后端尚未落地。首版 V4L2 只承诺在打开设备并完成固定格式协商后，在首帧前由 `produce()` 输出真实 `VIDEO_RAW Caps`，随后输出深拷贝 `BufferRef`；运行期设备重配、PTS discontinuity 和 Caps generation 仍留待后续单独设计。
+### 5.2.1 V4L2CaptureNode
+
+`V4L2CaptureNode` 已作为首个具体设备 Source 落地。构造函数固定创建 `out_0` 并声明 `{VIDEO_RAW}`；配置在构造期给出设备路径、请求 width/height、可选 V4L2 fourcc、请求 nominal framerate、mmap buffer 数量和 poll 超时。Ready 阶段按以下顺序完成单平面、CPU 可访问 raw capture 的固定协商：
+
+```text
+open(O_RDWR | O_NONBLOCK | O_CLOEXEC)
+→ VIDIOC_QUERYCAP（VIDEO_CAPTURE + STREAMING）
+→ VIDIOC_ENUM_FMT（未指定 fourcc 时只选本节点可映射的 raw 格式）
+→ VIDIOC_S_FMT（width / height / pixelformat）
+→ VIDIOC_G_PARM
+→ 若支持 V4L2_CAP_TIMEPERFRAME：VIDIOC_S_PARM 请求 framerate → 再次 VIDIOC_G_PARM
+→ VIDIOC_REQBUFS / VIDIOC_QUERYBUF / mmap
+→ 每个 buffer VIDIOC_QBUF
+→ VIDIOC_STREAMON
+```
+
+节点保存并记录驱动最终接受的 `timeperframe`，而不是把请求 fps 或 `S_PARM` 入参当作协商结果；该 nominal interval 写入每个 RAW Buffer 的 `duration`。它不进入 `VIDEO_RAW Caps`，也不代替每帧实际 PTS。设备不支持 `V4L2_CAP_TIMEPERFRAME` 时，协商帧率未知、`duration = 0`，仍可采集。
+
+`produce()` 以有限超时 `poll()` 等待非阻塞 fd，因此 stop/cancel 最多等待一个 poll 周期，不依赖 join 后的 `onStop()` 才关闭 fd。可用 DQBUF 后，节点依据实际协商的 `bytesperline` / `sizeimage` 和 mmap `buffer.length` 将图像压紧深拷贝到框架 Buffer，首帧前在同一 `outputs` 序列加入真实 `VIDEO_RAW Caps`，再加入 `BufferRef`；无论拷贝路径是否成功都及时 `VIDIOC_QBUF` 归还驱动 buffer。当前支持单平面 `YUYV`、`UYVY`、`NV12`、`YUV420`、`RGB24`、`BGR24`，不把 MJPEG/H.264 等压缩 payload 伪装为 RAW。
+
+`V4L2_BUF_FLAG_ERROR` 代表当前帧可能损坏但属于可恢复 streaming error：节点丢弃该帧、重新 QBUF 并继续采集，不把单帧问题扩大为 Pipeline ERROR；`DQBUF`/`QBUF`/协商等 ioctl 真正失败仍为 ERROR。V4L2 timestamp 只有 `V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC` 时才转换为框架微秒 PTS，以保证与 Pipeline `steady_clock` 同域；`UNKNOWN` 和 `COPY` 保持 `AV_NOPTS_VALUE`。`TSTAMP_SRC_SOE/EOF` 仅描述采样位置，不改变时钟域判断。
+
+当前实现仍不支持多平面 capture、压缩设备格式、DMA-BUF、运行期格式重配、PTS discontinuity 或 Caps generation。
 
 需要注意的是用户可能对同一路输出连接多个下游，比如采集到的画面可以一路直接本地预览，一路编码之后传输，甚至可以有别的路用来作别的格式的编码或者其他的处理，**所以 SourceNode 的 requestSrcPad 需要重写，需要支持分叉**
 
@@ -626,6 +648,34 @@ EOSEvent
 默认 `TransformNode::onCaps()` 是格式保留：将收到的 Caps 原样加入 outputs。DecodeNode 覆盖它：输入 encoded Caps 到达时先 drain 旧 decoder、重建上下文；真实 `AVFrame` 到达时才在该帧之前生成完整 RAW Caps。子类 `onEOS()` 不得追加或转发 EOSEvent，避免遗漏或重复 EOS。
 
 同源分叉仍通过 `requestSrcPad()` 创建共享 Route 的新 SrcPad；新 Pad 复制已有 TemplateCaps，hint_type 只做能力检查。
+
+### 5.4.1 EncodeNode
+
+`EncodeNode` 是当前首个具体视频编码 Transform：构造期固定创建 `in: {VIDEO_RAW}` 与 `out_0: {VIDEO_ENCODED}`。其 `EncodeConfig` 在构造时不可变，包含 encoder 名称和 nominal framerate；它们属于编码器实例配置，不属于输入 `VIDEO_RAW Caps`。Ready 阶段仅检查配置并通过 `avcodec_find_encoder_by_name()` 查找、验证视频 encoder，不能在此 `avcodec_open2()`，因为 width、height 和输入 pix_fmt 尚未由 Running Caps 确定。
+
+收到完整 `VIDEO_RAW Caps` 后，EncodeNode 执行以下边界：
+
+```text
+输入 Caps
+→ 若存在旧 encoder：先 flush delayed Packet，保持输出有序
+→ 依据 encoder 支持的 pix_fmt 选择直接输入格式或转换目标格式
+→ 必要时建立 input pix_fmt → encoder pix_fmt 的 swscale
+→ 用 Caps 的 width / height 和 EncodeConfig 的 time_base / framerate 建立并 avcodec_open2()
+```
+
+每个输入 Buffer 都被复制或 swscale 到由 `av_frame_get_buffer()` 分配的自有 `AVFrame`，不让 encoder 延迟引用 Route 中的 Buffer payload。输入 PTS 从框架微秒换算到 encoder `time_base`；编码 Packet 再换回框架微秒。`avcodec_send_frame(EAGAIN)` 统一先 drain 已就绪 Packet、再重发同一个仍存活 Frame；普通输入、Caps 重配 flush 和 EOS flush 共用这条状态机。
+
+输出 Caps 不能在打开 context 后提前猜测。当前实现请求 `AV_CODEC_FLAG_GLOBAL_HEADER`：第一个实际 Packet 到达时必须已有稳定 `ctx_->extradata`，才在同一 `outputs` 中严格发布：
+
+```text
+VIDEO_ENCODED Caps（codec_id / width / height / extradata / nominal framerate）
+→ 第一个 Packet
+→ 后续 Packet
+```
+
+无法在首个 Packet 前取得 configuration 的 encoder 配置被拒绝，避免为等未来关键帧或 EOS 的 extradata 无界暂存实时 Packet。Encoder 的输入 Caps 重配前先 flush 旧 Packet；EOS 时 flush 全部 delayed Packet，随后由 TransformNode 基类追加唯一 EOS。
+
+当前工程的静态 FFmpeg 构建仍禁用 encoder，故 EncodeNode 已完成编译/单元回归和图组 demo，但 `libx264`/`libx265` 等真实 encoder 的端到端验收必须待项目 FFmpeg 构建启用相应 encoder 后进行。
 
 ### 5.5 DemuxNode
 
@@ -1467,6 +1517,9 @@ CapsEvent → Buffer* → CapsEvent → Buffer* → EOSEvent
 |---|---|
 | Decode 输入 encoded Caps | `codec_id` 必须存在；VIDEO_ENCODED 的 width/height、AUDIO_ENCODED 的 sample_rate/channel_layout 是可选提示。已提供的合法提示写入 AVCodecContext；未知提示留给 FFmpeg 从 extradata/bitstream 确定。 |
 | Decode 输出 RAW Caps | 从真实 AVFrame 生成；VIDEO_RAW 必须有 width/height/pix_fmt，AUDIO_RAW 必须有 sample_rate/sample_fmt/有效 channel_layout。 |
+| V4L2Capture 输出 RAW Caps/Buffer | Caps 必须含实际协商的 width/height/pix_fmt；Buffer 为紧密 raw layout，PTS 仅接纳 MONOTONIC V4L2 timestamp，duration 为驱动接受的 nominal timeperframe（未知为 0）。 |
+| Encode 输入 RAW Caps | 必须有 width/height/pix_fmt；encoder 名称和 nominal framerate 来自构造期 EncodeConfig，不从 RAW Caps 推断。 |
+| Encode 输出 encoded Caps | 首个实际 Packet 前必须有 codec_id、width/height、稳定 extradata 和 nominal framerate；Caps 必须先于该 Packet 发布。 |
 | VideoRender | 要求完整的 VIDEO_RAW width/height/pix_fmt。YUV420P/YUVJ420P 直传 SDL IYUV；其他 CPU 可访问格式经 swscale 转为 YUV420P 后上传。 |
 | AudioPlay | 只接受完整、标准 native channel layout 的 AUDIO_RAW Caps，并重采样为固定 canonical SDL 格式。 |
 | Mux 基类 | 初始 encoded Caps 至少需要 `codec_id`；具体容器 Header 所需的尺寸/采样率等由 `addStream()` 后端校验。 |
@@ -1476,6 +1529,23 @@ CapsEvent → Buffer* → CapsEvent → Buffer* → EOSEvent
 **DemuxNode** 在 Ready 探测并缓存 encoded Caps；其 worker 对每条已连接逻辑 Route 先发布 Caps，再发布 Packet Buffer。对于同类型分叉，只发布一次，所有订阅者通过共享 Route 看到相同序列。
 
 **DecodeNode** 在输入 encoded Caps 到达时：若已有旧上下文，先把 delayed AVFrame 加入本地有序 outputs，再释放旧上下文并配置新 decoder。它不以 `avcodec_open2()` 后的 context 字段声明 RAW 格式；许多视频 decoder 此时仍没有 pix_fmt。每取得一帧真实 AVFrame，Decode 先比较其真实 RAW 格式：首帧或格式变化帧先将完整 RAW Caps 加入 outputs，随后加入该帧 Buffer。EOS flush 使用同一 outputs 序列，基类最后追加唯一 EOSEvent。
+
+**EncodeNode** 收到 VIDEO_RAW Caps 后才用输入 width/height/pix_fmt 打开 encoder：encoder 名称和 nominal framerate 来自构造期 `EncodeConfig`，不是 RAW Caps。它依据 encoder 支持的 pix_fmt 选择直拷贝或建立 swscale，将每个输入 Buffer 复制到自有 AVFrame，按 encoder time_base 转换 PTS 后送入 `send_frame/receive_packet` 状态机。当前请求 global header，只有第一个实际 Packet 前已经取得稳定 extradata 时才发布完整 `VIDEO_ENCODED Caps → Packet`；无法满足首包 configuration 边界的 encoder 配置明确报错，不为实时链路无界缓存。Caps 重配和 EOS 都先 flush delayed Packet，再由 Transform 基类维持有序输出和唯一 EOS。
+
+**V4L2CaptureNode** 在 Ready 固定协商 raw capture 格式和 nominal framerate，worker 使用非阻塞 fd 加有限超时 poll 等待。它在首帧前发布真实 VIDEO_RAW Caps，随后深拷贝紧密 Buffer 并立刻归还驱动 mmap buffer；只接受 MONOTONIC V4L2 timestamp 作为与 Clock 同域的 PTS。驱动标记 `V4L2_BUF_FLAG_ERROR` 的单帧被丢弃、QBUF 后继续采集，不是自然 EOS 也不直接终止 Pipeline。其输出可直接连接 VideoRender，也可进入 EncodeNode：
+
+```text
+V4L2Capture
+VIDEO_RAW Caps → raw Buffer*
+                 ↓
+Encode
+VIDEO_ENCODED Caps → Packet*
+                     ↓
+Decode
+VIDEO_RAW Caps → raw Buffer*
+                 ↓
+VideoRender
+```
 
 **VideoRenderNode** 在 Running 应用 Caps，忠实保存上游真实像素格式：YUV420P/YUVJ420P 直接上传 SDL IYUV，其他 CPU 可访问格式在该消费端通过 swscale 转为紧密 YUV420P。像素格式重配只替换转换资源，尺寸变化时再销毁旧 Texture，下一帧重建。SDL VIDEO/Window/Renderer/Texture 仍由 worker 持有完整生命周期。
 
@@ -1846,23 +1916,84 @@ if (!pipeline.play()) {
 pipeline.waitEOS();
 ```
 
-### 11.2 采集编码，同时推流 + 本地录制（分叉）
+### 11.2 采集预览、编码回环与推流 + 本地录制
+
+```cpp
+// 最小真实设备预览：V4L2CaptureNode → VideoRenderNode
+{
+    V4L2CaptureConfig capture_config;
+    capture_config.device = "/dev/video0";
+    capture_config.width = 640;
+    capture_config.height = 480;
+    capture_config.framerate = {30, 1};  // Ready 后以驱动 G_PARM 最终接受值为准
+
+    Pipeline preview;
+    auto* vcap = preview.addNode<V4L2CaptureNode>("vcap", capture_config);
+    auto* vrender = preview.addNode<VideoRenderNode>("vrender");
+
+    if (!preview.link(vcap, "out_0", vrender, "in", MediaType::VIDEO_RAW) ||
+        !preview.build() || !preview.play()) {
+        return -1;
+    }
+    // 实时采集无自然 EOS；应用在 SIGINT、窗口关闭或自身生命周期中调用 preview.stop()，
+    // 或通过 waitEOS() 等待节点 STOP_REQUESTED / ERROR。
+    preview.waitEOS();
+}
+
+// 真实编解码回环：采集 RAW → 编码 Packet → 解码 RAW → 渲染
+{
+    V4L2CaptureConfig capture_config;
+    capture_config.device = "/dev/video0";
+    capture_config.width = 640;
+    capture_config.height = 480;
+    capture_config.framerate = {30, 1};
+
+    EncodeConfig encode_config;
+    encode_config.codec_name = "libx264";
+    encode_config.framerate = {30, 1};
+
+    Pipeline loopback;
+    auto* capture = loopback.addNode<V4L2CaptureNode>("vcap", capture_config);
+    auto* encode = loopback.addNode<EncodeNode>("vencode", encode_config);
+    auto* decode = loopback.addNode<DecodeNode>("vdecode");
+    auto* render = loopback.addNode<VideoRenderNode>("vrender");
+
+    if (!loopback.link(capture, "out_0", encode, "in", MediaType::VIDEO_RAW) ||
+        !loopback.link(encode, "out_0", decode, "in", MediaType::VIDEO_ENCODED) ||
+        !loopback.link(decode, "out_0", render, "in", MediaType::VIDEO_RAW) ||
+        !loopback.build() || !loopback.play()) {
+        return -1;
+    }
+    loopback.waitEOS();
+}
+```
+
+上面两段是独立用法示例，不能在同一进程同时存活；当前进程级 SDL 生命周期合同只支持同一时刻一个 Pipeline。
+
+当前仓库静态 FFmpeg 尚未启用 video encoder，上述第二个回环在链接层可构建，但实际运行前须启用 `libx264`/`libx265` 等 encoder；第一段预览闭环已在真实 V4L2 设备验证。
+
+下面保留第五阶段目标中的采集编码、推流与录制分叉示例：
 
 ```cpp
 Pipeline pipeline;
 
-auto* vcap    = pipeline.addNode<V4L2CaptureNode>("vcap");
+V4L2CaptureConfig capture_config;
+capture_config.device = "/dev/video0";
+capture_config.width = 640;
+capture_config.height = 480;
+capture_config.framerate = {30, 1};
+EncodeConfig video_encode_config{"libx264", {30, 1}};
+
+auto* vcap    = pipeline.addNode<V4L2CaptureNode>("vcap", capture_config);
 auto* acap    = pipeline.addNode<AudioCaptureNode>("acap");
-auto* venc    = pipeline.addNode<EncodeNode>("venc");
+auto* venc    = pipeline.addNode<EncodeNode>("venc", video_encode_config);
 auto* aenc    = pipeline.addNode<EncodeNode>("aenc");
 auto* mux_r   = pipeline.addNode<AVMuxNode>("mux_rtsp", MuxFormat::FLV);
 auto* mux_f   = pipeline.addNode<AVMuxNode>("mux_file", MuxFormat::MP4);
 auto* rtsp    = pipeline.addNode<RTSPPushNode>("rtsp");
 auto* file    = pipeline.addNode<FileSinkNode>("file");
 
-vcap->setDevice("/dev/video0");
 acap->setDevice("hw:0,0");
-venc->setCodec("libx264");
 aenc->setCodec("aac");
 rtsp->setUrl("rtsp://...");
 file->setPath("output.mp4");
@@ -1947,8 +2078,8 @@ Pipeline::waitEOS
 4. **Route 通知回调限制**：当前只在 Mux Ready 阶段注册，用于唤醒多输入调度；若未来需要运行期变更，必须定义通知列表的线程安全边界。
 5. **link/build 错误报告**：核心库当前只返回 bool，不直接 fprintf，也不适合走运行期 MessageBus；详细错误报告机制仍需独立设计。
 6. **Caps 运行期边界的剩余限制**：Decoder 首帧真实格式定案、同一 Route 多份 Caps、VideoRender 尺寸变化、CPU 可访问非 YUV420P swscale 和 AudioPlay 输入重配已支持；尚不支持 PTS discontinuity、Caps generation，以及色彩空间/range/primaries/transfer/HDR 的显式格式协商与严格色彩管理。
-7. **采集具体节点与运行期重配**：`SourceNode` 已可有序生产 `Caps → Buffer → Caps → Buffer`，并在生产边界阻止 Buffer 越过 active Caps；采集 Source 不具备自然 EOS，必须由外部 stop/cancel 或设备 ERROR 结束。V4L2/AudioCapture 尚未落地。后续具体后端仍须结合设备 open、协商、阻塞取消及运行期格式变化确定 `produce()` 行为；本阶段不支持设备运行期重配、PTS discontinuity 或 Caps generation。
-8. **媒体兼容性**：解码 Frame 已优先使用 `best_effort_timestamp`，Decoder 的 `send_packet(EAGAIN)` 已按 drain 后重发同一 Packet 的合同处理，CPU 可访问的非 YUV420P 视频已在 VideoRender 通过 swscale 转为 IYUV；`pkt_timebase` 已设置为框架微秒时间基，完整 channel layout 已以 Caps 的 `ChannelLayout` 值类型传递，但 AudioPlay 当前只承诺标准 native layout 到 stereo 的转换。Packet side data（例如 DISPLAYMATRIX、HDR/动态 metadata）当前仍在 Packet→Buffer 转换时丢弃，未接入 CapsEvent：目前没有消费端，尤其 VideoRender 没有旋转/HDR 应用路径。若素材来源出现手机直拍等必须按旋转矩阵显示的竖版视频，再单独确定“CapsEvent 的 rotation 字段 + Render 应用”设计；不得预先将所有逐 Packet side data 伪装为流级 Caps。色彩空间/HDR 的显式协商也仍待具体消费端语义确定。
+7. **采集具体节点、运行期重配与帧率观测**：`V4L2CaptureNode` 已落地单平面 CPU raw capture：构造期固定 `{VIDEO_RAW}` 输出、Ready 阶段协商格式和 nominal `timeperframe`、非阻塞 poll 可取消等待、mmap DQBUF 深拷贝后及时 QBUF、首帧前 Running Caps、MONOTONIC PTS、可恢复错误帧丢弃后继续。`V4L2_BUF_FLAG_ERROR` 当前只做丢帧继续，尚未提供计数、限频 WARNING 或用户可观测统计；这些可在后续诊断需求明确后补充。AudioCapture 尚未落地；多平面、压缩设备格式、DMA-BUF、设备运行期重配、PTS discontinuity 与 Caps generation 仍待设计。虚拟机 V4L2 设备上曾观察到 `G_PARM` 接受 30 fps、但直接 `v4l2-ctl` 依据 DQBUF timestamp 实测仅约 14–15 fps（不经 Pipeline、swscale 或 SDL），另一次未显式 S_PARM 的外接设备测试约 22 fps；当前只记录为宿主机/VMware/UVC 链路待观察项，待交叉编译至嵌入式目标板和真实 V4L2 设备后复验，不在项目层伪造帧率或以渲染补丁掩盖。
+8. **媒体兼容性与编码验收**：解码 Frame 已优先使用 `best_effort_timestamp`，Decoder 的 `send_packet(EAGAIN)` 已按 drain 后重发同一 Packet 的合同处理，CPU 可访问的非 YUV420P 视频已在 VideoRender 通过 swscale 转为 IYUV；`pkt_timebase` 已设置为框架微秒时间基，完整 channel layout 已以 Caps 的 `ChannelLayout` 值类型传递。EncodeNode 已实现 RAW Caps 驱动 encoder open、输入格式转换、自有 Frame 存储、send/receive EAGAIN、global-header 首 Packet configuration、Caps 重配/EOS flush，但当前项目静态 FFmpeg 仍禁用 encoder，故 `libx264`/`libx265` 的真实 Packet、Decode 回环、ASAN 端到端验收待启用对应 encoder 后完成。Packet side data（例如 DISPLAYMATRIX、HDR/动态 metadata）当前仍在 Packet→Buffer 转换时丢弃，未接入 CapsEvent：目前没有消费端，尤其 VideoRender 没有旋转/HDR 应用路径。若素材来源出现手机直拍等必须按旋转矩阵显示的竖版视频，再单独确定“CapsEvent 的 rotation 字段 + Render 应用”设计；不得预先将所有逐 Packet side data 伪装为流级 Caps。色彩空间/HDR 的显式协商也仍待具体消费端语义确定。
 9. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
 10. **Demux/Mux 边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`，虽 Route 已支持可靠多订阅者输出，但动态 Mux 输出 Pad、最终交织策略、阻塞网络 I/O interrupt callback 和具体 AVMuxNode 仍待实现。
 11. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4；需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
@@ -1992,10 +2123,12 @@ media-pipeline/
 │   ├── core/
 │   └── nodes/
 ├── demo/
-│   ├── player.cpp               # 本地播放
-│   ├── recorder.cpp             # 采集录制
-│   ├── pusher.cpp               # 推流
-│   └── transcoder.cpp           # 转码
+│   ├── player.cpp                         # 本地播放
+│   ├── v4l2_preview.cpp                   # V4L2Capture → VideoRender 真实预览
+│   ├── v4l2_encode_decode_preview.cpp     # V4L2Capture → Encode → Decode → VideoRender（待 encoder 验收）
+│   ├── recorder.cpp                       # 采集录制
+│   ├── pusher.cpp                         # 推流
+│   └── transcoder.cpp                     # 转码
 └── tests/
     ├── test_graph.cpp
     ├── test_caps.cpp
