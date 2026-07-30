@@ -48,6 +48,7 @@ private:
     // 返回 true 表示当前帧应呈现；返回 false 表示当前帧应跳过或等待被 stop 打断。
     bool waitForPresentationTime(int64_t pts_us, int64_t duration_us);
     bool waitForStartupBarrier();
+    void traceStartupStage(const char* stage);
 
     int width_ = 0;
     int height_ = 0;
@@ -75,6 +76,9 @@ private:
 
     int rendered_frames_ = 0;
     int dropped_frames_ = 0;
+    uint64_t received_frames_ = 0;
+    int64_t startup_trace_origin_us_ = 0;
+    int64_t startup_trace_previous_us_ = 0;
 };
 
 } // namespace pipeline

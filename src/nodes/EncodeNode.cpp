@@ -1,6 +1,7 @@
 #include "pipeline/nodes/EncodeNode.h"
 
 #include "pipeline/core/Buffer.h"
+#include "pipeline/core/LatencyTrace.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -166,6 +167,8 @@ bool EncodeNode::configureEncoder(const CapsEvent& caps) {
     ctx_ = replacement;
     input_caps_ = caps;
     encoder_pix_fmt_ = output_format;
+    input_frames_ = 0;
+    output_packets_ = 0;
     flushed_ = false;
     output_caps_emitted_ = false;
     fprintf(stderr, "[%s] encoder opened: codec=%s %dx%d input_pix_fmt=%d encoder_pix_fmt=%d\n",
@@ -312,6 +315,9 @@ bool EncodeNode::appendEncodedPacket(const AVPacket* packet, std::vector<QueueIt
         postMessage(MessageType::ERROR, "EncodeNode: Buffer::fromAVPacket failed");
         return false;
     }
+    ++output_packets_;
+    traceLatencySample(name_.c_str(), "encode-out", output_packets_,
+                       encoded->pts, encoded->dts, input_frames_);
 
     if (output_caps_emitted_) {
         outputs.emplace_back(std::move(encoded));
@@ -376,6 +382,11 @@ void EncodeNode::process(const Buffer* input, std::vector<QueueItem>& outputs) {
         postMessage(MessageType::ERROR, "EncodeNode: input Buffer arrived without configured encoder");
         return;
     }
+
+    ++input_frames_;
+    traceLatencySample(name_.c_str(), "encode-in", input_frames_,
+                       input ? input->pts : AV_NOPTS_VALUE,
+                       input ? input->dts : AV_NOPTS_VALUE);
 
     AVFrame* frame = nullptr;
     if (!buildEncoderFrame(input, &frame)) {

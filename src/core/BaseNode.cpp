@@ -816,7 +816,7 @@ bool MuxNode::writeHeaderAfterAllInputsConfigured() {
 
     CapsEvent output_caps;
     output_caps.media_type = MediaType::CONTAINER;
-    if (!sendCapsEvent("out_0", output_caps) || !writeHeader() || !flushPendingOutput()) {
+    if (!sendCapsEvent("out_0", output_caps) || !writeHeader(format_) || !flushPendingOutput()) {
         pending_output_.clear();
         return false;
     }
@@ -874,10 +874,10 @@ void MuxNode::runLoop() {
             continue;
         }
 
-        // 已 link 的 Mux 输入在初始 Caps 前 EOS 无法参与容器 header，是明确配置错误。
-        if (!initial_caps_pads_.count(pad_name)) {
+        // Header 尚未建立时，任一路 EOS 都证明不可能再等齐本轮全部输入的初始 Caps。
+        if (!header_written_) {
             postMessage(MessageType::ERROR,
-                        "MuxNode: linked input reached EOS before initial CapsEvent");
+                        "MuxNode: linked input reached EOS before all inputs supplied initial CapsEvent");
             break;
         }
 
@@ -899,34 +899,59 @@ void MuxNode::runLoop() {
 
 SinkPad* MuxNode::waitAnyPadReady() {
     std::unique_lock<std::mutex> lock(mux_mutex_);
+    // 上游向任一路 Route 发布，或 Route 被 cancel 时，通知会唤醒这个条件变量
     mux_cv_.wait(lock, [this] {
         if (stop_requested_.load()) {
             return true;
         }
 
-        for (const auto& pad : sink_pads_) {
-            if (!pad->isConnected()) {
-                continue;
+        // 如果尚未建立容器 Header
+        if (!header_written_) {
+            for (const auto& pad : sink_pads_) {
+                if (!pad->isConnected()) {
+                    continue;
+                }
+                const auto top = pad->peek();
+                if (top && (std::holds_alternative<Event>(*top) ||
+                            !initial_caps_pads_.count(pad->name()))) {
+                    // Header 前必须优先推进尚未完成初始 Caps 配置的输入，已配置输入的
+                    // Buffer 则保留在 Route 中，不能越过未来 Header
+                    return true;
+                }
             }
-            const auto top = pad->peek();
-            if (!top) {
+            return false;
+        }
+
+        bool has_active_input = false;
+        // 第一轮先扫描全部仍活跃的输入，看是否有控制 Event
+        for (const auto& pad : sink_pads_) {
+            if (!pad->isConnected() || eos_pads_.count(pad->name())) {
                 continue;
             }
 
-            // Mux cannot write a header until every linked input supplied initial Caps. While that
-            // condition is incomplete, only control Events may advance the setup state; an early
-            // Buffer on another input must remain retained instead of being mistaken for an error.
-            if (!header_written_) {
-                if (std::holds_alternative<Event>(*top) || !initial_caps_pads_.count(pad->name())) {
-                    return true;
-                }
-                // This input already supplied Caps, so its queued Buffer is valid but must wait for
-                // the other linked inputs to establish their header streams.
+            has_active_input = true;
+            const auto top = pad->peek();
+            if (top && std::holds_alternative<Event>(*top)) {
+                // 先扫描全部活跃输入的控制边界，不能让另一条暂空 Route 延后其 EOS 或错误 Caps
+                return true;
+            }
+        }
+
+        // 第二轮要求每个未 EOS 输入都有 Buffer 队首
+        for (const auto& pad : sink_pads_) {
+            if (!pad->isConnected() || eos_pads_.count(pad->name())) {
                 continue;
             }
-            return true;
+
+            const auto top = pad->peek();
+            if (!top) {
+                // 当前输入尚没有候选 Packet，不能让其他输入越过其未知未来 DTS
+                return false;
+            }
         }
-        return false;
+
+        // 全部未 EOS 输入均已有 Buffer 队首，才可由框架选择全局最小 DTS
+        return has_active_input;
     });
 
     if (stop_requested_.load()) {
@@ -934,8 +959,7 @@ SinkPad* MuxNode::waitAnyPadReady() {
     }
 
     if (!header_written_) {
-        // Prefer a missing input's first item (Caps or an invalid early Buffer) so the loop always
-        // makes progress or reports the precise protocol error instead of waiting indefinitely.
+        // 优先选择仍缺初始 Caps 的输入，使 Header 建立过程有序前进或报告精确协议错误
         for (auto& pad : sink_pads_) {
             const auto top = pad->peek();
             if (top && !initial_caps_pads_.count(pad->name())) {
@@ -951,6 +975,18 @@ SinkPad* MuxNode::waitAnyPadReady() {
         return nullptr;
     }
 
+    // Header 后控制 Event 优先于 Packet 调度，避免 EOS 或非法 Caps 被数据越过
+    for (auto& pad : sink_pads_) {
+        if (eos_pads_.count(pad->name())) {
+            continue;
+        }
+        const auto top = pad->peek();
+        if (top && std::holds_alternative<Event>(*top)) {
+            return pad.get();
+        }
+    }
+
+    // 此时 Header 已建立，并且已经保证，每个未 EOS 输入都有一个 Buffer 队首
     return selectMinDtsPad();
 }
 
@@ -959,27 +995,35 @@ SinkPad* MuxNode::selectMinDtsPad() {
     int64_t min_dts = std::numeric_limits<int64_t>::max();
 
     for (auto& pad : sink_pads_) {
-        if (!pad->isConnected()) {
+        if (!pad->isConnected() || eos_pads_.count(pad->name())) {
             continue;
         }
 
-        auto top = pad->peek();
-        if (!top) {
-            continue;
+        // 再次校验候选集没有被破坏
+        const auto top = pad->peek();
+        if (!top || !std::holds_alternative<BufferRef>(*top)) {
+            postMessage(MessageType::ERROR,
+                        "MuxNode: active input lost its Buffer candidate during DTS selection");
+            return nullptr;
         }
 
-        if (std::holds_alternative<Event>(*top)) {
-            // Event（EOS 等）优先处理，不参与 DTS 比较
-            return pad.get();
+        const BufferRef& buffer = std::get<BufferRef>(*top);
+        // 为了让框架自己做跨流排序，必须有可比较的 DTS
+        if (!buffer || buffer->dts == AV_NOPTS_VALUE) {
+            postMessage(MessageType::ERROR,
+                        "MuxNode: encoded Buffer requires a valid DTS for framework interleaving");
+            return nullptr;
         }
-
-        int64_t dts = std::get<BufferRef>(*top)->dts;
-        if (dts < min_dts) {
-            min_dts = dts;
+        // 选最小 DTS
+        if (buffer->dts < min_dts) {
+            min_dts = buffer->dts;
             min_pad = pad.get();
         }
     }
 
+    if (!min_pad) {
+        postMessage(MessageType::ERROR, "MuxNode: no active Buffer candidate for DTS selection");
+    }
     return min_pad;
 }
 

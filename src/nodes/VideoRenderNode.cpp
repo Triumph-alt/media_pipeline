@@ -1,6 +1,7 @@
 #include "pipeline/nodes/VideoRenderNode.h"
 #include "pipeline/core/Buffer.h"
 #include "pipeline/core/Clock.h"
+#include "pipeline/core/LatencyTrace.h"
 #include "pipeline/core/Pipeline.h"
 
 extern "C" {
@@ -34,6 +35,7 @@ bool VideoRenderNode::onReady() {
     }
     startup_barrier_arrived_ = false;
     startup_barrier_withdrawn_ = false;
+    received_frames_ = 0;
     return true;
 }
 
@@ -176,11 +178,31 @@ bool VideoRenderNode::convertFrameToYuv420p(const Buffer* buffer, const CapsEven
     return true;
 }
 
+void VideoRenderNode::traceStartupStage(const char* stage) {
+    if (!latencyTraceEnabled()) {
+        return;
+    }
+
+    const int64_t now_us = latencyTraceNowUs();
+    if (startup_trace_origin_us_ == 0) {
+        startup_trace_origin_us_ = now_us;
+        startup_trace_previous_us_ = now_us;
+    }
+    traceStartupStep(name_.c_str(), stage,
+                     now_us - startup_trace_previous_us_,
+                     now_us - startup_trace_origin_us_);
+    startup_trace_previous_us_ = now_us;
+}
+
 // ===================================================================
 // runLoop: SDL 视频资源的完整生命周期都属于节点工作线程
 // ===================================================================
 void VideoRenderNode::runLoop() {
+    startup_trace_origin_us_ = 0;
+    startup_trace_previous_us_ = 0;
+    traceStartupStage("worker-enter");
     if (openRenderer()) {
+        traceStartupStage("sink-loop-enter");
         SinkNode::runLoop();
     }
 
@@ -213,10 +235,12 @@ bool VideoRenderNode::openRenderer() {
     rendered_frames_ = 0;
     dropped_frames_ = 0;
 
+    traceStartupStage("sdl-init-begin");
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
         return failRender(std::string("VideoRenderNode: SDL_InitSubSystem failed: ") +
                           SDL_GetError());
     }
+    traceStartupStage("sdl-init-end");
     sdl_video_initialized_ = true;
 
     // 仅记录 SDL 对当前工作线程的判定，不把它作为运行前置条件
@@ -225,12 +249,15 @@ bool VideoRenderNode::openRenderer() {
 
     const int window_width = width_ > 0 ? width_ : 640;
     const int window_height = height_ > 0 ? height_ : 360;
+    traceStartupStage("window-create-begin");
     window_ = SDL_CreateWindow("Media Pipeline", window_width, window_height, 0);
     if (!window_) {
         return failRender(std::string("VideoRenderNode: SDL_CreateWindow failed: ") +
                           SDL_GetError());
     }
+    traceStartupStage("window-create-end");
 
+    traceStartupStage("renderer-create-begin");
     renderer_ = SDL_CreateRenderer(static_cast<SDL_Window*>(window_), "software");
     if (!renderer_) {
         fprintf(stderr, "[%s] software renderer failed: %s, trying default\n",
@@ -241,6 +268,7 @@ bool VideoRenderNode::openRenderer() {
         return failRender(std::string("VideoRenderNode: SDL_CreateRenderer failed: ") +
                           SDL_GetError());
     }
+    traceStartupStage("renderer-create-end");
 
     fprintf(stderr, "[%s] renderer: %s\n", name_.c_str(),
             SDL_GetRendererName(static_cast<SDL_Renderer*>(renderer_)));
@@ -406,6 +434,12 @@ void VideoRenderNode::consume(const Buffer* buf) {
     // 并统一给出 SDL IYUV 所需的 Y/U/V 平面与 stride。
     const int width = caps.width;
     const int height = caps.height;
+    ++received_frames_;
+    if (received_frames_ == 1) {
+        traceStartupStage("first-render-in");
+    }
+    traceLatencySample(name_.c_str(), "render-in", received_frames_,
+                       buf->pts, buf->dts);
     // 先完成同步判断：已过期帧不值得再执行 swscale，正常晚帧丢弃仍由 SinkNode ack 当前 Delivery。
     if (!waitForPresentationTime(buf->pts, buf->duration)) {
         return;
@@ -447,6 +481,11 @@ void VideoRenderNode::consume(const Buffer* buf) {
     }
 
     ++rendered_frames_;
+    if (rendered_frames_ == 1) {
+        traceStartupStage("first-present");
+    }
+    traceLatencySample(name_.c_str(), "present", received_frames_,
+                       buf->pts, buf->dts);
     if (rendered_frames_ % 100 == 1) {
         fprintf(stderr, "[%s] rendered %d frames\n",
                 name_.c_str(), rendered_frames_);

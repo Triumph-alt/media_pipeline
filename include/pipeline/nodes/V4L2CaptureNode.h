@@ -70,6 +70,7 @@ private:
     AVPixelFormat av_pixel_format_ = AV_PIX_FMT_NONE;
     AVRational negotiated_framerate_ = {0, 1};
     int64_t nominal_frame_duration_us_ = 0;
+    uint64_t captured_frames_ = 0;
     bool streaming_ = false;
     bool initial_caps_emitted_ = false;
 };

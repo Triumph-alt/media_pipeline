@@ -63,6 +63,8 @@ private:
     SwsContext* sws_ctx_ = nullptr;
     CapsEvent input_caps_;
     AVPixelFormat encoder_pix_fmt_ = AV_PIX_FMT_NONE;
+    uint64_t input_frames_ = 0;
+    uint64_t output_packets_ = 0;
     bool flushed_ = false;
     bool output_caps_emitted_ = false;
 };

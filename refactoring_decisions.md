@@ -425,3 +425,30 @@ remaining >= -threshold
 - 当前请求 `AV_CODEC_FLAG_GLOBAL_HEADER`，并只在第一个实际 Packet 前观察到稳定、非空 `ctx_->extradata` 时发布 `VIDEO_ENCODED Caps → 第一个 Packet`。这将 out-of-band codec configuration 固定为 Caps 的可复制字段，避免猜测关键帧是否恰好携带完整 in-band 参数集。
 - 否决“等待第一个未来关键帧或 EOS flush 才决定 configuration、期间暂存所有 Packet”的方案：实时 V4L2 Source 无界，若 configuration 只在未来才出现，该策略会形成无界内存积压并失去流式输出。无法满足 global-header 首 Packet configuration 的 encoder 配置明确报错；未来若要支持 in-band configuration 或运行期 configuration 变化，必须先独立设计其 Caps/event 语义。
 - 每个编码输入都复制或转换到 encoder 自有的 `av_frame_get_buffer()` 存储；不让 encoder 延迟引用 Route delivery 中的 Buffer payload。`send_frame(EAGAIN)` 一律先 receive drain、再以同一个仍存活 AVFrame 重发，Caps 重配 flush 与 EOS flush复用该状态机。
+
+---
+
+## AVMuxNode MPEG-TS 首版与框架侧 DTS 调度
+
+### 决策背景
+
+`MuxNode` 原本只在当前已有队首的输入之间选择最小 DTS。若某一路暂时为空，其他路的 Packet 会先写出，随后到达的更小 DTS 已无法插回，因而不能诚实地宣称框架完成了跨输入排序。与此同时，`av_interleaved_write_frame()` 会建立 libavformat 自己的通用 interleave queue，与 Route 的可靠有界背压和框架侧排序 owner 重叠。
+
+### 正式合同
+
+- `MuxNode::writeHeader()` 改为 `writeHeader(MuxFormat format)`：基类持有唯一不可变的 `format_`，在调用钩子时显式传入；具体后端不读取 protected/private 格式成员，也不重复保存 format
+- Header 后，所有尚未 EOS 的输入都必须先拥有一个 Buffer 队首，才在完整候选集中选择框架微秒量纲的全局最小 DTS。Caps 和 EOS 等控制 Event 先在全部活跃输入中扫描、优先于 Packet 处理；ack 后的 EOS 输入从下一轮候选集合移除。Header 前任一路 EOS 都证明本轮初始 Caps 无法齐备，必须立即报配置错误
+- 活跃输入缺少候选 Buffer 时，其他输入在 Route 上可靠背压，不以“先写当前可见 Packet”、FFmpeg 隐藏 interleave queue 或无界缓存越过未知未来 DTS
+- 当前 `MuxNode` 因而要求每个 Header 后待写 encoded Buffer 有有效 DTS；无 DTS 不参与猜测排序，而是作为协议错误拒绝
+- `AVMuxNode` 具体后端使用 `av_write_frame()`，不调用 `av_interleaved_write_frame()`；跨输入排序的唯一 owner 是 `MuxNode`
+- `AVPacket` 使用 `av_new_packet()` 建立 FFmpeg 自有且带 padding 的 payload 后深拷贝框架 Buffer 数据。不得借用 Buffer 的 `new[]` 存储，也不得把它交给 `av_packet_from_data()`
+- `EncodedMeta::flags` 必须恢复到 `AVPacket::flags`，保持 keyframe 信息供 MPEG-TS、后续 FLV 和 fragmented MP4 使用
+- custom AVIO callback 只调用 `appendContainerBytes()` 立即复制临时容器字节。Header、每个 Packet 和 Trailer 结束前调用 `avio_flush()` 并检查 AVIO error，随后仍由 `MuxNode` 发布有序 CONTAINER Buffer
+
+### 首版范围与后续边界
+
+- `AVMuxNode` 首版只接受一条 `VIDEO_ENCODED` H.264 或 HEVC 输入，并只实现 `MuxFormat::MPEGTS`。音频、多视频、FLV 和 fragmented MP4 在 link 或后端边界明确拒绝/留待后续，不伪装为已支持
+- 首份 video Caps 必须有 codec_id、正 width/height 和非空 extradata；后端将 extradata 以 `av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE)` 深拷贝给 `AVCodecParameters`
+- AVStream 先以框架微秒 `{1, 1000000}` 建立 time_base；`avformat_write_header()` 后写 Packet 必须使用 muxer最终确认的 stream time_base 重标定 pts/dts/duration
+- `closeContext()` 必须支持部分初始化，释放顺序为当前 `AVIOContext::buffer`、`avio_context_free()`、`avformat_free_context()`
+- 本轮不新增临时 CONTAINER Sink 或 test_pipeline 测试场景。普通/ASAN 既有回归只证明集成、生命周期和既有 Mux 合同未退化；真实 MPEG-TS 字节的 ffprobe/解码验收等待实际网络 Sink 连接后进行

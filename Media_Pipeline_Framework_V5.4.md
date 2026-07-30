@@ -675,7 +675,7 @@ VIDEO_ENCODED Caps（codec_id / width / height / extradata / nominal framerate�
 
 无法在首个 Packet 前取得 configuration 的 encoder 配置被拒绝，避免为等未来关键帧或 EOS 的 extradata 无界暂存实时 Packet。Encoder 的输入 Caps 重配前先 flush 旧 Packet；EOS 时 flush 全部 delayed Packet，随后由 TransformNode 基类追加唯一 EOS。
 
-当前工程的静态 FFmpeg 构建仍禁用 encoder，故 EncodeNode 已完成编译/单元回归和图组 demo，但 `libx264`/`libx265` 等真实 encoder 的端到端验收必须待项目 FFmpeg 构建启用相应 encoder 后进行。
+x86_64 静态 FFmpeg 已启用 GPL `libx264` / `libx265` encoder wrapper。真实 `/dev/video0` 的 `V4L2CaptureNode → EncodeNode(libx264) → DecodeNode → VideoRenderNode` 回环已成功出画并完成受控 SIGINT 收尾；当前观察到端到端延迟较高，需作为独立问题按采集 PTS、实际 fps、x264 B-frame/lookahead、各节点/Route 滞留和 Render Clock 分段测量，不能先以低延迟参数、队列或渲染补丁掩盖。`libx265` 的真实回环与真实设备 ASAN 端到端验收仍待单独执行。
 
 ### 5.5 DemuxNode
 
@@ -866,7 +866,7 @@ AVMuxNode(std::string name, MuxFormat format)
     : MuxNode(std::move(name), format) {}
 ```
 
-`format_` 是基类中的 `const MuxFormat`，不存在 `setFormat()`，也不向框架使用者暴露 FFmpeg muxer 字符串。枚举到 FFmpeg muxer 名和 fMP4 movflags 的映射属于后续 `AVMuxNode`。
+`format_` 是基类中的 `const MuxFormat`，不存在 `setFormat()`，也不向框架使用者暴露 FFmpeg muxer 字符串。首版 `AVMuxNode` 已映射 `MPEGTS → "mpegts"`；FLV 和 fMP4 的映射与对应后端选项属于后续步骤。
 
 #### 5.6.2 MuxNode 抽象基类（当前正式骨架）
 
@@ -887,7 +887,7 @@ protected:
 
     virtual bool allocateContext(MuxFormat format) = 0;
     virtual bool addStream(const CapsEvent& caps, int* stream_index) = 0;
-    virtual bool writeHeader() = 0;
+    virtual bool writeHeader(MuxFormat format) = 0;
     virtual bool writePacket(const Buffer* buf, int stream_index) = 0;
     virtual bool writeTrailer() = 0;
     virtual void closeContext() = 0;
@@ -906,15 +906,15 @@ private:
 `onReady()` 只分配与输入格式无关的输出 context、确认 Pad 已连接并注册 Route 通知；具体 stream、Header 和输出 CONTAINER Caps 全部在 Running 中由输入 Caps 驱动：
 
 1. 每个输入 Pad 的首份 encoded Caps 到达时，Mux 先校验 codec_id、Pad 能力和当前 Buffer 类型合同，再调用具体后端 `addStream()`，记录 Pad → stream 映射；容器特有字段（例如是否必须有 width/height）由 `addStream()` 判断。
-2. Mux 必须等全部已连接输入都提供首份 Caps，才依次发布 `CONTAINER` Caps、调用 `writeHeader()`、flush Header 字节；此前先到的有效 encoded Buffer 保留在各自 Route 中等待，不越过 Header。
-3. Header 写入后，每个 Buffer 必须已有该 Pad 的 active Caps 且 media_type 匹配；基类按最小 DTS 选择输入，`writePacket()` 成功后 flush 本次容器字节。
+2. Mux 必须等全部已连接输入都提供首份 Caps，才依次发布 `CONTAINER` Caps、调用 `writeHeader(format)`、flush Header 字节；此前先到的有效 encoded Buffer 保留在各自 Route 中等待，不越过 Header。
+3. Header 写入后，Caps/EOS 等控制 Event 先在全部活跃输入中扫描和处理；任一路 EOS 在 Header 前到达都表示初始 Caps 无法齐备，必须报错。否则所有尚未 EOS 的输入都必须各自有一个 Buffer 队首，才由基类在完整候选集中按框架微秒 DTS 选择全局最小项。缺少候选的活跃输入使其他输入可靠背压，不能让当前可见 Packet 越过未知未来 DTS；每个待写 encoded Buffer 因而必须有有效 DTS。具体后端直接写已排序 Packet，不重新建立通用 interleave queue。
 4. Header 建立后的 encoded Caps 再次到达明确报错；当前 Mux 不支持运行期 encoded 格式重配。
 
 Ready 任一步失败只返回 `false`，资源由 `Graph::ready()` 回滚后统一通过 `onStop()` / `closeContext()` 释放，不在失败分支重复 close。
 
 #### 5.6.3 pending 输出与 Header 死锁规避
 
-FFmpeg 自定义 AVIO callback 得到的是临时容器字节，未来 `AVMuxNode` 的 callback 只能调用：
+FFmpeg 自定义 AVIO callback 得到的是临时容器字节，`AVMuxNode` 的 callback 只能调用：
 
 ```cpp
 appendContainerBytes(data, size);
@@ -927,7 +927,7 @@ appendContainerBytes(data, size);
 ```text
 Ready:   allocate output context、注册输入 Route 通知
 Running: 所有输入 initial Caps
-         → CONTAINER Caps → writeHeader() → flush Header bytes
+         → CONTAINER Caps → writeHeader(format) → flush Header bytes
          → 每次 writePacket() 成功后 flush 本次字节
          → 所有有效输入 EOS
          → writeTrailer() → flush trailer bytes → 输出 EOS
@@ -951,137 +951,15 @@ eos_pads_.size() == sink_pads_.size()
 - Pad、Caps、无有效输入、缺少输出连接等框架错误由 `MuxNode` 上报；
 - 抽象基类看到格式钩子失败时只退出或触发 Ready 回滚，不重复发送泛化错误。
 
-#### 5.6.5 AVMuxNode（后续具体实现参考）
+#### 5.6.5 AVMuxNode（首个 MPEG-TS 后端）
 
-`AVMuxNode` 尚未落地。下面示例只展示 FFmpeg 后端怎样实现基类钩子；输入 Caps 收集、固定 `out_0`、pending flush、Trailer 后 EOS 和回滚仍由 `MuxNode` 处理。首个具体实现可以只完成 MPEG-TS，再逐步加入 FLV 和 fMP4。
+`AVMuxNode` 已落地为 `MuxNode` 的首个 FFmpeg 具体后端，当前只接受一条 `VIDEO_ENCODED` H.264 或 HEVC 输入并只实现 `MuxFormat::MPEGTS`。请求音频或第二条视频 SinkPad、或用 `FLV` / `MP4` 构造节点都会在对应边界明确拒绝；FLV 与 fragmented MP4 保留为后续独立步骤。
 
-```cpp
-class AVMuxNode final : public MuxNode {
-public:
-    AVMuxNode(std::string name, MuxFormat format)
-        : MuxNode(std::move(name), format) {}
+`allocateContext(MPEGTS)` 使用 `avformat_alloc_output_context2(..., "mpegts", ...)` 建立输出上下文，分配自定义只写 `AVIOContext` 并设置 `AVFMT_FLAG_CUSTOM_IO`。callback 只通过 `appendContainerBytes()` 深拷贝 FFmpeg 临时字节至基类 `pending_output_`，不直接 publish 框架 Route。`addStream()` 要求完整 video Caps 的 codec_id、正 width/height 和非空 extradata；它将 extradata 以 `av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE)` 深拷贝给 `AVCodecParameters`，先设 `AVStream::time_base = {1, 1000000}`。
 
-private:
-    static int writeCallback(void* opaque, const uint8_t* data, int size) {
-        auto* self = static_cast<AVMuxNode*>(opaque);
-        return self->appendContainerBytes(data, static_cast<size_t>(size))
-             ? size : AVERROR_EXTERNAL;
-    }
+Header、每个 Packet 与 Trailer 后均调用 `avio_flush()` 并检查 `avio_ctx_->error`，使基类随后能在正确的 `CONTAINER Caps → Header / Packet / Trailer bytes → EOS` 边界发布 pending 字节。Packet 由 `av_new_packet()` 分配 FFmpeg 自有、带 padding 的 payload 后从框架 Buffer 深拷贝，恢复 `EncodedMeta::flags`，并以 Header 后 muxer确定的 stream time_base 换算框架微秒 pts/dts/duration。由于 `MuxNode` 已是唯一 DTS 调度 owner，后端调用 `av_write_frame()`，不调用会建立 libavformat 通用重排队列的 `av_interleaved_write_frame()`。
 
-    bool allocateContext(MuxFormat format) override {
-        const char* muxer_name = nullptr;
-        switch (format) {
-            case MuxFormat::MPEGTS: muxer_name = "mpegts"; break;
-            case MuxFormat::FLV:    muxer_name = "flv";    break;
-            case MuxFormat::MP4:    muxer_name = "mp4";    break;
-        }
-
-        int ret = avformat_alloc_output_context2(
-            &fmt_ctx_, nullptr, muxer_name, nullptr);
-        if (ret < 0 || !fmt_ctx_) {
-            postMessage(MessageType::ERROR,
-                        "avformat_alloc_output_context2 failed", ret);
-            return false;
-        }
-
-        uint8_t* avio_buffer = static_cast<uint8_t*>(av_malloc(4096));
-        if (!avio_buffer) {
-            postMessage(MessageType::ERROR, "av_malloc AVIO buffer failed");
-            return false;
-        }
-        avio_ctx_ = avio_alloc_context(
-            avio_buffer, 4096, 1, this,
-            nullptr, &AVMuxNode::writeCallback, nullptr);
-        if (!avio_ctx_) {
-            av_free(avio_buffer);
-            postMessage(MessageType::ERROR, "avio_alloc_context failed");
-            return false;
-        }
-        fmt_ctx_->pb = avio_ctx_;
-        return true;
-    }
-
-    bool addStream(const CapsEvent& caps, int* stream_index) override {
-        AVStream* st = avformat_new_stream(fmt_ctx_, nullptr);
-        if (!st) {
-            postMessage(MessageType::ERROR, "avformat_new_stream failed");
-            return false;
-        }
-
-        st->codecpar->codec_type =
-            caps.media_type == MediaType::VIDEO_ENCODED
-                ? AVMEDIA_TYPE_VIDEO : AVMEDIA_TYPE_AUDIO;
-        st->codecpar->codec_id    = caps.codec_id;
-        st->codecpar->width       = caps.width;
-        st->codecpar->height      = caps.height;
-        st->codecpar->sample_rate = caps.sample_rate;
-        copyExtradata(caps.extradata, st->codecpar);
-        *stream_index = st->index;
-        return true;
-    }
-
-    bool writeHeader() override {
-        AVDictionary* options = nullptr;
-        if (formatIsMP4()) {
-            // MuxFormat::MP4 在本项目中只能输出 fragmented MP4。
-            av_dict_set(&options, "movflags",
-                        "frag_keyframe+empty_moov+default_base_moof", 0);
-        }
-        int ret = avformat_write_header(fmt_ctx_, &options);
-        av_dict_free(&options);
-        if (ret < 0) {
-            postMessage(MessageType::ERROR, "avformat_write_header failed", ret);
-            return false;
-        }
-        return true; // callback 产生的 Header 字节已进入基类 pending_output_
-    }
-
-    bool writePacket(Buffer* buf, int stream_index) override {
-        AVPacket* pkt = toAVPacket(buf); // 深拷贝 payload，时间戳仍为微秒
-        if (!pkt) {
-            postMessage(MessageType::ERROR, "toAVPacket failed");
-            return false;
-        }
-        pkt->stream_index = stream_index;
-        AVStream* st = fmt_ctx_->streams[stream_index];
-        pkt->pts = rescaleUs(buf->pts, st->time_base);
-        pkt->dts = rescaleUs(buf->dts, st->time_base);
-        pkt->duration = rescaleUs(buf->duration, st->time_base);
-
-        int ret = av_interleaved_write_frame(fmt_ctx_, pkt);
-        av_packet_free(&pkt);
-        if (ret < 0) {
-            postMessage(MessageType::ERROR,
-                        "av_interleaved_write_frame failed", ret);
-            return false;
-        }
-        return true; // callback 产生的容器字节由基类随后 flush
-    }
-
-    bool writeTrailer() override {
-        int ret = av_write_trailer(fmt_ctx_);
-        if (ret < 0) {
-            postMessage(MessageType::ERROR, "av_write_trailer failed", ret);
-            return false;
-        }
-        return true;
-    }
-
-    void closeContext() override {
-        if (avio_ctx_) {
-            av_freep(&avio_ctx_->buffer);
-            avio_context_free(&avio_ctx_);
-        }
-        if (fmt_ctx_) avformat_free_context(fmt_ctx_);
-        fmt_ctx_ = nullptr;
-    }
-
-    AVFormatContext* fmt_ctx_ = nullptr;
-    AVIOContext* avio_ctx_ = nullptr;
-};
-```
-
-示例中的 `copyExtradata()`、`toAVPacket()`、`rescaleUs()` 和 `formatIsMP4()` 是待具体实现的小工具，用于突出主流程而省略边界检查。关键约束是：AVIO callback 只调用 `appendContainerBytes()`，不得自行创建框架 Buffer、publish Route 或发送 EOS；`MuxFormat::MP4` 必须配置成 fragmented MP4，传统 MP4 不通过通用 `MuxNode → CONTAINER → Sink` 链路实现。
+`closeContext()` 支持部分初始化：解除 `fmt_ctx_->pb`，释放当前 `avio_ctx_->buffer`、`avio_context_free()`，再 `avformat_free_context()`。当前仓库尚无真实 CONTAINER Sink，因此本节点已完成编译与普通/ASAN 既有回归，但 MPEG-TS 输出字节的 ffprobe/连续解码端到端验收需等网络 Sink 落地后完成。
 
 ---
 
@@ -2072,21 +1950,22 @@ Pipeline::waitEOS
 
 ## 13. 已知问题与后续优化
 
-1. **Route 容量与内存预算**：当前 Route 先按条目数硬限，`VIDEO_RAW=4`、`VIDEO_ENCODED=32`、`AUDIO_RAW=50`、`AUDIO_ENCODED=32`、`CONTAINER=32`。ENCODED 已从旧 tryPush 时代的 128 下调到 32；RAW audio 和 CONTAINER 要等 AudioPlay/Mux 的设备缓冲与实际输出块大小确定后再调。后续增加 payload 字节上限、节点级总内存预算和高低水位监控。
-2. **分叉可靠传输已完成，但端到端零拷贝未完成**：同源分叉已共享只读 BufferRef，Route Entry 只保存一份 payload；FFmpeg AVPacket/AVFrame 与框架 Buffer、以及未来 V4L2/硬件 surface 之间仍会复制。后续需要 DMA-BUF/硬件帧等外部存储模型。
-3. **有损订阅策略暂不支持**：当前所有静态订阅者都可靠。未来实时预览、统计等确需丢帧时，应在 EdgePolicy 中显式表达 `LATEST_ONLY`/drop 策略；Caps、EOS、格式变化等控制事件仍必须可靠。
+1. **Route 容量与内存预算**：当前 Route 先按条目数硬限，`VIDEO_RAW=4`、`VIDEO_ENCODED=32`、`AUDIO_RAW=50`、`AUDIO_ENCODED=32`、`CONTAINER=32`；RAW audio 和 CONTAINER 要等 AudioPlay/Mux 的设备缓冲与实际输出块大小确定后再调，且需与第 3 条的按订阅者丢帧模型一并重新校准。后续增加 payload 字节上限、节点级总内存预算和高低水位监控。
+2. **端到端零拷贝未完成**：FFmpeg AVPacket/AVFrame 与框架 Buffer、以及未来 V4L2/硬件 surface 之间仍会复制。后续需要 DMA-BUF/硬件帧等外部存储模型。
+3. **有损订阅策略暂不支持**：当前所有静态订阅者都可靠，`OutputRoute` 只有 `publishBlocking()`，容量满时无条件阻塞发布者；这个阻塞会沿"节点不再读取输入"逐级传导回最上游的实时采集节点。对 V4L2CaptureNode 这类实时源而言，旧的 VIDEO_RAW 帧通常没有回放价值，阻塞模型会把下游短暂卡顿（Decode/Render 抖动、SDL 慢启动等）转化为 Route 积压，恢复后连续快速吐出积压帧，表现为“卡顿后快进”。真正的丢帧模型不能简单假设“整条 Route 只有一种用途”：同一路 VIDEO_RAW 输出可能同时分叉给本地预览（可接受丢帧）和 EncodeNode（不可接受丢帧或时间戳跳变），中间层不应预设上层只接哪一种下游，因此丢帧粒度需要是按订阅者可声明，而不是整条 Route 一刀切；这决定了它不是给 `OutputRoute` 加一个 `tryPublish()` 就能解决的，需要先重新设计 Subscription 一层的可靠性语义。Route 容量数值（见第 1 条）与本项一并重新校准：当前按“阻塞前能攒多少”选取，丢帧模型落地后应改按“丢帧前能攒多少”的语义重新评估，不宜提前单独调整容量数字。此外，纯视频场景下 `VideoRenderNode::waitForPresentationTime()` 只在首帧用 `Clock::anchorOnce()` 锚定一次且不可覆盖；若 Route 积压导致首帧本身已迟到较多，这个迟到量会被当作播放起点永久保留、不被晚帧策略追回。该问题大概率是丢帧模型落地、旧帧不再堆积后的自然结果，暂不单独设计，随上面的丢帧模型一并重新评估。Caps、EOS、格式变化等控制事件仍必须可靠，不在这次讨论范围内。
 4. **Route 通知回调限制**：当前只在 Mux Ready 阶段注册，用于唤醒多输入调度；若未来需要运行期变更，必须定义通知列表的线程安全边界。
 5. **link/build 错误报告**：核心库当前只返回 bool，不直接 fprintf，也不适合走运行期 MessageBus；详细错误报告机制仍需独立设计。
-6. **Caps 运行期边界的剩余限制**：Decoder 首帧真实格式定案、同一 Route 多份 Caps、VideoRender 尺寸变化、CPU 可访问非 YUV420P swscale 和 AudioPlay 输入重配已支持；尚不支持 PTS discontinuity、Caps generation，以及色彩空间/range/primaries/transfer/HDR 的显式格式协商与严格色彩管理。
-7. **采集具体节点、运行期重配与帧率观测**：`V4L2CaptureNode` 已落地单平面 CPU raw capture：构造期固定 `{VIDEO_RAW}` 输出、Ready 阶段协商格式和 nominal `timeperframe`、非阻塞 poll 可取消等待、mmap DQBUF 深拷贝后及时 QBUF、首帧前 Running Caps、MONOTONIC PTS、可恢复错误帧丢弃后继续。`V4L2_BUF_FLAG_ERROR` 当前只做丢帧继续，尚未提供计数、限频 WARNING 或用户可观测统计；这些可在后续诊断需求明确后补充。AudioCapture 尚未落地；多平面、压缩设备格式、DMA-BUF、设备运行期重配、PTS discontinuity 与 Caps generation 仍待设计。虚拟机 V4L2 设备上曾观察到 `G_PARM` 接受 30 fps、但直接 `v4l2-ctl` 依据 DQBUF timestamp 实测仅约 14–15 fps（不经 Pipeline、swscale 或 SDL），另一次未显式 S_PARM 的外接设备测试约 22 fps；当前只记录为宿主机/VMware/UVC 链路待观察项，待交叉编译至嵌入式目标板和真实 V4L2 设备后复验，不在项目层伪造帧率或以渲染补丁掩盖。
-8. **媒体兼容性与编码验收**：解码 Frame 已优先使用 `best_effort_timestamp`，Decoder 的 `send_packet(EAGAIN)` 已按 drain 后重发同一 Packet 的合同处理，CPU 可访问的非 YUV420P 视频已在 VideoRender 通过 swscale 转为 IYUV；`pkt_timebase` 已设置为框架微秒时间基，完整 channel layout 已以 Caps 的 `ChannelLayout` 值类型传递。EncodeNode 已实现 RAW Caps 驱动 encoder open、输入格式转换、自有 Frame 存储、send/receive EAGAIN、global-header 首 Packet configuration、Caps 重配/EOS flush，但当前项目静态 FFmpeg 仍禁用 encoder，故 `libx264`/`libx265` 的真实 Packet、Decode 回环、ASAN 端到端验收待启用对应 encoder 后完成。Packet side data（例如 DISPLAYMATRIX、HDR/动态 metadata）当前仍在 Packet→Buffer 转换时丢弃，未接入 CapsEvent：目前没有消费端，尤其 VideoRender 没有旋转/HDR 应用路径。若素材来源出现手机直拍等必须按旋转矩阵显示的竖版视频，再单独确定“CapsEvent 的 rotation 字段 + Render 应用”设计；不得预先将所有逐 Packet side data 伪装为流级 Caps。色彩空间/HDR 的显式协商也仍待具体消费端语义确定。
-9. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
-10. **Demux/Mux 边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`，虽 Route 已支持可靠多订阅者输出，但动态 Mux 输出 Pad、最终交织策略、阻塞网络 I/O interrupt callback 和具体 AVMuxNode 仍待实现。
-11. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4；需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
-12. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
-13. **第三方 GUI LeakSanitizer 基线**：当前 Linux/X11 环境的 SDL3 2D software renderer 在 window surface 呈现时会内部尝试 GPU texture framebuffer，加载 Mesa/GLX；即使独立最小程序完整销毁 Texture、Renderer、Window，退出 VIDEO 并调用 `SDL_Quit()`，LeakSanitizer 仍报告 Mesa/GLX 约 1464B/16 allocations。强制直接 X11 framebuffer 可避免 Mesa 报告，但会出现约 33066B/572 allocations 的 X11/XKB 报告。两者均可由独立 SDL 最小程序复现，不属于 Pipeline、Buffer、Route 或节点资源泄漏；不为消除报告而改 renderer/backend。player 的 LeakSanitizer 验证应将该 Mesa/GLX 基线与项目自身泄漏区分，框架单测仍无 suppression 严格运行。
-14. SDL_GetAudioDeviceFormat 查询已打开设备偶发返回空错误失败,而当前它被当硬 ERROR 直接毙掉整个 Ready。将来或可对这个查询加一次重试/容忍,但现在按硬失败处理也说得过去,先不动。
-15. SourceNode 的 active_output_caps_ 私有成员,和 SinkPad/OutputRoute 里已有的 active_caps_/actualType 概念是同一件事在不同层面的第三份实现(Sink 侧、Route 侧、现在 Source 侧各自维护一份"当前生效格式"的状态)。因为 Source 天生没有输入 Route 可以借,只能自己长一份，但如果以后再新增第四个需要类似状态的地方,值得先看看能不能收敛成一个共享的小工具类,而不是继续复制这段"先存副本、发布成功才切换"的逻辑。
+6. **Caps 运行期边界剩余限制**：尚不支持 PTS discontinuity、Caps generation，以及色彩空间/range/primaries/transfer/HDR 的显式格式协商与严格色彩管理。
+7. **采集具体节点、运行期重配与帧率/卡顿观测**：`V4L2_BUF_FLAG_ERROR` 当前只做丢帧继续，尚未提供计数、限频 WARNING 或用户可观测统计；这些可在后续诊断需求明确后补充。AudioCapture 尚未落地；多平面、压缩设备格式、DMA-BUF、设备运行期重配、PTS discontinuity 与 Caps generation 仍待设计。虚拟机 V4L2 设备上曾观察到 `G_PARM` 接受 30 fps、但直接 `v4l2-ctl` 依据 DQBUF timestamp 实测仅约 14–15 fps（不经 Pipeline、swscale 或 SDL），另一次未显式 S_PARM 的外接设备测试约 22 fps；`V4L2CaptureNode → VideoRenderNode` 直接预览（`v4l2_preview`）同样表现出明显卡顿和延迟，怀疑与第 8 条记录的编码回环高延迟属于同一族问题（Route 阻塞背压、`SDL_CreateRenderer("software")` 慢启动等），但尚未做分段探针实测确认，不能先假定根因。当前只记录为宿主机/VMware/UVC 链路待观察项，待交叉编译至嵌入式目标板和真实 V4L2 设备后统一复验，不在项目层伪造帧率或以渲染补丁掩盖。
+8. **编码回环高延迟**：真实 `V4L2CaptureNode → EncodeNode(libx264) → DecodeNode → VideoRenderNode` 回环能稳定出画，但端到端延迟很高，已用分段延迟探针（`PIPELINE_LATENCY_TRACE=1`，默认关闭）定位到两个相互独立、会叠加的原因。其一，`EncodeConfig` 目前只有 `codec_name`/`framerate`，`avcodec_open2()` 不传任何 encoder 私有选项，x264 因而落在默认 `medium` 预设，`rc_lookahead=40`/`bframes=3` 形成约 47 帧、3.2 秒量级的固定内部缓存；实测 `preset=veryfast`+`tune=zerolatency` 可完全消除该缓存，但 EncodeNode 当前没有暴露任何编码器私有参数配置接口，也还没设计好这个接口该长什么样（显式字段还是通用键值对透传）；当前虚拟化环境干扰因素较多，暂不适合专门设计和实现，先记账。其二，`SDL_CreateRenderer("software")` 在当前 VMware/X11/Mesa 环境下经 `strace` 证实稳定耗时约 1.8–2.5 秒（卡在一次 DRI3 fd 传递的 `poll()`），期间 decoded RAW Route 等可靠队列填满并把背压一路传导回采集端，形成第二段与首段量级相当的固定延迟；已确认与 Pipeline 线程模型无关，但尚无目标板/原生 Linux 对照数据，不能把 VMware 数字泛化为框架架构成本，需要真实设备复验后再决定是否调整 VideoRender 的启动/消费策略。两个原因目前都不具备立即修的条件，待真实嵌入式设备或原生 PC 环境测过之后再看效果、再决定优先级。
+9. **媒体兼容性剩余边界**：Packet side data（例如 DISPLAYMATRIX、HDR/动态 metadata）当前仍在 Packet→Buffer 转换时丢弃，未接入 CapsEvent：目前没有消费端，尤其 VideoRender 没有旋转/HDR 应用路径。若素材来源出现手机直拍等必须按旋转矩阵显示的竖版视频，再单独确定“CapsEvent 的 rotation 字段 + Render 应用”设计；不得预先将所有逐 Packet side data 伪装为流级 Caps。色彩空间/HDR 的显式协商也仍待具体消费端语义确定。`libx265` 真实回环与真实设备 ASAN 端到端验收仍待执行。
+10. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
+11. **Demux/Mux 与网络输出边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`。动态 Mux 输出 Pad、音频/多视频交织、FLV、fragmented MP4、阻塞网络 I/O interrupt callback 和具体网络 Sink 仍待实现。HTTPS、TLS、RTMPS 尚未启用：它们需要 TLS 后端；当前 OpenSSL 3 与 GPL x264/x265 组合还需 `--enable-version3`，涉及单独的发布许可证决策，不能在未明确需求时擅自引入。仓库尚无真实 CONTAINER Sink，真实容器字节的 ffprobe/连续解码、FLV/fMP4 与网络端到端验收仍待后续网络 Sink，当前不得将普通/ASAN 回归当作端到端验收。
+12. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4；需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
+13. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
+14. **第三方 GUI LeakSanitizer 基线**：当前 Linux/X11 环境的 SDL3 2D software renderer 在 window surface 呈现时会内部尝试 GPU texture framebuffer，加载 Mesa/GLX；即使独立最小程序完整销毁 Texture、Renderer、Window，退出 VIDEO 并调用 `SDL_Quit()`，LeakSanitizer 仍报告 Mesa/GLX 约 1464B/16 allocations。强制直接 X11 framebuffer 可避免 Mesa 报告，但会出现约 33066B/572 allocations 的 X11/XKB 报告。两者均可由独立 SDL 最小程序复现，不属于 Pipeline、Buffer、Route 或节点资源泄漏；不为消除报告而改 renderer/backend。player 的 LeakSanitizer 验证应将该 Mesa/GLX 基线与项目自身泄漏区分，框架单测仍无 suppression 严格运行。
+15. SDL_GetAudioDeviceFormat 查询已打开设备偶发返回空错误失败,而当前它被当硬 ERROR 直接毙掉整个 Ready。将来或可对这个查询加一次重试/容忍,但现在按硬失败处理也说得过去,先不动。
+16. SourceNode 的 active_output_caps_ 私有成员,和 SinkPad/OutputRoute 里已有的 active_caps_/actualType 概念是同一件事在不同层面的第三份实现(Sink 侧、Route 侧、现在 Source 侧各自维护一份"当前生效格式"的状态)。因为 Source 天生没有输入 Route 可以借,只能自己长一份，但如果以后再新增第四个需要类似状态的地方,值得先看看能不能收敛成一个共享的小工具类,而不是继续复制这段"先存副本、发布成功才切换"的逻辑。
 
 ---
 
@@ -2125,7 +2004,7 @@ media-pipeline/
 ├── demo/
 │   ├── player.cpp                         # 本地播放
 │   ├── v4l2_preview.cpp                   # V4L2Capture → VideoRender 真实预览
-│   ├── v4l2_encode_decode_preview.cpp     # V4L2Capture → Encode → Decode → VideoRender（待 encoder 验收）
+│   ├── v4l2_encode_decode_preview.cpp     # V4L2Capture → Encode → Decode → VideoRender（x264 回环已验收，x265/ASAN 待验收）
 │   ├── recorder.cpp                       # 采集录制
 │   ├── pusher.cpp                         # 推流
 │   └── transcoder.cpp                     # 转码

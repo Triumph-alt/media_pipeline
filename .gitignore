@@ -10,6 +10,7 @@ cmake-build-*/
 # ============================================================
 third_party/ffmpeg/
 third_party/SDL3/
+third_party/encoders/
 
 # ============================================================
 # Communication files (for AI collaboration only)

@@ -7,6 +7,7 @@ set(CORE_SOURCES
     core/Pad.cpp
     core/BaseNode.cpp
     core/Graph.cpp
+    core/LatencyTrace.cpp
     core/Pipeline.cpp
     core/MessageBus.cpp
 )
@@ -14,6 +15,7 @@ set(CORE_SOURCES
 # ---- 节点源码（第三阶段）----
 set(NODE_SOURCES
     nodes/AVDemuxNode.cpp
+    nodes/AVMuxNode.cpp
     nodes/DecodeNode.cpp
     nodes/EncodeNode.cpp
     nodes/V4L2CaptureNode.cpp
@@ -43,12 +45,4 @@ target_link_libraries(pipeline PRIVATE
     ${SDL3_LIBRARIES}
 )
 
-# ---- 系统依赖 ----
-target_link_libraries(pipeline PUBLIC
-    pthread
-    m
-    dl
-    z
-    lzma
-    drm
-)
+# FFmpeg 和 SDL3 的静态传递依赖分别由其安装前缀的 pkg-config 元数据与 FindSDL3.cmake 提供

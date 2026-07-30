@@ -324,9 +324,9 @@ private:
 // 固定单路 CONTAINER 输出 out_0、CapsEvent 收发、容器字节暂存与发送、
 // 多路输入监听、EOS 汇合及向下游传播。
 //
-// appendContainerBytes() 是具体 Mux 后端的输出入口：未来 AVMuxNode 的
-// AVIO callback 将临时字节复制到 pending_output_；基类在 runLoop 中再将
-// pending 字节作为 CONTAINER Buffer 阻塞发送，避免 Ready 阶段无消费者死锁。
+// appendContainerBytes() 是具体 Mux 后端的输出入口：AVMuxNode 的 AVIO callback 将临时
+// 字节复制到 pending_output_；基类在 runLoop 中再将 pending 字节作为 CONTAINER Buffer
+// 阻塞发送，避免 Ready 阶段无消费者死锁。
 //
 // 具体容器封装（AVFormatContext / AVIOContext 等）留在 AVMuxNode 实现
 // ===================================================================
@@ -350,8 +350,8 @@ protected:
     // AVMuxNode 可用 AVStream::index 作为该序号。失败前由具体类上报 ERROR。
     virtual bool addStream(const CapsEvent& caps, int* stream_index) = 0;
 
-    // 写文件头；失败前由具体类上报 ERROR。
-    virtual bool writeHeader() = 0;
+    // 按已冻结的输出格式写文件头；失败前由具体类上报 ERROR。
+    virtual bool writeHeader(MuxFormat format) = 0;
 
     // 写一帧。stream_index 是 addStream() 返回的抽象输出流序号；
     // buf 只读且所有权仍归基类。失败前由具体类上报 ERROR。

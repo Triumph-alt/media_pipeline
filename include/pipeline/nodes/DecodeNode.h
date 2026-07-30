@@ -45,6 +45,8 @@ private:
     bool is_video_ = false;
     // encoded 流的 nominal timing hint，仅用于推导输出视频 Buffer 的 duration。
     AVRational framerate_ = {0, 1};
+    uint64_t input_packets_ = 0;
+    uint64_t output_frames_ = 0;
     bool flushed_ = false;
     std::optional<CapsEvent> output_caps_;
 };

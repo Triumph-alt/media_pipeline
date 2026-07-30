@@ -582,17 +582,23 @@ public:
 
     int streamCount() const { return stream_count_; }
 
+    // 按 writePacket() 实际被调用的顺序记录每个 Buffer 的 dts；测试据此验证 MuxNode
+    // 是否真的按全局最小 DTS 调度，而不是按各输入 Buffer 到达 Route 的先后顺序。
+    // 只在 waitEOS() 之后读取，与 stream_count_ 一样借助 join 建立的 happens-before。
+    const std::vector<int64_t>& writtenDts() const { return written_dts_; }
+
 private:
     bool allocateContext(MuxFormat) override { return true; }
     bool addStream(const CapsEvent&, int* stream_index) override {
         *stream_index = stream_count_++;
         return true;
     }
-    bool writeHeader() override {
+    bool writeHeader(MuxFormat) override {
         const uint8_t header = 0x48;
         return appendContainerBytes(&header, 1);
     }
-    bool writePacket(const Buffer*, int) override {
+    bool writePacket(const Buffer* buf, int) override {
+        written_dts_.push_back(buf->dts);
         const uint8_t packet = 0x50;
         return appendContainerBytes(&packet, 1);
     }
@@ -603,6 +609,46 @@ private:
     void closeContext() override {}
 
     int stream_count_ = 0;
+    std::vector<int64_t> written_dts_;
+};
+
+// DelayedScriptProducer 与 CapsScriptProducer 同构，但在指定脚本下标之前额外阻塞一段
+// 时间。用于人为制造"某一路输入的 Buffer 比另一路晚到 Route"的时序，验证 MuxNode 在
+// Header 建立后是否真的等到每一路都有队首 Buffer 才按全局最小 DTS 选择，而不是让先到
+// 的 Buffer 越过尚未出现的更小 DTS。
+class DelayedScriptProducer final : public BaseNode {
+public:
+    DelayedScriptProducer(const std::string& name, std::vector<QueueItem> script,
+                          size_t delay_before_index, std::chrono::milliseconds delay)
+        : BaseNode(name), script_(std::move(script)),
+          delay_before_index_(delay_before_index), delay_(delay) {
+        addSrcPad("out", TemplateCaps{{MediaType::VIDEO_ENCODED, MediaType::AUDIO_ENCODED}});
+    }
+
+    NodeType nodeType() const override { return NodeType::DEMUX; }
+
+protected:
+    bool onReady() override { return true; }
+    void onStop() override {}
+
+    void runLoop() override final {
+        for (size_t index = 0; index < script_.size(); ++index) {
+            if (index == delay_before_index_) {
+                std::this_thread::sleep_for(delay_);
+            }
+            if (stop_requested_.load() || !publishOutputItem(std::move(script_[index]))) {
+                return;
+            }
+        }
+        if (!stop_requested_.load()) {
+            sendEOSDownstream();
+        }
+    }
+
+private:
+    std::vector<QueueItem> script_;
+    size_t delay_before_index_;
+    std::chrono::milliseconds delay_;
 };
 
 void test_template_caps_compatibility() {
@@ -1382,11 +1428,15 @@ void test_mux_waits_for_all_initial_caps() {
 
     std::vector<QueueItem> video_script;
     video_script.emplace_back(Event{makeEncodedVideoCaps()});
-    video_script.emplace_back(makeBuffer(MediaType::VIDEO_ENCODED, 1));
+    BufferRef video_packet = makeBuffer(MediaType::VIDEO_ENCODED, 1);
+    video_packet.mutableGet()->dts = 0;
+    video_script.emplace_back(std::move(video_packet));
 
     std::vector<QueueItem> audio_script;
     audio_script.emplace_back(Event{makeEncodedAudioCaps()});
-    audio_script.emplace_back(makeBuffer(MediaType::AUDIO_ENCODED, 2));
+    BufferRef audio_packet = makeBuffer(MediaType::AUDIO_ENCODED, 2);
+    audio_packet.mutableGet()->dts = 1000;
+    audio_script.emplace_back(std::move(audio_packet));
 
     Pipeline pipeline;
     auto* video = pipeline.addNode<CapsScriptProducer>("video", std::move(video_script));
@@ -1403,6 +1453,56 @@ void test_mux_waits_for_all_initial_caps() {
     assert(pipeline.lastError().empty());
     assert(mux->streamCount() == 2);
     assert(sink->received() == 4);  // header + video packet + audio packet + trailer
+    printf(" OK\n");
+}
+
+// 验证 MuxNode 在 Header 建立后确实按全局最小 DTS 调度跨输入 Buffer，而不是按 Buffer
+// 到达 Route 的先后顺序。video 输入的 Buffer（dts=2000）在 Caps 之后立即发布；audio
+// 输入的 Buffer（dts=1000）故意延迟发布，使其在到达时间上晚于 video。若 MuxNode 在
+// 某一路暂无候选 Buffer 时就先选择已到达的那一路（本测试要防止的历史 bug），会先写出
+// dts=2000 再写出 dts=1000，产生非法的非单调容器时间戳；正确实现必须等两路都有候选
+// Buffer 后再比较，从而先写出 dts=1000。
+void test_mux_orders_by_global_dts_when_inputs_arrive_out_of_order() {
+    printf("  test_mux_orders_by_global_dts_when_inputs_arrive_out_of_order...");
+    fflush(stdout);
+
+    std::vector<QueueItem> video_script;
+    video_script.emplace_back(Event{makeEncodedVideoCaps()});
+    BufferRef video_packet = makeBuffer(MediaType::VIDEO_ENCODED, 1);
+    video_packet.mutableGet()->dts = 2000;
+    video_script.emplace_back(std::move(video_packet));
+
+    std::vector<QueueItem> audio_script;
+    audio_script.emplace_back(Event{makeEncodedAudioCaps()});
+    BufferRef audio_packet = makeBuffer(MediaType::AUDIO_ENCODED, 2);
+    audio_packet.mutableGet()->dts = 1000;
+    audio_script.emplace_back(std::move(audio_packet));
+
+    Pipeline pipeline;
+    // video 不延迟：Caps 和 dts=2000 的 Buffer 都立即发布。
+    auto* video = pipeline.addNode<CapsScriptProducer>("video", std::move(video_script));
+    // audio 的 Caps（脚本下标 0）立即发布，使两路初始 Caps 都能尽快到齐、Header 尽快建立；
+    // 只延迟脚本下标 1（dts=1000 的 Buffer），确保它在 Route 上出现时，video 的
+    // dts=2000 Buffer 早已在 Header 建立后等在那里。
+    auto* audio = pipeline.addNode<DelayedScriptProducer>(
+        "audio", std::move(audio_script), /*delay_before_index=*/1,
+        std::chrono::milliseconds(50));
+    auto* mux = pipeline.addNode<FakeMux>("mux");
+    auto* sink = pipeline.addNode<ContainerSink>("sink");
+    assert(pipeline.link(video, "out", mux, "video", MediaType::VIDEO_ENCODED));
+    assert(pipeline.link(audio, "out", mux, "audio", MediaType::AUDIO_ENCODED));
+    assert(pipeline.link(mux, "out_0", sink, "in", MediaType::CONTAINER));
+    assert(pipeline.build());
+    assert(pipeline.play());
+    pipeline.waitEOS();
+
+    assert(pipeline.lastError().empty());
+    const std::vector<int64_t>& order = mux->writtenDts();
+    assert(order.size() == 2);
+    // 全局最小 DTS 优先：dts=1000 的 audio Buffer 必须先于 dts=2000 的 video Buffer 写出，
+    // 即使 video 的 Buffer 更早到达 Route。
+    assert(order[0] == 1000);
+    assert(order[1] == 2000);
     printf(" OK\n");
 }
 
@@ -1477,6 +1577,7 @@ int main() {
     test_pipeline_stop_cancels_startup_barrier();
     test_pipeline_forked_backpressure();
     test_mux_waits_for_all_initial_caps();
+    test_mux_orders_by_global_dts_when_inputs_arrive_out_of_order();
     test_pipeline_ready_failure_rolls_back();
 
     printf("\n=== All Tests Passed ===\n");

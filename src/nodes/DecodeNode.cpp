@@ -1,6 +1,7 @@
 #include "pipeline/nodes/DecodeNode.h"
 #include "pipeline/core/Buffer.h"
 #include "pipeline/core/Edge.h"
+#include "pipeline/core/LatencyTrace.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -98,6 +99,8 @@ bool DecodeNode::configureDecoder(const CapsEvent& caps) {
     }
 
     // 打开成功不代表已经知道 RAW 输出格式；只能由真实 AVFrame 定案后再发布。
+    input_packets_ = 0;
+    output_frames_ = 0;
     flushed_ = false;
     fprintf(stderr, "[%s] decoder opened: codec=%d\n", name_.c_str(), caps.codec_id);
     return true;
@@ -180,6 +183,11 @@ bool DecodeNode::appendFrame(AVFrame* frame, std::vector<QueueItem>& outputs) {
         postMessage(MessageType::ERROR, "DecodeNode: Buffer::fromAVFrame failed");
         return false;
     }
+    if (is_video_) {
+        ++output_frames_;
+        traceLatencySample(name_.c_str(), "decode-out", output_frames_,
+                           output->pts, output->dts, input_packets_);
+    }
 
     outputs.emplace_back(std::move(output));
     return true;
@@ -238,6 +246,13 @@ void DecodeNode::process(const Buffer* input, std::vector<QueueItem>& outputs) {
     if (!ctx_) {
         postMessage(MessageType::ERROR, "DecodeNode: input Buffer received without configured decoder");
         return;
+    }
+
+    if (is_video_) {
+        ++input_packets_;
+        traceLatencySample(name_.c_str(), "decode-in", input_packets_,
+                           input ? input->pts : AV_NOPTS_VALUE,
+                           input ? input->dts : AV_NOPTS_VALUE);
     }
 
     AVPacket* packet = toAVPacket(input);
