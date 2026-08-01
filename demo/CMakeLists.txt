@@ -24,3 +24,11 @@ target_link_libraries(v4l2_record_flv PRIVATE pipeline)
 # 有限文件自然 EOS 转码：覆盖 Encode flush、Mux trailer 和 FileSink fsync。
 add_executable(transcode_to_flv transcode_to_flv.cpp)
 target_link_libraries(transcode_to_flv PRIVATE pipeline)
+
+# 实时采集 MPEG-TS/TCP 推流：SIGINT 强制 stop，不承诺 Mux trailer。
+add_executable(v4l2_push_mpegts_tcp v4l2_push_mpegts_tcp.cpp)
+target_link_libraries(v4l2_push_mpegts_tcp PRIVATE pipeline)
+
+# 有限文件自然 EOS：Encode flush、Mux trailer、TcpSink shutdown(SHUT_WR)。
+add_executable(transcode_to_mpegts_tcp transcode_to_mpegts_tcp.cpp)
+target_link_libraries(transcode_to_mpegts_tcp PRIVATE pipeline)

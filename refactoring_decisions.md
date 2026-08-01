@@ -604,3 +604,29 @@ kStagingTotalLimit = 512
 - 既有单测 `test_mux_waits_for_all_initial_caps` 与 `test_mux_orders_by_global_dts_when_inputs_arrive_out_of_order` 继续通过
 - 真实素材 `那天下雨了原版MV.mp4` 经 `transcode_to_flv libx264 30` 自然 EOS 完成；ffprobe 识别 AAC + H.264 1280x720，duration 约 3:10，ffplay 可播放
 - Encode 私参接口本轮不动，继续作为编码回环高延迟后续项；容量合同不依赖 encoder 一定 1～2 帧出首包
+
+---
+
+## TcpSinkNode 与 MPEG-TS/TCP 首闭环
+
+### 决策
+
+- 首个网络 Sink 采用与 `FileSinkNode` 同构的顺序 `CONTAINER` 字节写出模型，不解析容器，不实现 RTMP/RTSP 会话
+- 具体节点名 `TcpSinkNode`；首版只支持主动 Connect，对端 listen（`ffmpeg`/`ffplay` 的 `tcp://host:port?listen`）
+- 首闭环固定容器为 `MuxFormat::MPEGTS`：`Encode/Demux → AVMux(MPEGTS) → TcpSink`
+- 因为 `Pipeline::stop()` 先 join worker 再调 `onStop()`，socket 必须非阻塞；consume 用 `poll(POLLOUT)` 切片观察 `stop_requested_`，禁止阻塞 `send` 卡死 stop
+- 自然 EOS 的 `onDrain()` 只 `shutdown(SHUT_WR)` 让接收端 EOF；实时 Source 的 stop/cancel 不进入 drain，不承诺 Mux Trailer
+- `send` 使用 `MSG_NOSIGNAL`，对端关闭/写失败明确 ERROR，不静默截断已获得的容器字节
+
+### 明确否决
+
+- 把已 mux 的 FLV/TS 字节裸写到 RTMP 端口
+- 为贴文档旧名把 TCP 字节 Sink 叫 `RTSPPushNode`
+- 首闭环引入 RTSP Server、RTMP URL 输出或 TCP Listen 模式
+- 在 Network Sink 内二次解析容器或重建交织
+
+### 验收
+
+- `transcode_to_mpegts_tcp` 自然 EOS：本机 listen 的 ffmpeg 收到可识别 MPEG-TS/H.264 并完整结束
+- `v4l2_push_mpegts_tcp` 实时推流可被 ffplay/ffmpeg 解码；SIGINT 有限时间回收
+- 普通 + ASAN `test_pipeline` 不退化

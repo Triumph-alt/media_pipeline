@@ -675,7 +675,7 @@ VIDEO_ENCODED Caps（codec_id / width / height / extradata / nominal framerate�
 
 无法在首个 Packet 前取得 configuration 的 encoder 配置被拒绝，避免为等未来关键帧或 EOS 的 extradata 无界暂存实时 Packet。Encoder 的输入 Caps 重配前先 flush 旧 Packet；EOS 时 flush 全部 delayed Packet，随后由 TransformNode 基类追加唯一 EOS。
 
-x86_64 静态 FFmpeg 已启用 GPL `libx264` / `libx265` encoder wrapper。真实 `/dev/video0` 的 `V4L2CaptureNode → EncodeNode(libx264) → DecodeNode → VideoRenderNode` 回环已成功出画并完成受控 SIGINT 收尾；当前观察到端到端延迟较高，需作为独立问题按采集 PTS、实际 fps、x264 B-frame/lookahead、各节点/Route 滞留和 Render Clock 分段测量，不能先以低延迟参数、队列或渲染补丁掩盖。`libx265` 的真实回环与真实设备 ASAN 端到端验收仍待单独执行。
+x86_64 静态 FFmpeg 已启用 GPL `libx264` / `libx265` encoder wrapper。真实 `/dev/video0` 的 `V4L2CaptureNode → EncodeNode(libx264|libx265) → DecodeNode → VideoRenderNode` 回环均已成功出画并完成受控 SIGINT 收尾；`libx265` 普通与 ASAN 路径均无项目自身内存错误（ASAN 仅复现既有 Mesa/Gallium LSAN 基线）。当前观察到端到端延迟较高，需作为独立问题按采集 PTS、实际 fps、默认 B-frame/lookahead、各节点/Route 滞留和 Render Clock 分段测量，不能先以低延迟参数、队列或渲染补丁掩盖。
 
 ### 5.5 DemuxNode
 
@@ -935,7 +935,7 @@ Running: 所有输入 initial Caps
          → writeTrailer() → flush trailer bytes → 输出 EOS
 ```
 
-`flushPendingOutput()` 把 pending 字节复制为一个 `MediaType::CONTAINER` Buffer，并向 CONTAINER OutputRoute 可靠 publish 一次；未来多个输出订阅者共享该 Route，不会静默丢弃容器字节。当前 FileSink / RTSPPush 只按顺序消费字节，不读取 CONTAINER Buffer 的 meta；`ContainerMeta` 延后设计。
+`flushPendingOutput()` 把 pending 字节复制为一个 `MediaType::CONTAINER` Buffer，并向 CONTAINER OutputRoute 可靠 publish 一次；未来多个输出订阅者共享该 Route，不会静默丢弃容器字节。当前 FileSink / TcpSink 只按顺序消费字节，不读取 CONTAINER Buffer 的 meta；`ContainerMeta` 延后设计。
 
 #### 5.6.4 EOS 与错误责任
 
@@ -961,13 +961,21 @@ eos_pads_.size() == sink_pads_.size()
 
 Header、每个 Packet 与 Trailer 后均调用 `avio_flush()` 并检查 `avio_ctx_->error`，使基类随后能在正确的 `CONTAINER Caps → Header / Packet / Trailer bytes → EOS` 边界发布 pending 字节。Packet 由 `av_new_packet()` 分配 FFmpeg 自有、带 padding 的 payload 后从框架 Buffer 深拷贝，恢复 `EncodedMeta::flags`。Mux session 以首个有效 DTS 作为时间轴 origin，将框架 absolute monotonic PTS/DTS 归一化为容器相对时间，同时保持 PTS−DTS 重排偏移、duration 和后续间隔，并拒绝 DTS 回退；随后按 Header 后 muxer 确认的 stream time_base 重标定。由于 `MuxNode` 已是唯一 DTS 调度 owner，后端调用 `av_write_frame()`，不调用会建立 libavformat 通用重排队列的 `av_interleaved_write_frame()`。
 
-`closeContext()` 支持部分初始化：解除 `fmt_ctx_->pb`，释放当前 `avio_ctx_->buffer`、`avio_context_free()`，再 `avformat_free_context()`。MPEG-TS 真实文件字节仍待网络 Sink 或后续专门 demo 验收；FLV 已通过 FileSink 两类真实链路验证。
+`closeContext()` 支持部分初始化：解除 `fmt_ctx_->pb`，释放当前 `avio_ctx_->buffer`、`avio_context_free()`，再 `avformat_free_context()`。FLV 已通过 FileSink 两类真实链路验证；MPEG-TS 已通过 `TcpSinkNode` 的自然 EOS 与实时推流路径验收容器字节可被 ffmpeg/ffplay 识别解码。
 
 #### 5.6.6 FileSinkNode 与文件验收边界
 
 `FileSinkNode` 是正式的顺序 `CONTAINER` 文件输出 Sink，不解析或修改容器字节。其构造期 `FileSinkConfig` 固定 path 与 overwrite：默认 `O_EXCL` 拒绝覆盖；显式覆盖时仍以 `O_NOFOLLOW` 拒绝符号链接并拒绝既有非普通文件。Ready 打开并 `fstat()`，consume 对每个 Buffer 处理 partial write 与 EINTR，只有自然 EOS 的 `onDrain()` 才 `fsync()`，Pipeline stop/Ready 回滚统一在 `onStop()` close fd。
 
 实时 V4L2 Source 没有自然 EOS，SIGINT 走 stop/cancel，因此 `V4L2 → Encode → AVMux(FLV) → FileSink` 的中断文件不承诺 Encode EOS flush 或 Mux Trailer；它验证流式 Header/Packet/文件写入和中断回收。有限文件输入链路会自然 EOF，覆盖 Decode/Encode flush、Mux Trailer、FileSink fsync 和 Sink EOS。当前实测实时中断 FLV 与自然 EOS FLV 均被 ffprobe 识别为 H.264 640×480、约 11.833 秒且可被 ffmpeg 完整解码；自然 EOS 转码输入/输出均为 168 帧/168 Packet，无尾帧截断。
+
+#### 5.6.7 TcpSinkNode 与 MPEG-TS/TCP 推流边界
+
+`TcpSinkNode` 是与 `FileSinkNode` 同构的正式顺序 `CONTAINER` 网络 Sink：只可靠写出上游容器字节，不解析 MPEG-TS/FLV，也不实现 RTMP/RTSP 会话。构造期 `TcpSinkConfig` 固定 `host`/`port`、建连超时与 I/O poll 切片；首版只支持主动 Connect，对端需先 listen（例如 `ffmpeg -i tcp://127.0.0.1:PORT?listen`）。
+
+Ready 完成非阻塞 TCP 建连；consume 在 `poll(POLLOUT)` 可写后 `send(MSG_NOSIGNAL)`，处理 partial send、`EINTR`/`EAGAIN` 与对端关闭；自然 EOS 的 `onDrain()` 执行 `shutdown(SHUT_WR)` 让接收端读到 EOF，不做 fsync。`onStop()` 统一 close socket，覆盖 Ready 回滚、错误与 stop。因为 `Pipeline::stop()` 在 join worker 之后才调用 `onStop()`，socket 必须保持非阻塞并由 consume 周期观察 `stop_requested_`，禁止阻塞式 `send` 卡死 stop。
+
+首版推流闭环固定为 `Encode → AVMux(MPEGTS) → TcpSink`。实时 `v4l2_push_mpegts_tcp` 与有限输入 `transcode_to_mpegts_tcp` 覆盖中断回收和自然 EOS/Trailer；RTMP、RTSP Server/客户端与 Listen 模式仍属后续独立方案，不把 CONTAINER 字节伪装成 RTMP chunk 或 RTP 包。
 
 ---
 
@@ -1966,9 +1974,9 @@ Pipeline::waitEOS
 6. **Caps 运行期边界剩余限制**：尚不支持 PTS discontinuity、Caps generation，以及色彩空间/range/primaries/transfer/HDR 的显式格式协商与严格色彩管理。
 7. **采集具体节点、运行期重配与帧率/卡顿观测**：`V4L2_BUF_FLAG_ERROR` 当前只做丢帧继续，尚未提供计数、限频 WARNING 或用户可观测统计；这些可在后续诊断需求明确后补充。AudioCapture 尚未落地；多平面、压缩设备格式、DMA-BUF、设备运行期重配、PTS discontinuity 与 Caps generation 仍待设计。虚拟机 V4L2 设备上曾观察到 `G_PARM` 接受 30 fps、但直接 `v4l2-ctl` 依据 DQBUF timestamp 实测仅约 14–15 fps（不经 Pipeline、swscale 或 SDL），另一次未显式 S_PARM 的外接设备测试约 22 fps；`V4L2CaptureNode → VideoRenderNode` 直接预览（`v4l2_preview`）同样表现出明显卡顿和延迟，怀疑与第 8 条记录的编码回环高延迟属于同一族问题（Route 阻塞背压、`SDL_CreateRenderer("software")` 慢启动等），但尚未做分段探针实测确认，不能先假定根因。当前只记录为宿主机/VMware/UVC 链路待观察项，待交叉编译至嵌入式目标板和真实 V4L2 设备后统一复验，不在项目层伪造帧率或以渲染补丁掩盖。
 8. **编码回环高延迟**：真实 `V4L2CaptureNode → EncodeNode(libx264) → DecodeNode → VideoRenderNode` 回环能稳定出画，但端到端延迟很高，已用分段延迟探针（`PIPELINE_LATENCY_TRACE=1`，默认关闭）定位到两个相互独立、会叠加的原因。其一，`EncodeConfig` 目前只有 `codec_name`/`framerate`，`avcodec_open2()` 不传任何 encoder 私有选项，x264 因而落在默认 `medium` 预设，`rc_lookahead=40`/`bframes=3` 形成约 47 帧、3.2 秒量级的固定内部缓存；实测 `preset=veryfast`+`tune=zerolatency` 可完全消除该缓存，但 EncodeNode 当前没有暴露任何编码器私有参数配置接口，也还没设计好这个接口该长什么样（显式字段还是通用键值对透传）；当前虚拟化环境干扰因素较多，暂不适合专门设计和实现，先记账。其二，`SDL_CreateRenderer("software")` 在当前 VMware/X11/Mesa 环境下经 `strace` 证实稳定耗时约 1.8–2.5 秒（卡在一次 DRI3 fd 传递的 `poll()`），期间 decoded RAW Route 等可靠队列填满并把背压一路传导回采集端，形成第二段与首段量级相当的固定延迟；已确认与 Pipeline 线程模型无关，但尚无目标板/原生 Linux 对照数据，不能把 VMware 数字泛化为框架架构成本，需要真实设备复验后再决定是否调整 VideoRender 的启动/消费策略。两个原因目前都不具备立即修的条件，待真实嵌入式设备或原生 PC 环境测过之后再看效果、再决定优先级。
-9. **媒体兼容性剩余边界**：Packet side data（例如 DISPLAYMATRIX、HDR/动态 metadata）当前仍在 Packet→Buffer 转换时丢弃，未接入 CapsEvent：目前没有消费端，尤其 VideoRender 没有旋转/HDR 应用路径。若素材来源出现手机直拍等必须按旋转矩阵显示的竖版视频，再单独确定“CapsEvent 的 rotation 字段 + Render 应用”设计；不得预先将所有逐 Packet side data 伪装为流级 Caps。色彩空间/HDR 的显式协商也仍待具体消费端语义确定。`libx265` 真实回环与真实设备 ASAN 端到端验收仍待执行。
+9. **媒体兼容性剩余边界**：Packet side data（例如 DISPLAYMATRIX、HDR/动态 metadata）当前仍在 Packet→Buffer 转换时丢弃，未接入 CapsEvent：目前没有消费端，尤其 VideoRender 没有旋转/HDR 应用路径。若素材来源出现手机直拍等必须按旋转矩阵显示的竖版视频，再单独确定“CapsEvent 的 rotation 字段 + Render 应用”设计；不得预先将所有逐 Packet side data 伪装为流级 Caps。色彩空间/HDR 的显式协商也仍待具体消费端语义确定。`libx265` 真实设备回环与 ASAN 端到端验收已完成（见桌面 `EncodeNode_x265_ASAN真实验收记录.md`）。
 10. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
-11. **Demux/Mux 与网络输出边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`。动态 Mux 输出 Pad、多视频交织、fragmented MP4、阻塞网络 I/O interrupt callback 和具体网络 Sink 仍待实现。HTTPS、TLS、RTMPS 尚未启用：它们需要 TLS 后端；当前 OpenSSL 3 与 GPL x264/x265 组合还需 `--enable-version3`，涉及单独的发布许可证决策，不能在未明确需求时擅自引入。MPEG-TS 真实文件字节和网络端到端仍待后续验收，不能用 FLV 路径替代其它容器/网络合同。
+11. **Demux/Mux 与网络输出边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`。动态 Mux 输出 Pad、多视频交织、fragmented MP4 仍待实现。顺序 `CONTAINER` 网络输出已落地 `TcpSinkNode`（MPEG-TS/TCP Connect 首闭环）；RTMP、RTSP Server/客户端、TCP Listen 模式和 FFmpeg URL 输出 interrupt callback 仍待独立方案。HTTPS、TLS、RTMPS 尚未启用：它们需要 TLS 后端；当前 OpenSSL 3 与 GPL x264/x265 组合还需 `--enable-version3`，涉及单独的发布许可证决策，不能在未明确需求时擅自引入。不能用 FLV 文件路径替代 RTMP 会话合同，也不能把 CONTAINER 字节伪装成 RTP 包。
 12. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4；需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
 13. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
 14. **第三方 GUI LeakSanitizer 基线**：当前 Linux/X11 环境的 SDL3 2D software renderer 在 window surface 呈现时会内部尝试 GPU texture framebuffer，加载 Mesa/GLX；即使独立最小程序完整销毁 Texture、Renderer、Window，退出 VIDEO 并调用 `SDL_Quit()`，LeakSanitizer 仍报告 Mesa/GLX 约 1464B/16 allocations。强制直接 X11 framebuffer 可避免 Mesa 报告，但会出现约 33066B/572 allocations 的 X11/XKB 报告。两者均可由独立 SDL 最小程序复现，不属于 Pipeline、Buffer、Route 或节点资源泄漏；不为消除报告而改 renderer/backend。player 的 LeakSanitizer 验证应将该 Mesa/GLX 基线与项目自身泄漏区分，框架单测仍无 suppression 严格运行。
@@ -2005,14 +2013,19 @@ media-pipeline/
 │       ├── VideoRenderNode.h    # SDL3 视频渲染
 │       ├── AudioPlayNode.h      # SDL3 音频播放
 │       ├── FileSinkNode.h       # 本地文件写入
-│       └── RTSPPushNode.h       # RTSP/RTMP 推流
+│       ├── TcpSinkNode.h        # CONTAINER TCP 推流（MPEG-TS/TCP 首闭环）
+│       └── RTSPPushNode.h       # RTSP/RTMP 推流（后续）
 ├── src/
 │   ├── core/
 │   └── nodes/
 ├── demo/
 │   ├── player.cpp                         # 本地播放
 │   ├── v4l2_preview.cpp                   # V4L2Capture → VideoRender 真实预览
-│   ├── v4l2_encode_decode_preview.cpp     # V4L2Capture → Encode → Decode → VideoRender（x264 回环已验收，x265/ASAN 待验收）
+│   ├── v4l2_encode_decode_preview.cpp     # V4L2Capture → Encode → Decode → VideoRender（x264/x265 回环与 ASAN 已验收）
+│   ├── v4l2_record_flv.cpp                # V4L2 → Encode → FLV → FileSink
+│   ├── transcode_to_flv.cpp               # 文件转码 FLV 自然 EOS
+│   ├── v4l2_push_mpegts_tcp.cpp           # V4L2 → Encode → MPEG-TS → TcpSink
+│   ├── transcode_to_mpegts_tcp.cpp        # 文件转码 MPEG-TS/TCP 自然 EOS
 │   ├── recorder.cpp                       # 采集录制
 │   ├── pusher.cpp                         # 推流
 │   └── transcoder.cpp                     # 转码

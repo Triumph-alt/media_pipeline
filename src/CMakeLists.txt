@@ -19,6 +19,7 @@ set(NODE_SOURCES
     nodes/DecodeNode.cpp
     nodes/EncodeNode.cpp
     nodes/FileSinkNode.cpp
+    nodes/TcpSinkNode.cpp
     nodes/V4L2CaptureNode.cpp
     nodes/VideoRenderNode.cpp
     nodes/AudioPlayNode.cpp
