@@ -18,6 +18,7 @@ set(NODE_SOURCES
     nodes/AVMuxNode.cpp
     nodes/DecodeNode.cpp
     nodes/EncodeNode.cpp
+    nodes/FileSinkNode.cpp
     nodes/V4L2CaptureNode.cpp
     nodes/VideoRenderNode.cpp
     nodes/AudioPlayNode.cpp

@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -324,6 +325,10 @@ private:
 // 固定单路 CONTAINER 输出 out_0、CapsEvent 收发、容器字节暂存与发送、
 // 多路输入监听、EOS 汇合及向下游传播。
 //
+// 等齐期（Header 前等齐 initial Caps、Header 后等齐 DTS 候选）的 encoded Buffer
+// 由 Mux 每路有界 staging 持有，而不是长期占用上游 Route。pull 阶段只使用
+// tryAcquire，并在 ack 离开 Route 之前完成 Buffer 合同校验。
+//
 // appendContainerBytes() 是具体 Mux 后端的输出入口：AVMuxNode 的 AVIO callback 将临时
 // 字节复制到 pending_output_；基类在 runLoop 中再将 pending 字节作为 CONTAINER Buffer
 // 阻塞发送，避免 Ready 阶段无消费者死锁。
@@ -371,25 +376,61 @@ protected:
     void runLoop() override final;
     void onStop() override final;
 
+    // 具体后端根据不可变输出格式和当前已创建输入 Pad 决定是否接受新输入
+    // 默认接受 MuxNode 声明的 encoded MediaType；具体 AVMuxNode 可按容器收紧
+    virtual bool acceptsInputPad(MuxFormat format, MediaType hint_type) const {
+        return hint_type == MediaType::VIDEO_ENCODED ||
+               hint_type == MediaType::AUDIO_ENCODED;
+    }
+
     // 动态创建 SinkPad：只接受 VIDEO_ENCODED / AUDIO_ENCODED
     SinkPad* requestSinkPad(const std::string& name, MediaType hint_type) override;
 
 private:
+    // 每路等齐期暂存：只持有已通过合同校验的 Buffer；Caps/EOS 不进入该队列
+    struct InputStaging {
+        std::deque<BufferRef> packets;  // 只放已校验 Buffer
+        bool initial_caps_done = false; // 该路是否已建流
+        bool eos_done = false;          // 该路 EOS 是否已 ack
+    };
+
+    // 单路与全节点 packet 条目硬顶
+    // 按默认 libx264 quality 迟滞估算，不按 zerolatency：
+    //   N ≈ (47 帧 / 30 fps) × (44100/1024 AAC 包率) ≈ 68
+    //   单路 256 ≈ 名义需求约 3.8 倍余量；总顶 512 = 2× 单路
+    // 完整算式与否决项见 refactoring_decisions.md
+    // 「Mux 等齐期有界 staging 与多路 FLV 死锁修复 / 容量估算」
+    static constexpr size_t kStagingPerPadLimit = 256;
+    static constexpr size_t kStagingTotalLimit = 512;
+
     // 将 pending 字节作为一个 CONTAINER Buffer 阻塞发送到固定 out_0。
     bool flushPendingOutput();
     bool configureInitialInput(const std::string& pad_name, const CapsEvent& caps);
-    bool writeHeaderAfterAllInputsConfigured();
+    bool tryEmitHeader();
+    bool tryEmitPacket();
+    bool tryEmitTrailer();
 
-    // 多路复用辅助
-    SinkPad* waitAnyPadReady();
-    SinkPad* selectMinDtsPad();
+    // pull 只使用 tryAcquire，禁止在多路扫描中 acquireBlocking
+    // 返回值：是否从任一输入实际取得并处理了项目；失败时已 post ERROR
+    bool pullInputsOnce(bool* progressed, bool* fatal);
+
+    // Buffer 合同校验必须在 ack 之前完成；失败返回 false 且不 ack、不进 staging
+    bool validateBufferForStaging(const std::string& pad_name, const Buffer* buffer);
+
+    size_t stagingTotalSize() const;
+    bool stagingIsFull(const InputStaging& staging) const;
+    bool canEmitPacket() const;
+    bool allInputsEosAndDrained() const;
+    bool stagingBlockedWithoutProgress() const;
+    void clearStaging();
+    void waitForProgress();
 
     // pad_name -> 具体后端返回的抽象输出流序号，基类不解释该整数
     std::unordered_map<std::string, int> pad_to_stream_;
-    std::unordered_set<std::string> initial_caps_pads_;
 
-    // 已收到 EOS 的输入 Pad。Mux 在每路初始 Caps 后才允许处理其 EOS。
-    std::unordered_set<std::string> eos_pads_;
+    // 每路本地 staging，key 与 SinkPad 名称一致
+    std::unordered_map<std::string, InputStaging> staging_;
+
     bool header_written_ = false;
 
     // 格式钩子产生、尚未发给下游的容器字节。

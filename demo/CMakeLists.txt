@@ -16,3 +16,11 @@ target_link_libraries(v4l2_preview PRIVATE pipeline)
 # 第四/五阶段节点闭环：采集 RAW → 编码 → 解码回 RAW → 本地渲染。
 add_executable(v4l2_encode_decode_preview v4l2_encode_decode_preview.cpp)
 target_link_libraries(v4l2_encode_decode_preview PRIVATE pipeline)
+
+# 实时采集流式录制：SIGINT 使用强制 stop，不承诺生成 Mux trailer。
+add_executable(v4l2_record_flv v4l2_record_flv.cpp)
+target_link_libraries(v4l2_record_flv PRIVATE pipeline)
+
+# 有限文件自然 EOS 转码：覆盖 Encode flush、Mux trailer 和 FileSink fsync。
+add_executable(transcode_to_flv transcode_to_flv.cpp)
+target_link_libraries(transcode_to_flv PRIVATE pipeline)

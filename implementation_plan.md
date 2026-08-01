@@ -263,7 +263,8 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 | 节点 | 关键内容 |
 |---|---|
 | EncodeNode | 接收有序 VIDEO_RAW Caps，按 encoder 所需 pix_fmt/尺寸建立或重建 swscale 与 AVCodecContext；处理 send_frame/receive_packet、延迟 Packet flush；在首个 encoded Packet 前发布完整 VIDEO_ENCODED Caps（codec、尺寸、extradata 等） |
-| MuxNode / AVMuxNode | 已完成首个 FFmpeg MPEG-TS 后端：单视频 H.264/HEVC Caps 建流、custom AVIO 字节暂存、Header/Packet/Trailer、`av_write_frame()`、AVPacket 自有 payload、flags/PTS/DTS 传递；MuxNode 已收紧为所有未 EOS 输入均有队首后才按全局 DTS 写入。FLV、fragmented MP4、音频与真实 Container 网络输出仍待后续实现和验收 |
+| MuxNode / AVMuxNode | 已完成 MPEG-TS 与 FLV 后端：MPEG-TS 支持 H.264/HEVC，FLV 支持 H.264 视频 + AAC 音频旁路复用；custom AVIO、Header/Packet/Trailer、`av_write_frame()`、Packet 自有 payload、flags 和 session-relative PTS/DTS 均已落地。`MuxNode` 以每路有界 staging + eager pull 持有等齐 Header/DTS 候选期的 encoded Buffer，在完整候选集上按全局最小 DTS 写入。fragmented MP4 与多视频仍待后续 |
+| FileSinkNode | 已完成正式 CONTAINER 顺序文件 Sink：默认拒绝覆盖、显式安全覆盖、完整 partial write/EINTR、自然 EOS fsync、stop/回滚统一关闭；已用于 FLV 实时中断、单视频自然 EOS 与多路 H.264+AAC 自然 EOS 验收 |
 | RTSPPushNode / 网络 Sink | 建立可取消的输出 I/O，处理阻塞写入、网络失败与 stop；本阶段至少打通一种实际启用的流式协议和容器组合（例如 FLV/RTMP 或 MPEG-TS/TCP） |
 | 推流 Demo | `V4L2CaptureNode → EncodeNode → AVMuxNode → 网络 Sink`；可按 Route 分叉扩展到预览，但分叉不是首个闭环的必要条件 |
 | 兼容性 | x86_64 静态 FFmpeg 已启用 `libx264` / `libx265`，并实际包含 FLV、MPEG-TS、MP4 muxer，RTMP/TCP/UDP/RTP/HTTP protocol 与 RTSP output muxer；`FLV/RTMP`、`MPEG-TS/TCP`、`RTSP/RTP` 明文路径不需因组件缺失重编。HTTPS/TLS/RTMPS 需独立选择 TLS 后端和许可证边界，当前不启用。后续不得将音频编码、传统 MP4 seek-back 输出或运行期 Header 重配混入首个网络 Sink 闭环 |
@@ -271,7 +272,7 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 ### 验收标准
 
 - [ ] EncodeNode 对第四阶段协商出的固定 RAW 视频格式稳定输出 H.264 或 H.265；输出 Packet 可由 ffprobe/ffmpeg 解码，PTS/DTS 合法，EOS 后延迟 Packet 完整输出
-- [ ] AVMuxNode 已完成单视频 MPEG-TS 后端的编译与普通/ASAN 回归：初始 Caps 汇合后写 Header、custom AVIO Container 输出、框架侧全局 DTS 调度、Packet flags/时间戳传递和 Trailer→EOS 顺序均已落地；尚无实际 CONTAINER Sink，因此 ffprobe 连续解码、FLV/fMP4 和网络端到端验收待网络 Sink 实现后进行
+- [ ] AVMuxNode 已完成 MPEG-TS 与 H.264 FLV 后端；FLV 已由正式 FileSink 实测：V4L2 中断流文件、单视频自然 EOS、以及 H.264 重编码 + AAC 旁路多路自然 EOS（真实约 3:10 素材，ffprobe 双轨可识别、ffplay 可播放）均已通过，并完成 Mux 等齐期 staging 死锁修复。MPEG-TS 真实字节、fragmented MP4 与网络端到端仍待后续验收
 - [ ] 网络 Sink 在本地可控接收端完成端到端推流；断连、写失败和外部 stop 可在有限时间内取消并完整回收线程与资源
 - [ ] `V4L2CaptureNode → EncodeNode → AVMuxNode → 网络 Sink` 连续运行时，框架不静默丢弃已获得的 encoded Packet，Route 不发生无界积压；必要时以预览分叉验证最慢可靠订阅者背压
 - [ ] 单测、端到端推流与 ASAN 验证通过；第三方协议库/驱动泄漏与项目自身问题分开报告
@@ -282,6 +283,6 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 ## 第六阶段及后续
 
 - AudioCapture、音频编码、音视频采集同步与音视频复用；
-- FileSink 与传统 MP4 专用文件输出；
+- 传统 MP4 专用 seek-back 文件输出；通用顺序 FileSinkNode 已完成；
 - 采集设备的运行期重配、PTS discontinuity、Caps generation；
 - DMA-BUF / 硬件帧零拷贝、硬件编解码、动态插件与多 Pipeline 模型。

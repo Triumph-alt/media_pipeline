@@ -3,6 +3,8 @@
 #include "pipeline/core/Pipeline.h"
 
 #include <algorithm>
+#include <deque>
+#include <limits>
 #include <utility>
 
 namespace pipeline {
@@ -701,10 +703,16 @@ void DemuxNode::onStop() {
 
 // ===================================================================
 // MuxNode: 格式无关的共享骨架
+//
+// 调度模型：
+//   pullPhase: 用 tryAcquire 把各输入 Route 上的控制事件和已配置 Buffer
+//              拉进本地有界 staging，并在 ack 前完成 Buffer 合同校验
+//   emitPhase: 在合同允许时写 Header / 按全局最小 DTS 写 packet / 写 Trailer
+//   wait:      仅当本轮 pull 与 emit 都无进展时等待 Route notify 或 stop
 // ===================================================================
 
 SinkPad* MuxNode::requestSinkPad(const std::string& name, MediaType hint_type) {
-    if (hint_type != MediaType::VIDEO_ENCODED && hint_type != MediaType::AUDIO_ENCODED) {
+    if (!acceptsInputPad(format_, hint_type)) {
         return nullptr;
     }
     return addSinkPad(name, TemplateCaps{{hint_type}});
@@ -735,16 +743,161 @@ bool MuxNode::flushPendingOutput() {
     std::copy(pending_output_.begin(), pending_output_.end(), output->data);
     pending_output_.clear();
 
-    // Header、packet、trailer 都经同一个 BufferRef 发布边界；失败时 output_ref 自动释放。
+    // Header、packet、trailer 都经同一个 BufferRef 发布边界；失败时 output_ref 自动释放
     BufferRef output_ref(output);
     return pushToDownstream(std::move(output_ref), "out_0");
+}
+
+void MuxNode::clearStaging() {
+    for (auto& [pad_name, staging] : staging_) {
+        (void)pad_name;
+        staging.packets.clear();
+        staging.initial_caps_done = false;
+        staging.eos_done = false;
+    }
+}
+
+size_t MuxNode::stagingTotalSize() const {
+    size_t total = 0;
+    for (const auto& [pad_name, staging] : staging_) {
+        (void)pad_name;
+        total += staging.packets.size();
+    }
+    return total;
+}
+
+bool MuxNode::stagingIsFull(const InputStaging& staging) const {
+    return staging.packets.size() >= kStagingPerPadLimit ||
+           stagingTotalSize() >= kStagingTotalLimit;
+}
+
+bool MuxNode::canEmitPacket() const {
+    if (!header_written_) {
+        return false;
+    }
+
+    bool has_active = false;
+    for (const auto& pad : sink_pads_) {
+        if (!pad->isConnected()) {
+            continue;
+        }
+        const auto it = staging_.find(pad->name());
+        if (it == staging_.end()) {
+            return false;
+        }
+        // 已 EOS 且本地队列已空的路不再参与候选
+        if (it->second.eos_done && it->second.packets.empty()) {
+            continue;
+        }
+        has_active = true;
+        // 任一仍活跃的路缺少队首，就不能越过其未知未来 DTS
+        if (it->second.packets.empty()) {
+            return false;
+        }
+    }
+    return has_active;
+}
+
+bool MuxNode::allInputsEosAndDrained() const {
+    if (sink_pads_.empty()) {
+        return false;
+    }
+    for (const auto& pad : sink_pads_) {
+        if (!pad->isConnected()) {
+            return false;
+        }
+        const auto it = staging_.find(pad->name());
+        if (it == staging_.end() || !it->second.eos_done || !it->second.packets.empty()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool MuxNode::stagingBlockedWithoutProgress() const {
+    // 任一仍需数据的活跃路 staging 已满，且当前既不能写 Header 也不能写 packet
+    if (header_written_ && canEmitPacket()) {
+        return false;
+    }
+    if (!header_written_) {
+        size_t configured = 0;
+        for (const auto& [pad_name, staging] : staging_) {
+            (void)pad_name;
+            if (staging.initial_caps_done) {
+                ++configured;
+            }
+        }
+        if (configured == sink_pads_.size() && !sink_pads_.empty()) {
+            // Caps 已齐，应由 tryEmitHeader 前进，不算 blocked
+            return false;
+        }
+    }
+
+    for (const auto& pad : sink_pads_) {
+        if (!pad->isConnected()) {
+            continue;
+        }
+        const auto it = staging_.find(pad->name());
+        if (it == staging_.end()) {
+            continue;
+        }
+        const InputStaging& staging = it->second;
+        if (staging.eos_done && staging.packets.empty()) {
+            continue;
+        }
+        if (stagingIsFull(staging)) {
+            // 该路已满，且我们仍在等 Header 或其他活跃路的数据
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MuxNode::validateBufferForStaging(const std::string& pad_name, const Buffer* buffer) {
+    // 必须在 ack 之前调用：失败时不 ack，Delivery 析构放弃 in-flight，runLoop 随后 ERROR 退出
+    if (!buffer) {
+        postMessage(MessageType::ERROR,
+                    "MuxNode: null Buffer on pad '" + pad_name + "'");
+        return false;
+    }
+
+    const auto staging_it = staging_.find(pad_name);
+    if (staging_it == staging_.end() || !staging_it->second.initial_caps_done) {
+        postMessage(MessageType::ERROR,
+                    "MuxNode: Buffer received before initial CapsEvent on pad '" + pad_name + "'");
+        return false;
+    }
+
+    const auto active = active_caps_.find(pad_name);
+    if (active == active_caps_.end()) {
+        postMessage(MessageType::ERROR,
+                    "MuxNode: Buffer received without active CapsEvent on pad '" + pad_name + "'");
+        return false;
+    }
+    if (buffer->media_type != active->second.media_type) {
+        postMessage(MessageType::ERROR,
+                    "MuxNode: Buffer media type does not match active CapsEvent on pad '" +
+                        pad_name + "'");
+        return false;
+    }
+    if (buffer->dts == AV_NOPTS_VALUE) {
+        // 跨输入排序要求可比较 DTS；在进 staging 前拒绝，避免 ack 后才发现非法
+        postMessage(MessageType::ERROR,
+                    "MuxNode: encoded Buffer requires a valid DTS for framework interleaving");
+        return false;
+    }
+    if (pad_to_stream_.find(pad_name) == pad_to_stream_.end()) {
+        postMessage(MessageType::ERROR,
+                    "MuxNode: no backend stream mapping for pad '" + pad_name + "'");
+        return false;
+    }
+    return true;
 }
 
 bool MuxNode::onReady() {
     pending_output_.clear();
     pad_to_stream_.clear();
-    initial_caps_pads_.clear();
-    eos_pads_.clear();
+    staging_.clear();
     header_written_ = false;
 
     if (sink_pads_.empty()) {
@@ -757,7 +910,9 @@ bool MuxNode::onReady() {
                         "MuxNode: sink pad '" + pad->name() + "' is not connected");
             return false;
         }
-        // 任意一路 Route 新数据或 cancel 都唤醒 Mux 选择循环。
+        // 为每路建立空 staging 槽位
+        staging_.emplace(pad->name(), InputStaging{});
+        // 任意一路 Route 新数据或 cancel 都唤醒 Mux pull/emit 循环
         pad->setRouteNotify([this]() {
             std::lock_guard<std::mutex> lock(mux_mutex_);
             mux_cv_.notify_one();
@@ -770,21 +925,25 @@ bool MuxNode::onReady() {
         return false;
     }
 
-    // Context 不依赖输入流格式，可在 Ready 建立；stream/header 留到 Running 的完整 Caps 到达后。
+    // Context 不依赖输入流格式，可在 Ready 建立；stream/header 留到 Running 的完整 Caps 到达后
     return allocateContext(format_);
 }
 
 bool MuxNode::configureInitialInput(const std::string& pad_name, const CapsEvent& caps) {
-    // Container headers must name every input stream before any packet bytes are written. This function
-    // consumes exactly one initial encoded Caps per linked Pad, creates the backend stream, and records the
-    // Pad → backend stream index mapping. A later Caps on that Pad is explicitly rejected by the caller.
-    // Mux 只要求能建流的 codec_id；容器特有字段(如尺寸)由具体后端 addStream 自行校验。
+    // 每个已连接输入只接受一次 initial Caps；后续 Caps 由 pull 路径拒绝
+    // Mux 只要求能建流的 codec_id；容器特有字段(如尺寸)由具体后端 addStream 自行校验
     SinkPad* pad = getSinkPad(pad_name);
     if (!pad || caps.codec_id == AV_CODEC_ID_NONE || !pad->templateCaps().contains(caps.media_type)) {
         postMessage(MessageType::ERROR, "MuxNode: invalid initial CapsEvent on pad '" + pad_name + "'");
         return false;
     }
-    if (initial_caps_pads_.count(pad_name)) {
+
+    auto staging_it = staging_.find(pad_name);
+    if (staging_it == staging_.end()) {
+        postMessage(MessageType::ERROR, "MuxNode: missing staging for pad '" + pad_name + "'");
+        return false;
+    }
+    if (staging_it->second.initial_caps_done) {
         postMessage(MessageType::ERROR,
                     "MuxNode: runtime encoded Caps changes are not supported after header setup");
         return false;
@@ -799,13 +958,24 @@ bool MuxNode::configureInitialInput(const std::string& pad_name, const CapsEvent
         return false;
     }
     pad_to_stream_[pad_name] = stream_index;
-    initial_caps_pads_.insert(pad_name);
+    staging_it->second.initial_caps_done = true;
     return true;
 }
 
-bool MuxNode::writeHeaderAfterAllInputsConfigured() {
-    if (header_written_ || initial_caps_pads_.size() != sink_pads_.size()) {
+bool MuxNode::tryEmitHeader() {
+    if (header_written_) {
         return true;
+    }
+
+    // 全部已连接输入都完成 initial Caps 后才允许建立 Header
+    for (const auto& pad : sink_pads_) {
+        if (!pad->isConnected()) {
+            continue;
+        }
+        const auto it = staging_.find(pad->name());
+        if (it == staging_.end() || !it->second.initial_caps_done) {
+            return true;
+        }
     }
 
     auto* output_pad = getSrcPad("out_0");
@@ -816,6 +986,7 @@ bool MuxNode::writeHeaderAfterAllInputsConfigured() {
 
     CapsEvent output_caps;
     output_caps.media_type = MediaType::CONTAINER;
+    // 顺序固定：CONTAINER Caps → Header 字节 → flush
     if (!sendCapsEvent("out_0", output_caps) || !writeHeader(format_) || !flushPendingOutput()) {
         pending_output_.clear();
         return false;
@@ -825,210 +996,325 @@ bool MuxNode::writeHeaderAfterAllInputsConfigured() {
     return true;
 }
 
-void MuxNode::runLoop() {
-    while (!stop_requested_.load()) {
-        SinkPad* ready_pad = waitAnyPadReady();
-        if (!ready_pad) {
-            break;
+bool MuxNode::tryEmitPacket() {
+    if (!canEmitPacket()) {
+        return true;
+    }
+
+    // 在完整候选集（每路 staging 队首）上选全局最小 DTS
+    std::string min_pad_name;
+    int64_t min_dts = std::numeric_limits<int64_t>::max();
+    bool found = false;
+
+    for (const auto& pad : sink_pads_) {
+        if (!pad->isConnected()) {
+            continue;
+        }
+        const auto it = staging_.find(pad->name());
+        if (it == staging_.end()) {
+            continue;
+        }
+        if (it->second.eos_done && it->second.packets.empty()) {
+            continue;
+        }
+        // canEmitPacket 已保证活跃路非空；这里再防一次状态撕裂
+        if (it->second.packets.empty()) {
+            postMessage(MessageType::ERROR,
+                        "MuxNode: active input lost its Buffer candidate during DTS selection");
+            return false;
         }
 
-        auto delivery = ready_pad->tryAcquire();
+        const BufferRef& buffer = it->second.packets.front();
+        // pull 阶段已校验 DTS；这里只比较
+        if (buffer->dts < min_dts) {
+            min_dts = buffer->dts;
+            min_pad_name = pad->name();
+            found = true;
+        }
+    }
+
+    if (!found) {
+        postMessage(MessageType::ERROR, "MuxNode: no active Buffer candidate for DTS selection");
+        return false;
+    }
+
+    auto staging_it = staging_.find(min_pad_name);
+    auto stream_it = pad_to_stream_.find(min_pad_name);
+    if (staging_it == staging_.end() || stream_it == pad_to_stream_.end()) {
+        postMessage(MessageType::ERROR,
+                    "MuxNode: missing staging or stream mapping for pad '" + min_pad_name + "'");
+        return false;
+    }
+
+    BufferRef buffer = std::move(staging_it->second.packets.front());
+    staging_it->second.packets.pop_front();
+
+    if (!writePacket(buffer.get(), stream_it->second) || !flushPendingOutput() ||
+        stop_requested_.load()) {
+        pending_output_.clear();
+        return false;
+    }
+    return true;
+}
+
+bool MuxNode::tryEmitTrailer() {
+    if (!header_written_ || !allInputsEosAndDrained()) {
+        return true;
+    }
+
+    if (!writeTrailer() || !flushPendingOutput() || !sendEOSDownstream()) {
+        pending_output_.clear();
+        return false;
+    }
+    // Trailer 成功后由 runLoop 退出
+    return true;
+}
+
+bool MuxNode::pullInputsOnce(bool* progressed, bool* fatal) {
+    *progressed = false;
+    *fatal = false;
+
+    // 每轮扫描全部输入一次；只使用 tryAcquire，避免单路阻塞拖死其它路的 pull
+    for (auto& pad : sink_pads_) {
+        if (!pad->isConnected() || stop_requested_.load()) {
+            continue;
+        }
+
+        const std::string& pad_name = pad->name();
+        auto staging_it = staging_.find(pad_name);
+        if (staging_it == staging_.end()) {
+            postMessage(MessageType::ERROR, "MuxNode: missing staging for pad '" + pad_name + "'");
+            *fatal = true;
+            return false;
+        }
+        InputStaging& staging = staging_it->second;
+
+        // 该路已完整结束：EOS 已 ack 且本地队列已空
+        if (staging.eos_done && staging.packets.empty()) {
+            continue;
+        }
+
+        // 先 peek 区分控制事件与 Buffer，避免在 staging 满时误拉 Buffer
+        const auto top = pad->peek();
+        if (!top) {
+            continue;
+        }
+
+        if (std::holds_alternative<Event>(*top)) {
+            const Event& event = std::get<Event>(*top);
+
+            if (std::holds_alternative<CapsEvent>(event)) {
+                // Caps 始终优先 tryAcquire；校验/建流失败时不 ack
+                auto delivery = pad->tryAcquire();
+                if (!delivery) {
+                    continue;
+                }
+                const QueueItem& item = delivery->item();
+                if (!std::holds_alternative<Event>(item) ||
+                    !std::holds_alternative<CapsEvent>(std::get<Event>(item))) {
+                    postMessage(MessageType::ERROR,
+                                "MuxNode: peeked CapsEvent disappeared before acquire on pad '" +
+                                    pad_name + "'");
+                    *fatal = true;
+                    return false;
+                }
+
+                // 校验
+                if (!configureInitialInput(pad_name, std::get<CapsEvent>(std::get<Event>(item))) ||
+                    !delivery->ack()) {
+                    *fatal = true;
+                    return false;
+                }
+                *progressed = true;
+                continue;
+            }
+
+            // EOSEvent
+            // 放行条件只看该路是否已完成 initial Caps，不看 header_written_
+            // - initial_caps_done == false：该路尚未建流就 EOS，Header 永远无法齐套 → ERROR
+            // - initial_caps_done == true：即使 Header 尚未写出也允许处理 EOS
+            //   eager pull 会先把已配置路的 Buffer 移入 staging 并 ack，Route 队首因而可能
+            //   在 Header 前就露出 EOS；这是正常时序，不能再按旧模型“Header 前任何 EOS
+            //   都 ERROR”处理
+            if (!staging.initial_caps_done) {
+                auto delivery = pad->tryAcquire();
+                if (!delivery) {
+                    continue;
+                }
+                postMessage(MessageType::ERROR,
+                            "MuxNode: linked input reached EOS before all inputs supplied initial CapsEvent");
+                *fatal = true;
+                return false;
+            }
+
+            // 本地仍有未写 packet 时，EOS 必须留在 Route 队首，避免越过尾包
+            // Header 前后同一规则：staging 排空后再 ack EOS
+            if (!staging.packets.empty()) {
+                continue;
+            }
+
+            auto delivery = pad->tryAcquire();
+            if (!delivery) {
+                continue;
+            }
+            const QueueItem& item = delivery->item();
+            if (!std::holds_alternative<Event>(item) ||
+                !std::holds_alternative<EOSEvent>(std::get<Event>(item))) {
+                postMessage(MessageType::ERROR,
+                            "MuxNode: peeked EOSEvent disappeared before acquire on pad '" +
+                                pad_name + "'");
+                *fatal = true;
+                return false;
+            }
+            if (!delivery->ack()) {
+                *fatal = true;
+                return false;
+            }
+            // 已配置路可在 Header 前标记 eos_done；Header 是否可写仍只依赖各路 initial_caps_done
+            staging.eos_done = true;
+            *progressed = true;
+            continue;
+        }
+
+        // 队首是 Buffer
+        if (!staging.initial_caps_done) {
+            // 未配置 Caps 的 Buffer 是协议错误；先 tryAcquire 再校验，失败不 ack
+            auto delivery = pad->tryAcquire();
+            if (!delivery) {
+                continue;
+            }
+            postMessage(MessageType::ERROR,
+                        "MuxNode: Buffer received before initial CapsEvent on pad '" + pad_name + "'");
+            *fatal = true;
+            return false;
+        }
+
+        // staging 满时不再 pull 该路 Buffer，把机会留给 emit 或其它路的控制事件
+        if (stagingIsFull(staging)) {
+            continue;
+        }
+
+        auto delivery = pad->tryAcquire();
         if (!delivery) {
             continue;
         }
 
         const QueueItem& item = delivery->item();
-        const std::string& pad_name = ready_pad->name();
-        if (std::holds_alternative<BufferRef>(item)) {
-            const auto active = active_caps_.find(pad_name);
-            if (!header_written_ || active == active_caps_.end()) {
-                postMessage(MessageType::ERROR,
-                            "MuxNode: Buffer received before all linked inputs supplied initial CapsEvent");
-                break;
-            }
-
-            const BufferRef& buffer = std::get<BufferRef>(item);
-            if (buffer->media_type != active->second.media_type) {
-                postMessage(MessageType::ERROR,
-                            "MuxNode: Buffer media type does not match active CapsEvent on pad '" +
-                                pad_name + "'");
-                break;
-            }
-
-            auto stream = pad_to_stream_.find(pad_name);
-            if (stream == pad_to_stream_.end() ||
-                !writePacket(buffer.get(), stream->second) ||
-                !flushPendingOutput() || stop_requested_.load() || !delivery->ack()) {
-                pending_output_.clear();
-                break;
-            }
-            continue;
-        }
-
-        const Event& event = std::get<Event>(item);
-        if (std::holds_alternative<CapsEvent>(event)) {
-            if (!configureInitialInput(pad_name, std::get<CapsEvent>(event)) ||
-                !writeHeaderAfterAllInputsConfigured() || !delivery->ack()) {
-                break;
-            }
-            continue;
-        }
-
-        // Header 尚未建立时，任一路 EOS 都证明不可能再等齐本轮全部输入的初始 Caps。
-        if (!header_written_) {
+        if (!std::holds_alternative<BufferRef>(item)) {
+            // peek 与 acquire 之间被并发改变时视为内部错误
             postMessage(MessageType::ERROR,
-                        "MuxNode: linked input reached EOS before all inputs supplied initial CapsEvent");
-            break;
+                        "MuxNode: peeked Buffer disappeared before acquire on pad '" + pad_name + "'");
+            *fatal = true;
+            return false;
         }
 
-        eos_pads_.insert(pad_name);
-        const bool final_input_eos = eos_pads_.size() == sink_pads_.size();
-        if (!final_input_eos) {
-            if (!delivery->ack()) {
-                break;
-            }
+        // 合同校验必须在 ack 前完成：类型、active Caps、DTS、stream mapping
+        const BufferRef& buffer = std::get<BufferRef>(item);
+        if (!validateBufferForStaging(pad_name, buffer.get())) {
+            *fatal = true;
+            return false;
+        }
+
+        // 再次确认容量（与其它路 pull 交错后 total 可能已变）
+        if (stagingIsFull(staging)) {
+            // 不 ack：Delivery 析构放弃 in-flight，下次可重新 acquire 同一项
             continue;
         }
 
-        if (!writeTrailer() || !flushPendingOutput() || !sendEOSDownstream() || !delivery->ack()) {
-            pending_output_.clear();
+        staging.packets.push_back(buffer);
+        if (!delivery->ack()) {
+            staging.packets.pop_back();
+            *fatal = true;
+            return false;
         }
-        break;
+        *progressed = true;
     }
+
+    return true;
 }
 
-SinkPad* MuxNode::waitAnyPadReady() {
+void MuxNode::waitForProgress() {
     std::unique_lock<std::mutex> lock(mux_mutex_);
-    // 上游向任一路 Route 发布，或 Route 被 cancel 时，通知会唤醒这个条件变量
     mux_cv_.wait(lock, [this] {
         if (stop_requested_.load()) {
             return true;
         }
-
-        // 如果尚未建立容器 Header
-        if (!header_written_) {
-            for (const auto& pad : sink_pads_) {
-                if (!pad->isConnected()) {
-                    continue;
-                }
-                const auto top = pad->peek();
-                if (top && (std::holds_alternative<Event>(*top) ||
-                            !initial_caps_pads_.count(pad->name()))) {
-                    // Header 前必须优先推进尚未完成初始 Caps 配置的输入，已配置输入的
-                    // Buffer 则保留在 Route 中，不能越过未来 Header
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        bool has_active_input = false;
-        // 第一轮先扫描全部仍活跃的输入，看是否有控制 Event
+        // 任一路 Route 上出现新队首，或仅靠 notify 唤醒后由 pull/emit 再判断
         for (const auto& pad : sink_pads_) {
-            if (!pad->isConnected() || eos_pads_.count(pad->name())) {
+            if (!pad->isConnected()) {
                 continue;
             }
-
-            has_active_input = true;
-            const auto top = pad->peek();
-            if (top && std::holds_alternative<Event>(*top)) {
-                // 先扫描全部活跃输入的控制边界，不能让另一条暂空 Route 延后其 EOS 或错误 Caps
+            if (pad->peek()) {
                 return true;
             }
         }
-
-        // 第二轮要求每个未 EOS 输入都有 Buffer 队首
-        for (const auto& pad : sink_pads_) {
-            if (!pad->isConnected() || eos_pads_.count(pad->name())) {
-                continue;
-            }
-
-            const auto top = pad->peek();
-            if (!top) {
-                // 当前输入尚没有候选 Packet，不能让其他输入越过其未知未来 DTS
-                return false;
-            }
-        }
-
-        // 全部未 EOS 输入均已有 Buffer 队首，才可由框架选择全局最小 DTS
-        return has_active_input;
+        return false;
     });
-
-    if (stop_requested_.load()) {
-        return nullptr;
-    }
-
-    if (!header_written_) {
-        // 优先选择仍缺初始 Caps 的输入，使 Header 建立过程有序前进或报告精确协议错误
-        for (auto& pad : sink_pads_) {
-            const auto top = pad->peek();
-            if (top && !initial_caps_pads_.count(pad->name())) {
-                return pad.get();
-            }
-        }
-        for (auto& pad : sink_pads_) {
-            const auto top = pad->peek();
-            if (top && std::holds_alternative<Event>(*top)) {
-                return pad.get();
-            }
-        }
-        return nullptr;
-    }
-
-    // Header 后控制 Event 优先于 Packet 调度，避免 EOS 或非法 Caps 被数据越过
-    for (auto& pad : sink_pads_) {
-        if (eos_pads_.count(pad->name())) {
-            continue;
-        }
-        const auto top = pad->peek();
-        if (top && std::holds_alternative<Event>(*top)) {
-            return pad.get();
-        }
-    }
-
-    // 此时 Header 已建立，并且已经保证，每个未 EOS 输入都有一个 Buffer 队首
-    return selectMinDtsPad();
 }
 
-SinkPad* MuxNode::selectMinDtsPad() {
-    SinkPad* min_pad = nullptr;
-    int64_t min_dts = std::numeric_limits<int64_t>::max();
+void MuxNode::runLoop() {
+    while (!stop_requested_.load()) {
+        bool pulled = false;
+        bool fatal = false;
 
-    for (auto& pad : sink_pads_) {
-        if (!pad->isConnected() || eos_pads_.count(pad->name())) {
+        // 尽量从各 Route 拉进 staging
+        if (!pullInputsOnce(&pulled, &fatal) || fatal) {
+            break;
+        }
+
+        // Caps 齐套后尝试建立 Header；staging 中已有 packet 保留到 Header 后写出
+        if (!tryEmitHeader()) {
+            break;
+        }
+
+        // 尽可能按全局最小 DTS 连续写出，直到候选集不再完整
+        bool emitted_packet = false;
+        while (!stop_requested_.load() && canEmitPacket()) {
+            const size_t before = stagingTotalSize();
+            if (!tryEmitPacket()) {
+                return;
+            }
+            if (stagingTotalSize() >= before) {
+                // 防御：emit 后总量未下降说明状态机异常
+                postMessage(MessageType::ERROR, "MuxNode: emit packet did not consume staging");
+                return;
+            }
+            emitted_packet = true;
+        }
+
+        if (header_written_ && allInputsEosAndDrained()) {
+            if (!tryEmitTrailer()) {
+                break;
+            }
+            // 自然完成：Trailer + 输出 EOS 已发送
+            return;
+        }
+
+        // 满且无法写 Header/Packet：从死锁改为可诊断 ERROR
+        if (stagingBlockedWithoutProgress()) {
+            if (!header_written_) {
+                postMessage(MessageType::ERROR,
+                            "MuxNode: input staging full while waiting for initial Caps");
+            } else {
+                postMessage(MessageType::ERROR,
+                            "MuxNode: input staging full while waiting for peer stream data");
+            }
+            break;
+        }
+
+        if (pulled || emitted_packet) {
+            // 本轮有进展：立刻再 pull，让刚释放的 Route 空位尽快被上游填上
             continue;
         }
 
-        // 再次校验候选集没有被破坏
-        const auto top = pad->peek();
-        if (!top || !std::holds_alternative<BufferRef>(*top)) {
-            postMessage(MessageType::ERROR,
-                        "MuxNode: active input lost its Buffer candidate during DTS selection");
-            return nullptr;
-        }
-
-        const BufferRef& buffer = std::get<BufferRef>(*top);
-        // 为了让框架自己做跨流排序，必须有可比较的 DTS
-        if (!buffer || buffer->dts == AV_NOPTS_VALUE) {
-            postMessage(MessageType::ERROR,
-                        "MuxNode: encoded Buffer requires a valid DTS for framework interleaving");
-            return nullptr;
-        }
-        // 选最小 DTS
-        if (buffer->dts < min_dts) {
-            min_dts = buffer->dts;
-            min_pad = pad.get();
-        }
+        // 无进展：等待任一路 Route notify 或 stop
+        waitForProgress();
     }
-
-    if (!min_pad) {
-        postMessage(MessageType::ERROR, "MuxNode: no active Buffer candidate for DTS selection");
-    }
-    return min_pad;
 }
 
 void MuxNode::onStop() {
     pending_output_.clear();
+    clearStaging();
     closeContext();
 }
 

@@ -33,12 +33,22 @@ int64_t rescaleFromFrameworkTimeBase(int64_t value, AVRational target_time_base)
 
 } // namespace
 
-SinkPad* AVMuxNode::requestSinkPad(const std::string& name, MediaType hint_type) {
-    // 首版 MPEG-TS 只接受一路视频，音频和多视频交织留给后续明确的容器范围扩展
-    if (hint_type != MediaType::VIDEO_ENCODED || !sink_pads_.empty()) {
-        return nullptr;
+bool AVMuxNode::acceptsInputPad(MuxFormat format, MediaType hint_type) const {
+    if (hint_type != MediaType::VIDEO_ENCODED && hint_type != MediaType::AUDIO_ENCODED) {
+        return false;
     }
-    return MuxNode::requestSinkPad(name, hint_type);
+
+    switch (format) {
+        case MuxFormat::MPEGTS:
+        case MuxFormat::FLV:
+            // 容器实例可服务任意数量 encoded 输入；视频/音频 codec 兼容性和 stream 参数
+            // 在各 Pad 首份完整 Caps 到达时由 addStream() 做格式相关验证
+            return true;
+        case MuxFormat::MP4:
+            // fragmented MP4 后端尚未实现，link 阶段直接拒绝任何输入
+            return false;
+    }
+    return false;
 }
 
 int AVMuxNode::writeCallback(void* opaque, const uint8_t* data, int size) {
@@ -57,13 +67,21 @@ int AVMuxNode::writeCallback(void* opaque, const uint8_t* data, int size) {
 }
 
 bool AVMuxNode::allocateContext(MuxFormat format) {
-    if (format != MuxFormat::MPEGTS) {
-        postMessage(MessageType::ERROR,
-                    "AVMuxNode: only MPEG-TS is implemented in the first backend revision");
-        return false;
+    const char* muxer_name = nullptr;
+    switch (format) {
+        case MuxFormat::MPEGTS:
+            muxer_name = "mpegts";
+            break;
+        case MuxFormat::FLV:
+            muxer_name = "flv";
+            break;
+        case MuxFormat::MP4:
+            postMessage(MessageType::ERROR,
+                        "AVMuxNode: fragmented MP4 is not implemented yet");
+            return false;
     }
 
-    int result = avformat_alloc_output_context2(&fmt_ctx_, nullptr, "mpegts", nullptr);
+    int result = avformat_alloc_output_context2(&fmt_ctx_, nullptr, muxer_name, nullptr);
     if (result < 0 || !fmt_ctx_) {
         postMessage(MessageType::ERROR,
                     "AVMuxNode: avformat_alloc_output_context2 failed: " + avErrorStr(result),
@@ -88,6 +106,9 @@ bool AVMuxNode::allocateContext(MuxFormat format) {
     // 自定义 AVIO 由节点回收，FFmpeg 不得在 avformat_free_context 中关闭或释放它
     fmt_ctx_->pb = avio_ctx_;
     fmt_ctx_->flags |= AVFMT_FLAG_CUSTOM_IO;
+    backend_format_ = format;
+    timestamp_origin_us_ = AV_NOPTS_VALUE;
+    last_dts_us_ = AV_NOPTS_VALUE;
     return true;
 }
 
@@ -96,21 +117,44 @@ bool AVMuxNode::addStream(const CapsEvent& caps, int* stream_index) {
         postMessage(MessageType::ERROR, "AVMuxNode: output context is unavailable while adding stream");
         return false;
     }
-    if (caps.media_type != MediaType::VIDEO_ENCODED ||
-        (caps.codec_id != AV_CODEC_ID_H264 && caps.codec_id != AV_CODEC_ID_HEVC)) {
+
+    const bool is_video = caps.media_type == MediaType::VIDEO_ENCODED;
+    const bool is_audio = caps.media_type == MediaType::AUDIO_ENCODED;
+    if (!is_video && !is_audio) {
         postMessage(MessageType::ERROR,
-                    "AVMuxNode: MPEG-TS first revision accepts only H.264 or HEVC video input");
+                    "AVMuxNode: input Caps must describe encoded video or audio");
         return false;
     }
-    if (caps.width <= 0 || caps.height <= 0 || caps.extradata.empty()) {
+    if (caps.extradata.empty()) {
         postMessage(MessageType::ERROR,
-                    "AVMuxNode: MPEG-TS video Caps require width, height and non-empty extradata");
+                    "AVMuxNode: encoded stream Caps require non-empty extradata");
         return false;
     }
     if (caps.extradata.size() >
         static_cast<size_t>(std::numeric_limits<int>::max() - AV_INPUT_BUFFER_PADDING_SIZE)) {
         postMessage(MessageType::ERROR, "AVMuxNode: extradata exceeds FFmpeg integer limits");
         return false;
+    }
+
+    if (is_video) {
+        if ((caps.codec_id != AV_CODEC_ID_H264 && caps.codec_id != AV_CODEC_ID_HEVC) ||
+            caps.width <= 0 || caps.height <= 0) {
+            postMessage(MessageType::ERROR,
+                        "AVMuxNode: video Caps require H.264/HEVC, positive dimensions and extradata");
+            return false;
+        }
+        if (backend_format_ == MuxFormat::FLV && caps.codec_id != AV_CODEC_ID_H264) {
+            postMessage(MessageType::ERROR,
+                        "AVMuxNode: FLV accepts only H.264 video input");
+            return false;
+        }
+    } else {
+        if (caps.codec_id != AV_CODEC_ID_AAC || caps.sample_rate <= 0 ||
+            !caps.channel_layout.isValid()) {
+            postMessage(MessageType::ERROR,
+                        "AVMuxNode: audio Caps require AAC, positive sample rate, valid channel layout and extradata");
+            return false;
+        }
     }
 
     AVStream* stream = avformat_new_stream(fmt_ctx_, nullptr);
@@ -120,11 +164,21 @@ bool AVMuxNode::addStream(const CapsEvent& caps, int* stream_index) {
     }
 
     AVCodecParameters* parameters = stream->codecpar;
-    parameters->codec_type = AVMEDIA_TYPE_VIDEO;
+    parameters->codec_type = is_video ? AVMEDIA_TYPE_VIDEO : AVMEDIA_TYPE_AUDIO;
     parameters->codec_id = caps.codec_id;
-    parameters->width = caps.width;
-    parameters->height = caps.height;
     stream->time_base = kFrameworkTimeBase;
+
+    if (is_video) {
+        parameters->width = caps.width;
+        parameters->height = caps.height;
+    } else {
+        parameters->sample_rate = caps.sample_rate;
+        if (!caps.channel_layout.toAV(&parameters->ch_layout)) {
+            postMessage(MessageType::ERROR,
+                        "AVMuxNode: cannot materialize audio channel layout for stream parameters");
+            return false;
+        }
+    }
 
     const size_t extradata_size = caps.extradata.size();
     parameters->extradata = static_cast<uint8_t*>(
@@ -159,12 +213,20 @@ bool AVMuxNode::flushAvio() {
 }
 
 bool AVMuxNode::writeHeader(MuxFormat format) {
-    if (format != MuxFormat::MPEGTS || !fmt_ctx_) {
-        postMessage(MessageType::ERROR, "AVMuxNode: MPEG-TS output context is unavailable for header");
+    if ((format != MuxFormat::MPEGTS && format != MuxFormat::FLV) ||
+        format != backend_format_ || !fmt_ctx_) {
+        postMessage(MessageType::ERROR,
+                    "AVMuxNode: output context is unavailable or does not match header format");
         return false;
     }
 
-    const int result = avformat_write_header(fmt_ctx_, nullptr);
+    AVDictionary* options = nullptr;
+    if (format == MuxFormat::FLV) {
+        // custom AVIO 是严格顺序输出，不能让 FLV muxer 在 Trailer 时 seek 回 Header 更新时长/文件大小
+        av_dict_set(&options, "flvflags", "no_duration_filesize", 0);
+    }
+    const int result = avformat_write_header(fmt_ctx_, &options);
+    av_dict_free(&options);
     if (result < 0) {
         postMessage(MessageType::ERROR,
                     "AVMuxNode: avformat_write_header failed: " + avErrorStr(result), result);
@@ -179,15 +241,38 @@ bool AVMuxNode::writePacket(const Buffer* buf, int stream_index) {
         postMessage(MessageType::ERROR, "AVMuxNode: invalid packet write state");
         return false;
     }
-    if (buf->media_type != MediaType::VIDEO_ENCODED || !buf->data || buf->size == 0 ||
+    const AVMediaType stream_type = fmt_ctx_->streams[stream_index]->codecpar->codec_type;
+    const MediaType expected_media_type = stream_type == AVMEDIA_TYPE_VIDEO
+        ? MediaType::VIDEO_ENCODED
+        : stream_type == AVMEDIA_TYPE_AUDIO
+            ? MediaType::AUDIO_ENCODED
+            : MediaType::CONTAINER;
+    if (buf->media_type != expected_media_type || !buf->data || buf->size == 0 ||
         !std::holds_alternative<EncodedMeta>(buf->meta)) {
         postMessage(MessageType::ERROR,
-                    "AVMuxNode: expected a non-empty VIDEO_ENCODED Buffer with EncodedMeta");
+                    "AVMuxNode: encoded Buffer does not match its output stream type");
         return false;
     }
     if (buf->dts == AV_NOPTS_VALUE) {
         postMessage(MessageType::ERROR,
-                    "AVMuxNode: MPEG-TS Packet requires a valid DTS after framework interleaving");
+                    "AVMuxNode: encoded Packet requires a valid DTS after framework interleaving");
+        return false;
+    }
+    if (last_dts_us_ != AV_NOPTS_VALUE && buf->dts < last_dts_us_) {
+        postMessage(MessageType::ERROR,
+                    "AVMuxNode: encoded Packet DTS regressed after framework interleaving");
+        return false;
+    }
+    if (timestamp_origin_us_ == AV_NOPTS_VALUE) {
+        timestamp_origin_us_ = buf->dts;
+    }
+    const int64_t relative_dts_us = buf->dts - timestamp_origin_us_;
+    const int64_t relative_pts_us = buf->pts == AV_NOPTS_VALUE
+        ? AV_NOPTS_VALUE
+        : buf->pts - timestamp_origin_us_;
+    if (relative_dts_us < 0) {
+        postMessage(MessageType::ERROR,
+                    "AVMuxNode: normalized Packet DTS is negative");
         return false;
     }
     if (buf->size > static_cast<size_t>(std::numeric_limits<int>::max())) {
@@ -209,8 +294,10 @@ bool AVMuxNode::writePacket(const Buffer* buf, int stream_index) {
     // Packet 必须拥有 FFmpeg 分配且带 padding 的 payload，不能借用框架 Buffer 的 new[] 内存
     std::memcpy(packet->data, buf->data, buf->size);
     packet->stream_index = stream_index;
-    packet->pts = rescaleFromFrameworkTimeBase(buf->pts, fmt_ctx_->streams[stream_index]->time_base);
-    packet->dts = rescaleFromFrameworkTimeBase(buf->dts, fmt_ctx_->streams[stream_index]->time_base);
+    packet->pts = rescaleFromFrameworkTimeBase(
+        relative_pts_us, fmt_ctx_->streams[stream_index]->time_base);
+    packet->dts = rescaleFromFrameworkTimeBase(
+        relative_dts_us, fmt_ctx_->streams[stream_index]->time_base);
     packet->duration = buf->duration > 0
         ? av_rescale_q(buf->duration, kFrameworkTimeBase,
                        fmt_ctx_->streams[stream_index]->time_base)
@@ -225,6 +312,7 @@ bool AVMuxNode::writePacket(const Buffer* buf, int stream_index) {
                     "AVMuxNode: av_write_frame failed: " + avErrorStr(result), result);
         return false;
     }
+    last_dts_us_ = buf->dts;
     return flushAvio();
 }
 

@@ -452,3 +452,155 @@ remaining >= -threshold
 - AVStream 先以框架微秒 `{1, 1000000}` 建立 time_base；`avformat_write_header()` 后写 Packet 必须使用 muxer最终确认的 stream time_base 重标定 pts/dts/duration
 - `closeContext()` 必须支持部分初始化，释放顺序为当前 `AVIOContext::buffer`、`avio_context_free()`、`avformat_free_context()`
 - 本轮不新增临时 CONTAINER Sink 或 test_pipeline 测试场景。普通/ASAN 既有回归只证明集成、生命周期和既有 Mux 合同未退化；真实 MPEG-TS 字节的 ffprobe/解码验收等待实际网络 Sink 连接后进行
+
+---
+
+## AVMux FLV、Mux session 时间轴与正式 FileSink
+
+### FLV 后端范围
+
+- `AVMuxNode` 仍是唯一 FFmpeg 容器具体节点，以构造期不可变 `MuxFormat` 选择后端；不拆出独立 FLVMuxNode
+- `MuxFormat::MPEGTS` 继续支持单视频 H.264/HEVC；`MuxFormat::FLV` 首版只声明单视频 H.264，暂不把 FFmpeg 特定版本的 HEVC-in-FLV 能力提升为框架兼容性合同
+- custom AVIO、Packet 自有 payload、flags、Header/Packet/Trailer flush 与 `av_write_frame()` 路径由两种格式共用；fragmented MP4 保持后续独立步骤
+
+### Mux session 相对时间轴
+
+- 框架 Buffer 的 V4L2 PTS/DTS 可来自系统 monotonic absolute 时间，不能直接写入文件容器，否则 FLV duration 会被错误解释为系统启动秒数
+- 单视频 Mux session 以首个有效 DTS 为唯一 origin，后续写入 `relative_dts = dts - origin`、`relative_pts = pts - origin`，保留 PTS−DTS 的 B-frame 重排偏移、duration 和帧间间隔
+- Mux 仍要求有效 DTS，并在写入前拒绝 DTS 回退；首包归一化 DTS 必须为零。该归一化只属于容器 session，不修改框架 Buffer、Clock 或上游时间戳
+- FLV 实测首 DTS 为零、首 PTS 为 +0.3 秒，ffprobe 的 start_time=0.3 秒是 B-frame 合法重排偏移；中断录制 duration 从错误的 58059 秒修正为约 11.833 秒
+
+### FileSinkNode 正式合同
+
+- `FileSinkNode` 是正式顺序 CONTAINER Sink，不解析容器格式，也不是测试夹具
+- 构造期配置固定 path 与 overwrite；默认 `O_EXCL` 拒绝已有路径，显式覆盖仍使用 `O_NOFOLLOW` 并拒绝既有非普通文件，防止无意覆盖符号链接或设备节点
+- Ready 打开并 `fstat()`；consume 对每个 CONTAINER Buffer 循环处理 partial write 和 EINTR，只有完整写入后 SinkNode 才 ack Delivery
+- 自然 EOS 时 `onDrain()` 先 fsync，成功后基类才上报 Sink EOS；实时 Source 的 stop/cancel 不伪装为 EOS，不执行 Mux Trailer 或 FileSink自然 drain
+- `onStop()` 是 Ready 回滚、错误、自然 EOS 后统一 fd 关闭入口；Linux close 被 EINTR 打断时不盲目重试，避免误关复用 fd
+
+### 两类文件验收边界
+
+- `v4l2_record_flv` 验证真实 V4L2→libx264→FLV→FileSink 的流式数据面和中断回收；SIGINT 文件不承诺 Encoder EOS flush 或 Mux Trailer，但应能被 ffprobe 识别并连续解码已写 Packet
+- `transcode_to_flv` 使用有限文件输入自然 EOF，覆盖 Decode/Encode flush、Mux Trailer、FileSink fsync 和 Pipeline自然 EOS
+- 当前实测两类 FLV 均为 H.264 640×480、约 11.833 秒且 ffmpeg 解码退出 0；自然 EOS 输入/输出均为 168 Frame/168 Packet，无尾帧截断；普通与 ASAN 两类路径均通过
+
+---
+
+## Mux 等齐期有界 staging 与多路 FLV 死锁修复
+
+### 决策背景
+
+多路 `transcode_to_flv`（视频 Decode→libx264 重编码 + AAC encoded 旁路 → 同一 FLV Mux）在自然 EOS 路径上输出 0 字节并永久挂起。实测证实：AAC Caps/Packet 先到，Header 前旧调度不消费已配置路的 Buffer；`AUDIO_ENCODED` Route 容量 32 被填满后，单线程 Demux 的 `publishBlocking` 卡在第 33 个音频包，视频只推进到 Encode 约 26 帧，默认 x264 约 47 帧才出首 Packet/video Caps，Header 永远无法建立。
+
+这不是单点 API 写错，而是三个各自合理语义首次同时触发：
+
+```text
+单线程 Demux 可靠阻塞发布
++ 等齐 Header / DTS 候选时不能越过写容器
++ Route 有限容量 + 视频侧编码迟滞
+= 快路堵死慢路供给
+```
+
+问题比“Header 前”更宽：Header 后等齐 DTS 候选时，若已到齐的那路仍长期停在上游 Route，同样可堵死 Demux。扩大 Route、或只依赖 zerolatency 缩短窗口，都不是结构性解。
+
+### 正式合同
+
+- 跨输入排序与等齐期数据持有的唯一 owner 是 `MuxNode`；上游 Route 继续只做短 handoff（`ENCODED=32` 不变）
+- 每个已连接输入 Pad 维护有界 `InputStaging`：只存已通过合同校验的 `BufferRef`；Caps/EOS 不进 staging
+- 默认容量：每路 256 个 packet、全节点总计 512 个；按默认 x264 迟滞量级估算，不按 zerolatency 估算（算式见下节）
+- 调度改为 `pull → emit → wait`：
+  - pull 对全部输入只使用 `tryAcquire()`，禁止在多路扫描中 `acquireBlocking()`
+  - Buffer 的 media_type、active Caps、有效 DTS、stream mapping 校验必须在 ack 前、进 staging 前完成；失败不 ack、不进 staging，直接 ERROR
+  - 已配置 Pad 的 Buffer 进入 staging 后立即 ack，释放上游 Route
+  - Header 前禁止 `writePacket`；全部 initial Caps 齐套后才 `CONTAINER Caps → writeHeader → flush`
+  - Header 后在全部未 EOS 且未排空路的 staging 队首上选全局最小 DTS 写出
+- Header 后 EOS：若该路 staging 非空，EOS 留在 Route 队首，排空后再 ack；排空并 ack 后该路退出候选集
+- 只有“该路尚未 initial Caps 就 EOS”才在 Header 齐套前 ERROR；已配置路在 Header 前因 eager pull 露出的 EOS 合法，不按旧模型一律 Header 前 EOS 失败
+- staging 满且无法写 Header/Packet：明确 ERROR，禁止永久挂死
+- stop/cancel：清空全部 staging 与 pending 容器字节，不伪装成功 Header/Trailer
+
+### 容量估算（`kStagingPerPadLimit=256` / `kStagingTotalLimit=512`）
+
+这两个数字不是拍脑袋，也不是按 zerolatency 估；它们按**默认 libx264 quality 迟滞**下“快路在等齐期间最多会先到多少 encoded packet”做量级核算，并显式留安全余量。以后若引入 Encode 私参把首包延迟压到 1～2 帧，所需窗口只会更短，容量方向上只会更宽松，不会反噬本估算前提。
+
+#### 输入量
+
+| 量 | 取值 | 依据 |
+|---|---|---|
+| 默认 x264 内部固定缓存 | 约 **47 帧** | 实测 `rc_lookahead=40 + bframes=3`；首个 encoded Packet 前 Encode 约收 48 帧，稳态 `input_frames - output_packets ≈ 47` |
+| 名义视频帧间隔 | **1/30 s** | demo/`EncodeConfig` 常用 nominal 30fps；这是配置意图，不是 VMware 实测交付 fps |
+| 名义等齐时间窗口 | `47 / 30 ≈ 1.57 s` | 仅由 encoder 内部缓存决定的下界窗口；若再叠加 Decode 重排或更慢消费者，窗口只会更长 |
+| AAC 包间隔 | `1024 / 44100 ≈ 23.22 ms` | 标准 AAC-LC 帧长 1024 sample @ 44.1 kHz |
+| AAC 包率 | `44100 / 1024 ≈ 43.07 packet/s` | 与上式互逆 |
+| 实测死锁触发对照 | audio 填满 Route **32** 时 video 仅约 **26** 帧 | 旧模型在默认 x264 远未出首包前就已堵死；说明“默认迟滞窗口内快路包数 ≫ 32” |
+
+VMware 上还曾测到实际采集约 14.7fps、默认 quality 端到端 Present age 约 3.2s。那是环境 + encoder 叠加后的墙钟延迟，**不拿来当容量下界公式的唯一输入**；容量按更干净的“默认 encoder 帧缓存 × 名义帧率 × 快路包率”估算，再用余量覆盖 demux 抖动、Decode 重排和偶发更高音频包率。
+
+#### 单路下限
+
+等齐期内，已配置快路（典型为 AAC 旁路）在 Mux 本地需要暂存的 packet 数：
+
+```text
+N_fast ≈ T_wait × R_audio
+       ≈ (N_encoder_delay_frames / F_video_nominal) × (sample_rate / samples_per_aac_frame)
+       ≈ (47 / 30) × (44100 / 1024)
+       ≈ 1.567 × 43.07
+       ≈ 67.5 packet
+```
+
+对照与余量：
+
+```text
+旧 Route handoff 上限                         32     ← 已证实不够
+默认 x264@30fps 名义窗口                      ≈ 68
+按 3s 墙钟窗口粗算（1.5× 名义窗口量级）       3 × 43 ≈ 129
+按诊断用 1.5s × ~50 packet/s 量级             ≈ 75
+demux 抖动 / Decode 重排 / 更高音频包率余量   取整到 256
+```
+
+因此：
+
+```text
+kStagingPerPadLimit = 256
+≈ 默认名义需求 68 的约 3.8 倍
+≈ 3s@43pps 需求 129 的约 2.0 倍
+```
+
+256 覆盖“默认 encoder 迟滞 + 常见 AAC 包率 + 一截安全余量”，不是“刚好 47”。触顶仍 ERROR，极端 skew 不靠无界内存硬扛。
+
+#### 全节点总顶
+
+```text
+kStagingTotalLimit = 512
+= 2 × kStagingPerPadLimit
+```
+
+含义：
+
+- 当前主验收拓扑是两路（video encoded + audio encoded）；总顶允许最坏时约两路同时接近单路上限，同时防止三路以上或异常双涨时内存按路数线性失控
+- 总顶与单路顶同时生效：任一先到即停止再 pull 该方向的新 Buffer；若此时仍无法写 Header/Packet，则 ERROR
+- 总顶**不是**“永远够用的产品 SLA”，而是有界失败边界；真要服务高码率多路/更长产品窗口，应另开字节预算或可配置 staging，而不是默默加大常数
+
+#### 与 Encode 私参的关系
+
+```text
+容量合同按默认 quality 迟滞成立
+私参/zerolatency 只会缩短 T_wait → 降低常规水位
+因此“以后上私参只会更宽松”以本节算式为前提，而不是口号
+```
+
+容量合同**不**依赖 encoder 一定 1～2 帧出首包；默认 medium 仍必须能过多路验收。
+
+### 明确否决
+
+- Demux 侧 multiqueue 作为 P0 唯一解（可作后续抖动优化，但不能替代 Mux 作为同步屏障 owner）
+- 无界临时队列
+- 仅扩大 Route 容量掩盖死锁
+- 把 Encode zerolatency / 私参接口当作唯一修复
+- 为提前齐套 Header 而发布残缺 Caps
+
+### 验收边界
+
+- 既有单测 `test_mux_waits_for_all_initial_caps` 与 `test_mux_orders_by_global_dts_when_inputs_arrive_out_of_order` 继续通过
+- 真实素材 `那天下雨了原版MV.mp4` 经 `transcode_to_flv libx264 30` 自然 EOS 完成；ffprobe 识别 AAC + H.264 1280x720，duration 约 3:10，ffplay 可播放
+- Encode 私参接口本轮不动，继续作为编码回环高延迟后续项；容量合同不依赖 encoder 一定 1～2 帧出首包

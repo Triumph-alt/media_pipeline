@@ -13,7 +13,7 @@ namespace pipeline {
 // ===================================================================
 // AVMuxNode: 基于 FFmpeg 的流式复用具体节点
 //
-// 首版只实现单视频 MPEG-TS。MuxNode 基类负责输入 Caps 汇合、全局 DTS 调度、
+// 首版支持单视频 MPEG-TS 与 FLV。MuxNode 基类负责输入 Caps 汇合、全局 DTS 调度、
 // CONTAINER Buffer 发布和 EOS；本类只把已排序的 encoded Buffer 写入 FFmpeg muxer。
 // 自定义 AVIO callback 仅复制临时容器字节到基类 pending 输出，不直接操作 Route。
 // ===================================================================
@@ -23,7 +23,7 @@ public:
         : MuxNode(name, format) {}
 
 private:
-    SinkPad* requestSinkPad(const std::string& name, MediaType hint_type) override;
+    bool acceptsInputPad(MuxFormat format, MediaType hint_type) const override;
 
     static int writeCallback(void* opaque, const uint8_t* data, int size);
 
@@ -38,6 +38,9 @@ private:
 
     AVFormatContext* fmt_ctx_ = nullptr;
     AVIOContext* avio_ctx_ = nullptr;
+    MuxFormat backend_format_ = MuxFormat::MPEGTS;
+    int64_t timestamp_origin_us_ = AV_NOPTS_VALUE;
+    int64_t last_dts_us_ = AV_NOPTS_VALUE;
 };
 
 } // namespace pipeline

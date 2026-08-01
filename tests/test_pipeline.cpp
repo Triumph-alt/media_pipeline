@@ -1506,6 +1506,109 @@ void test_mux_orders_by_global_dts_when_inputs_arrive_out_of_order() {
     printf(" OK\n");
 }
 
+// 视频永久不提供 initial Caps，音频持续向已配置路灌包，直到击穿 Mux 全节点
+// staging 硬顶。验证“满且无法前进 → 明确 ERROR”，而不是无限等待或静默丢包。
+void test_mux_errors_when_staging_full_waiting_for_initial_caps() {
+    printf("  test_mux_errors_when_staging_full_waiting_for_initial_caps...");
+    fflush(stdout);
+
+    // 超过 MuxNode 全节点 staging 硬顶 512；再留一点余量覆盖 Route handoff
+    constexpr int kAudioPackets = 600;
+
+    std::vector<QueueItem> audio_script;
+    audio_script.emplace_back(Event{makeEncodedAudioCaps()});
+    for (int index = 0; index < kAudioPackets; ++index) {
+        BufferRef packet = makeBuffer(MediaType::AUDIO_ENCODED, static_cast<uint8_t>(index & 0xff));
+        packet.mutableGet()->dts = static_cast<int64_t>(index) * 1000;
+        audio_script.emplace_back(std::move(packet));
+    }
+
+    Pipeline pipeline;
+    // 视频侧永不发布 Caps/Buffer/EOS，只等外部 stop；保证 Header 永远等不齐
+    auto* video = pipeline.addNode<CaptureScriptSource>("video", std::vector<QueueItem>{});
+    auto* audio = pipeline.addNode<CapsScriptProducer>("audio", std::move(audio_script));
+    auto* mux = pipeline.addNode<FakeMux>("mux");
+    auto* sink = pipeline.addNode<ContainerSink>("sink");
+    assert(pipeline.link(video, "out", mux, "video", MediaType::VIDEO_ENCODED));
+    assert(pipeline.link(audio, "out", mux, "audio", MediaType::AUDIO_ENCODED));
+    assert(pipeline.link(mux, "out_0", sink, "in", MediaType::CONTAINER));
+    assert(pipeline.build());
+    assert(pipeline.play());
+    pipeline.waitEOS();
+
+    const std::string error = pipeline.lastError();
+    assert(!error.empty());
+    assert(error.find("input staging full while waiting for initial Caps") != std::string::npos);
+    // Header 未建立，下游不应收到任何容器字节
+    assert(sink->received() == 0);
+    assert(mux->writtenDts().empty());
+    printf(" OK\n");
+}
+
+// Header 建立后，音频仅 3 个包就 EOS，但视频仍有大量更小/交错 DTS 的 packet 留在
+// staging。验证：音频 EOS 不会在其 staging 排空前越过尾包；全部 packet 按全局最小
+// DTS 写出；Trailer 只在两路都真正排空后出现。
+void test_mux_drains_staging_after_peer_eos_before_trailer() {
+    printf("  test_mux_drains_staging_after_peer_eos_before_trailer...");
+    fflush(stdout);
+
+    constexpr int kVideoPackets = 20;
+    constexpr int kAudioPackets = 3;
+    constexpr int kTotalPackets = kVideoPackets + kAudioPackets;
+
+    std::vector<QueueItem> video_script;
+    video_script.emplace_back(Event{makeEncodedVideoCaps()});
+    // 视频包 DTS：0,100,...,1900，覆盖并延伸到音频结束之后仍有待写项
+    for (int index = 0; index < kVideoPackets; ++index) {
+        BufferRef packet = makeBuffer(MediaType::VIDEO_ENCODED, static_cast<uint8_t>(index & 0xff));
+        packet.mutableGet()->dts = static_cast<int64_t>(index) * 100;
+        video_script.emplace_back(std::move(packet));
+    }
+
+    std::vector<QueueItem> audio_script;
+    audio_script.emplace_back(Event{makeEncodedAudioCaps()});
+    // 音频仅 3 包后自然 EOS；DTS 插在视频序列中间，迫使 EOS 时视频 staging 仍可能非空
+    for (int index = 0; index < kAudioPackets; ++index) {
+        BufferRef packet = makeBuffer(MediaType::AUDIO_ENCODED, static_cast<uint8_t>(0xa0 + index));
+        packet.mutableGet()->dts = 50 + static_cast<int64_t>(index) * 100;
+        audio_script.emplace_back(std::move(packet));
+    }
+
+    Pipeline pipeline;
+    auto* video = pipeline.addNode<CapsScriptProducer>("video", std::move(video_script));
+    auto* audio = pipeline.addNode<CapsScriptProducer>("audio", std::move(audio_script));
+    auto* mux = pipeline.addNode<FakeMux>("mux");
+    auto* sink = pipeline.addNode<ContainerSink>("sink");
+    assert(pipeline.link(video, "out", mux, "video", MediaType::VIDEO_ENCODED));
+    assert(pipeline.link(audio, "out", mux, "audio", MediaType::AUDIO_ENCODED));
+    assert(pipeline.link(mux, "out_0", sink, "in", MediaType::CONTAINER));
+    assert(pipeline.build());
+    assert(pipeline.play());
+    pipeline.waitEOS();
+
+    assert(pipeline.lastError().empty());
+    const std::vector<int64_t>& order = mux->writtenDts();
+    assert(static_cast<int>(order.size()) == kTotalPackets);
+
+    // 全局 DTS 必须严格单调非降：证明 peer EOS 后仍按完整候选集排序，没有提前踢路
+    for (size_t index = 1; index < order.size(); ++index) {
+        assert(order[index] >= order[index - 1]);
+    }
+
+    // 期望交织序列：0(v),50(a),100(v),150(a),200(v),250(a),300(v)...1900(v)
+    assert(order[0] == 0);
+    assert(order[1] == 50);
+    assert(order[2] == 100);
+    assert(order[3] == 150);
+    assert(order[4] == 200);
+    assert(order[5] == 250);
+    assert(order.back() == static_cast<int64_t>(kVideoPackets - 1) * 100);
+
+    // header + 全部 packet + trailer
+    assert(sink->received() == kTotalPackets + 2);
+    printf(" OK\n");
+}
+
 void test_pipeline_ready_failure_rolls_back() {
     printf("  test_pipeline_ready_failure_rolls_back...");
     fflush(stdout);
@@ -1578,6 +1681,8 @@ int main() {
     test_pipeline_forked_backpressure();
     test_mux_waits_for_all_initial_caps();
     test_mux_orders_by_global_dts_when_inputs_arrive_out_of_order();
+    test_mux_errors_when_staging_full_waiting_for_initial_caps();
+    test_mux_drains_staging_after_peer_eos_before_trailer();
     test_pipeline_ready_failure_rolls_back();
 
     printf("\n=== All Tests Passed ===\n");
