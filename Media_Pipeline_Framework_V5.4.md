@@ -2036,7 +2036,9 @@ media-pipeline/
 │   ├── v4l2_preview.cpp                   # V4L2Capture → VideoRender 真实预览
 │   ├── v4l2_encode_decode_preview.cpp     # V4L2Capture → Encode → Decode → VideoRender（x264/x265 回环与 ASAN 已验收）
 │   ├── v4l2_record_flv.cpp                # V4L2 → Encode → FLV → FileSink
+│   ├── v4l2_record_mpegts.cpp             # V4L2 → Encode → MPEG-TS → FileSink
 │   ├── transcode_to_flv.cpp               # 文件转码 FLV 自然 EOS（H.264 重编码 + AAC 旁路）
+│   ├── transcode_to_mpegts.cpp            # 文件转码 MPEG-TS 自然 EOS（H.264/HEVC 重编码 + AAC 旁路）
 │   ├── transcode_to_fmp4.cpp              # 文件转码 fMP4 自然 EOS（H.264/HEVC 重编码 + AAC 旁路）
 │   ├── v4l2_push_mpegts_tcp.cpp           # V4L2 → Encode → MPEG-TS → TcpSink
 │   ├── transcode_to_mpegts_tcp.cpp        # 文件转码 MPEG-TS/TCP 自然 EOS

@@ -264,7 +264,7 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 |---|---|
 | EncodeNode | 接收有序 VIDEO_RAW Caps，按 encoder 所需 pix_fmt/尺寸建立或重建 swscale 与 AVCodecContext；处理 send_frame/receive_packet、延迟 Packet flush；在首个 encoded Packet 前发布完整 VIDEO_ENCODED Caps（codec、尺寸、extradata 等） |
 | MuxNode / AVMuxNode | 已完成 MPEG-TS、FLV 与 fragmented MP4（`MuxFormat::MP4`）后端：视频 H.264/HEVC（FLV 仅 H.264），音频 AAC 旁路复用；custom AVIO、Header/Packet/Trailer、`av_write_frame()`、Packet 自有 payload、flags 和 session-relative PTS/DTS 均已落地。fMP4 固定 `movflags=frag_keyframe+empty_moov+default_base_moof`，并以未提交 AVIO tail + 有限 seek 完成 moof size 回填（已 commit 前缀不可改写）。`MuxNode` 以每路有界 staging + eager pull 持有等齐 Header/DTS 候选期的 encoded Buffer，在完整候选集上按全局最小 DTS 写入。多视频交织仍待后续 |
-| FileSinkNode | 已完成正式 CONTAINER 顺序文件 Sink：默认拒绝覆盖、显式安全覆盖、完整 partial write/EINTR、自然 EOS fsync、stop/回滚统一关闭；已用于 FLV 实时中断、单视频/多路自然 EOS，以及 fMP4 自然 EOS 验收 |
+| FileSinkNode | 已完成正式 CONTAINER 顺序文件 Sink：默认拒绝覆盖、显式安全覆盖、完整 partial write/EINTR、自然 EOS fsync、stop/回滚统一关闭；已用于 FLV/MPEG-TS 实时中断与自然 EOS，以及 fMP4 自然 EOS |
 | TcpSinkNode / 网络 Sink 首闭环 | 已完成与 FileSink 同构的顺序 CONTAINER TCP Sink：主动 Connect、非阻塞 send + poll 可取消、自然 EOS `shutdown(SHUT_WR)`、断连/写失败 ERROR；首闭环固定 `AVMux(MPEGTS) → TcpSink` |
 | 推流 Demo | `v4l2_push_mpegts_tcp`：`V4L2CaptureNode → EncodeNode → AVMux(MPEGTS) → TcpSink`；`transcode_to_mpegts_tcp`：有限文件自然 EOS 覆盖 trailer 与半关闭。RTMP/RTSP 与分叉预览不作为首闭环必要条件 |
 | 兼容性 | x86_64 静态 FFmpeg 已启用 `libx264` / `libx265`，并实际包含 FLV、MPEG-TS、MP4 muxer，RTMP/TCP/UDP/RTP/HTTP protocol 与 RTSP output muxer；`MPEG-TS/TCP` 首闭环不需重编。HTTPS/TLS/RTMPS 需独立选择 TLS 后端和许可证边界，当前不启用。后续不得将音频编码、传统 MP4 seek-back 输出或运行期 Header 重配混入首个网络 Sink 闭环；RTMP/RTSP 另案 |

@@ -21,9 +21,16 @@ target_link_libraries(v4l2_encode_decode_preview PRIVATE pipeline)
 add_executable(v4l2_record_flv v4l2_record_flv.cpp)
 target_link_libraries(v4l2_record_flv PRIVATE pipeline)
 
+add_executable(v4l2_record_mpegts v4l2_record_mpegts.cpp)
+target_link_libraries(v4l2_record_mpegts PRIVATE pipeline)
+
 # 有限文件自然 EOS 转码：覆盖 Encode flush、Mux trailer 和 FileSink fsync。
 add_executable(transcode_to_flv transcode_to_flv.cpp)
 target_link_libraries(transcode_to_flv PRIVATE pipeline)
+
+# 有限文件自然 EOS：H.264/HEVC 重编码 + AAC 旁路 → MPEG-TS → FileSink。
+add_executable(transcode_to_mpegts transcode_to_mpegts.cpp)
+target_link_libraries(transcode_to_mpegts PRIVATE pipeline)
 
 # 有限文件自然 EOS：H.264/HEVC 重编码 + AAC 旁路 → fMP4（MuxFormat::MP4）→ FileSink。
 add_executable(transcode_to_fmp4 transcode_to_fmp4.cpp)
