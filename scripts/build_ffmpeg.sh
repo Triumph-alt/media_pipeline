@@ -108,10 +108,14 @@ case "${ARCH}" in
             echo "错误: aarch64 交叉工具链不存在: ${CROSS_PREFIX}{gcc,g++}"
             exit 1
         fi
+        # 有 --cross-prefix 时 FFmpeg 默认找 ${cross_prefix}pkg-config
+        # /opt 工具链不带该包装，找不到会把 pkg_config 设成 false，x264/x265 必失败
+        # 显式用主机 pkg-config，配合下方 PKG_CONFIG_LIBDIR 读 aarch64 encoder 的 .pc
         CONFIGURE_ARGS+=(
             "--cross-prefix=${CROSS_PREFIX}"
             --arch=aarch64
             --target-os=linux
+            --pkg-config=pkg-config
         )
         ;;
     *)

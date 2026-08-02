@@ -231,9 +231,89 @@ bool VideoRenderNode::pollWindowCloseRequested() {
     return false;
 }
 
+bool VideoRenderNode::queryDisplayUsableSize(int* max_w, int* max_h) const {
+    if (!max_w || !max_h) {
+        return false;
+    }
+    *max_w = 0;
+    *max_h = 0;
+
+    // 优先主显示器；失败再退到 displays 列表首项
+    SDL_DisplayID display = SDL_GetPrimaryDisplay();
+    if (display == 0) {
+        int count = 0;
+        SDL_DisplayID* displays = SDL_GetDisplays(&count);
+        if (!displays || count <= 0) {
+            if (displays) {
+                SDL_free(displays);
+            }
+            return false;
+        }
+        display = displays[0];
+        SDL_free(displays);
+    }
+
+    SDL_Rect bounds{};
+    // usable 会去掉任务栏等占位；不可用时退回整屏 bounds
+    if (!SDL_GetDisplayUsableBounds(display, &bounds) &&
+        !SDL_GetDisplayBounds(display, &bounds)) {
+        return false;
+    }
+    if (bounds.w <= 0 || bounds.h <= 0) {
+        return false;
+    }
+    *max_w = bounds.w;
+    *max_h = bounds.h;
+    return true;
+}
+
+void VideoRenderNode::fitSizeToDisplay(int video_w, int video_h,
+                                       int* window_w, int* window_h) const {
+    if (!window_w || !window_h || video_w <= 0 || video_h <= 0) {
+        if (window_w) {
+            *window_w = 0;
+        }
+        if (window_h) {
+            *window_h = 0;
+        }
+        return;
+    }
+
+    // 未取到显示器上限时不限幅，保持与视频同尺寸（旧行为）
+    if (display_max_w_ <= 0 || display_max_h_ <= 0 ||
+        (video_w <= display_max_w_ && video_h <= display_max_h_)) {
+        *window_w = video_w;
+        *window_h = video_h;
+        return;
+    }
+
+    // 整数等比缩小：比较 video_w/max_w 与 video_h/max_h，取更紧的一边
+    // video_w * max_h > video_h * max_w  ⇔  宽边先触顶
+    if (static_cast<int64_t>(video_w) * display_max_h_ >
+        static_cast<int64_t>(video_h) * display_max_w_) {
+        *window_w = display_max_w_;
+        *window_h = static_cast<int>(
+            (static_cast<int64_t>(video_h) * display_max_w_) / video_w);
+    } else {
+        *window_h = display_max_h_;
+        *window_w = static_cast<int>(
+            (static_cast<int64_t>(video_w) * display_max_h_) / video_h);
+    }
+    if (*window_w < 1) {
+        *window_w = 1;
+    }
+    if (*window_h < 1) {
+        *window_h = 1;
+    }
+}
+
 bool VideoRenderNode::openRenderer() {
     rendered_frames_ = 0;
     dropped_frames_ = 0;
+    display_max_w_ = 0;
+    display_max_h_ = 0;
+    window_width_ = 0;
+    window_height_ = 0;
 
     traceStartupStage("sdl-init-begin");
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
@@ -247,14 +327,32 @@ bool VideoRenderNode::openRenderer() {
     fprintf(stderr, "[%s] SDL main thread according to SDL: %s\n",
             name_.c_str(), SDL_IsMainThread() ? "yes" : "no");
 
-    const int window_width = width_ > 0 ? width_ : 640;
-    const int window_height = height_ > 0 ? height_ : 360;
+    // VIDEO 初始化后再查显示器；失败只打日志，后续窗口不限幅
+    if (queryDisplayUsableSize(&display_max_w_, &display_max_h_)) {
+        fprintf(stderr, "[%s] display usable bounds: %dx%d\n",
+                name_.c_str(), display_max_w_, display_max_h_);
+    } else {
+        fprintf(stderr,
+                "[%s] display usable bounds unavailable (%s); window will follow video size\n",
+                name_.c_str(), SDL_GetError());
+        display_max_w_ = 0;
+        display_max_h_ = 0;
+    }
+
+    // 建窗时尚无 Caps；用占位尺寸，首帧 ensureTexture 再按视频+显示器适配
+    const int placeholder_w = 640;
+    const int placeholder_h = 360;
+    int window_width = 0;
+    int window_height = 0;
+    fitSizeToDisplay(placeholder_w, placeholder_h, &window_width, &window_height);
     traceStartupStage("window-create-begin");
     window_ = SDL_CreateWindow("Media Pipeline", window_width, window_height, 0);
     if (!window_) {
         return failRender(std::string("VideoRenderNode: SDL_CreateWindow failed: ") +
                           SDL_GetError());
     }
+    window_width_ = window_width;
+    window_height_ = window_height;
     traceStartupStage("window-create-end");
 
     traceStartupStage("renderer-create-begin");
@@ -282,6 +380,10 @@ void VideoRenderNode::closeRenderer() {
     }
     texture_width_ = 0;
     texture_height_ = 0;
+    display_max_w_ = 0;
+    display_max_h_ = 0;
+    window_width_ = 0;
+    window_height_ = 0;
 
     // 转换资源也只属于 VideoRender worker，须在该线程退出前释放
     releaseConversion();
@@ -301,23 +403,42 @@ void VideoRenderNode::closeRenderer() {
 }
 
 bool VideoRenderNode::ensureTexture(int width, int height) {
-    // 已有 Texture，宽高一致，不创建新的，直接复用
-    if (texture_ && texture_width_ == width && texture_height_ == height) {
+    // Texture 始终是视频原始宽高；窗口尺寸单独按显示器适配，二者解耦
+    int fitted_w = 0;
+    int fitted_h = 0;
+    fitSizeToDisplay(width, height, &fitted_w, &fitted_h);
+
+    const bool texture_ok =
+        texture_ && texture_width_ == width && texture_height_ == height;
+    const bool window_ok =
+        window_width_ == fitted_w && window_height_ == fitted_h;
+
+    if (texture_ok && window_ok) {
         return true;
     }
 
-    // 已有 Texture，但宽高不一致，销毁并重建
+    if (!window_ok) {
+        if (!SDL_SetWindowSize(static_cast<SDL_Window*>(window_), fitted_w, fitted_h)) {
+            return failRender(std::string("VideoRenderNode: SDL_SetWindowSize failed: ") +
+                              SDL_GetError());
+        }
+        window_width_ = fitted_w;
+        window_height_ = fitted_h;
+        fprintf(stderr, "[%s] window fit: video %dx%d -> window %dx%d (display max %dx%d)\n",
+                name_.c_str(), width, height, fitted_w, fitted_h,
+                display_max_w_, display_max_h_);
+    }
+
+    if (texture_ok) {
+        return true;
+    }
+
+    // 已有 Texture 但视频尺寸变了，销毁后按新尺寸重建
     if (texture_) {
         SDL_DestroyTexture(static_cast<SDL_Texture*>(texture_));
         texture_ = nullptr;
         texture_width_ = 0;
         texture_height_ = 0;
-    }
-
-    // 原本就没有 Texture，跳过销毁逻辑直接创建
-    if (!SDL_SetWindowSize(static_cast<SDL_Window*>(window_), width, height)) {
-        return failRender(std::string("VideoRenderNode: SDL_SetWindowSize failed: ") +
-                          SDL_GetError());
     }
 
     texture_ = SDL_CreateTexture(

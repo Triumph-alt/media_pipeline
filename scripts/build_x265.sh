@@ -49,7 +49,14 @@ case "${ARCH}" in
             echo "错误: aarch64 CMake 工具链文件不存在: ${TOOLCHAIN_FILE}"
             exit 1
         fi
-        CMAKE_ARGS+=("-DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_FILE}")
+        # /opt 交叉链是 GCC 11.4，不认 -march=armv9-a+…+sve2
+        # x265 运行时探测默认仍会编译 SVE2 汇编，需在配置期关掉
+        # Neon / DotProd / I8MM / SVE1 保留；板上无 SVE2 时本就不会走到那条路径
+        CMAKE_ARGS+=(
+            "-DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_FILE}"
+            -DENABLE_SVE2=OFF
+            -DENABLE_SVE2_BITPERM=OFF
+        )
         ;;
     *)
         echo "错误: 不支持的架构 '${ARCH}'"

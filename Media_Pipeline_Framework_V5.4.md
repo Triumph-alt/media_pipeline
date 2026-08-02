@@ -593,9 +593,11 @@ Buffer 必须在处理完成后才 ack；停止或处理失败时不 ack 当前 
 生命周期：
 - Ready 阶段不依赖上游 Caps，只保留空的格式状态；不初始化 SDL VIDEO，也不创建 Window、Renderer 或 Texture
 - Running 中收到 VIDEO_RAW Caps 时，校验完整 width/height/pix_fmt；YUV420P/YUVJ420P 按紧密平面直传 SDL IYUV，其他 CPU 可访问格式在本节点以 swscale 转为紧密 YUV420P。输入像素格式变化时重建转换 context/缓冲，只有尺寸变化才销毁 Texture，下一帧按新尺寸创建
+- **窗口默认适配显示器可用区域**：`SDL_InitSubSystem(SDL_INIT_VIDEO)` 成功后查询主显示器（失败则 displays 列表首项）的 `SDL_GetDisplayUsableBounds`，不可用时退回 `SDL_GetDisplayBounds`。Texture 始终保持视频原始宽高；窗口宽高取视频尺寸与可用区域的等比缩小结果，**只缩小不放大**。Present 时 `SDL_RenderTexture(..., nullptr, nullptr)` 由 SDL 将 Texture 缩放到当前窗口。查询失败时不伪造屏幕尺寸，窗口回退为与视频同尺寸。不要求应用层填写屏幕宽高；全屏、用户拖拽缩放与 letterbox 黑边策略不在本节点当前范围
 - 进入 Running 后，工作线程按如下顺序完成资源管理与渲染（`SDL_InitSubSystem(SDL_INIT_VIDEO)`）：
-  - SDL_Window / SDL_Renderer 创建
-  - 消费 VIDEO_RAW Buffer，创建或更新 SDL_Texture
+  - 查询显示器可用区域（可失败）
+  - SDL_Window / SDL_Renderer 创建（占位尺寸，首帧再按视频+显示器适配）
+  - 消费 VIDEO_RAW Buffer，创建或更新 SDL_Texture，并按适配结果 `SDL_SetWindowSize`
   - Update / Clear / Render / Present
   - 线程退出前销毁 Texture / Renderer / Window
   - SDL_QuitSubSystem(SDL_INIT_VIDEO)
@@ -1454,7 +1456,7 @@ VIDEO_RAW Caps → raw Buffer*
 VideoRender
 ```
 
-**VideoRenderNode** 在 Running 应用 Caps，忠实保存上游真实像素格式：YUV420P/YUVJ420P 直接上传 SDL IYUV，其他 CPU 可访问格式在该消费端通过 swscale 转为紧密 YUV420P。像素格式重配只替换转换资源，尺寸变化时再销毁旧 Texture，下一帧重建。SDL VIDEO/Window/Renderer/Texture 仍由 worker 持有完整生命周期。
+**VideoRenderNode** 在 Running 应用 Caps，忠实保存上游真实像素格式：YUV420P/YUVJ420P 直接上传 SDL IYUV，其他 CPU 可访问格式在该消费端通过 swscale 转为紧密 YUV420P。像素格式重配只替换转换资源，尺寸变化时再销毁旧 Texture，下一帧重建。窗口默认按主显示器可用区域等比缩小适配，Texture 保持视频原始宽高，Present 时缩放到窗口；不要求应用层填写屏幕尺寸。SDL VIDEO/Window/Renderer/Texture 仍由 worker 持有完整生命周期。
 
 **AudioPlayNode** 在 Ready 建立固定 canonical SDL 提交端：S16 packed、默认设备派生采样率、stereo FL/FR。Running 中每份 AudioRaw Caps 先排空旧 swr 的 canonical 尾部，再重建 `input → canonical` swr；不会清空 canonical SDL 队列，故背压、提交账本和 Clock 始终使用 canonical 帧量纲。
 

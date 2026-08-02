@@ -14,6 +14,8 @@ namespace pipeline {
 // SDL VIDEO、Window、Renderer、Texture 全部由节点 worker 创建、使用和销毁。
 // 视频格式由 Running Route 上的完整 CapsEvent 唯一描述；YUV420P/YUVJ420P 直传 SDL IYUV，
 // 其他 CPU 可访问格式由本节点在 SDL 提交前经 swscale 转为紧密 YUV420P。
+// 窗口默认适配当前显示器可用区域：Texture 保持视频原始宽高，窗口只缩小不放大，
+// Present 时由 SDL 等比缩放到窗口；不要求应用层填写屏幕尺寸。
 // ===================================================================
 class VideoRenderNode final : public SinkNode {
 public:
@@ -49,6 +51,10 @@ private:
     bool waitForPresentationTime(int64_t pts_us, int64_t duration_us);
     bool waitForStartupBarrier();
     void traceStartupStage(const char* stage);
+    // 查询主显示器可用区域；失败时不伪造屏幕尺寸，调用方回退为不限幅
+    bool queryDisplayUsableSize(int* max_w, int* max_h) const;
+    // 将视频宽高等比装入显示器上限，仅缩小不放大
+    void fitSizeToDisplay(int video_w, int video_h, int* window_w, int* window_h) const;
 
     int width_ = 0;
     int height_ = 0;
@@ -68,6 +74,11 @@ private:
     void* texture_ = nullptr;
     int texture_width_ = 0;
     int texture_height_ = 0;
+    // openRenderer 后记录的显示器可用宽高；0 表示未取到，窗口不限幅
+    int display_max_w_ = 0;
+    int display_max_h_ = 0;
+    int window_width_ = 0;
+    int window_height_ = 0;
     bool sdl_video_initialized_ = false;
 
     // 首帧在 Texture 上传后、SDL_RenderPresent 前到达本轮共同起跑栅栏。
