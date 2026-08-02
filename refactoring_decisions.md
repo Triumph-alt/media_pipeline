@@ -630,3 +630,29 @@ kStagingTotalLimit = 512
 - `transcode_to_mpegts_tcp` 自然 EOS：本机 listen 的 ffmpeg 收到可识别 MPEG-TS/H.264 并完整结束
 - `v4l2_push_mpegts_tcp` 实时推流可被 ffplay/ffmpeg 解码；SIGINT 有限时间回收
 - 普通 + ASAN `test_pipeline` 不退化
+
+---
+
+## AVMuxNode fragmented MP4 与未提交 AVIO tail
+
+### 决策
+
+- `MuxFormat::MP4` 固定表示 fragmented MP4，不新建节点；不做传统 final-moov seek-back MP4
+- 固定 `movflags=frag_keyframe+empty_moov+default_base_moof`
+- 视频 H.264/HEVC，音频 AAC；多路复用既有 Mux staging + 全局 DTS 调度
+- MPEG-TS / FLV 保持严格顺序 AVIO：`seekable=0`，write 立刻 `appendContainerBytes`
+- fMP4 启用节点自有未提交 AVIO tail + 有限 `seekCallback`：
+  - 逻辑字节流分为已 commit 前缀与 `[committed, end)` 的 tail
+  - write 只落入 tail；seek 仅允许在 tail 内（含 `AVSEEK_SIZE`）
+  - 禁止 seek/write 进入已 commit 前缀；禁止在逻辑 EOF 后制造稀疏空洞
+  - 仅当写指针 `pos == end` 时才把整段 tail 顺序 `appendContainerBytes` 并推进 commit
+  - Header / Packet / Trailer 在 `avio_flush` 后按上述条件尝试 commit
+- 设计动机：FFmpeg mp4 muxer 写 fragment 时先把 moof/traf size 写成 0，再 seek 回填；大 moof 超过 AVIO 内部小缓冲后，若 size=0 头部已被顺序提交，则无法回填，ISO 下 size=0 表示 box 延伸到 EOF
+
+### 明确否决
+
+- 仅靠无限增大 `kAvioBufferSize` 掩盖大 moof（高码率/长 GOP 仍可能超过任意固定缓冲）
+- 把 tail seek 推广为传统整文件 moov 回写
+- 允许改写已进入 pending / Route / FileSink 的前缀
+- 在 AVIO callback 内 publish Route 或发送 EOS
+- 以短素材单小 fragment“碰巧可解码”单独作为 fMP4 完成判据

@@ -866,7 +866,7 @@ AVMuxNode(std::string name, MuxFormat format)
     : MuxNode(std::move(name), format) {}
 ```
 
-`format_` 是基类中的 `const MuxFormat`，不存在 `setFormat()`，也不向框架使用者暴露 FFmpeg muxer 字符串。首版 `AVMuxNode` 已映射 `MPEGTS → "mpegts"`；FLV 和 fMP4 的映射与对应后端选项属于后续步骤。
+`format_` 是基类中的 `const MuxFormat`，不存在 `setFormat()`，也不向框架使用者暴露 FFmpeg muxer 字符串。`AVMuxNode` 将格式映射为 `MPEGTS → "mpegts"`、`FLV → "flv"`、`MP4 → "mp4"`；其中 `MP4` 在项目中固定为 fMP4，由 `movflags` 强制，而不是传统 seek-back MP4。
 
 #### 5.6.2 MuxNode 抽象基类（当前正式骨架）
 
@@ -953,15 +953,28 @@ eos_pads_.size() == sink_pads_.size()
 - Pad、Caps、无有效输入、缺少输出连接等框架错误由 `MuxNode` 上报；
 - 抽象基类看到格式钩子失败时只退出或触发 Ready 回滚，不重复发送泛化错误。
 
-#### 5.6.5 AVMuxNode（MPEG-TS 与 FLV 后端）
+#### 5.6.5 AVMuxNode（MPEG-TS、FLV 与 fMP4 后端）
 
-`AVMuxNode` 是 `MuxNode` 的 FFmpeg 具体后端，当前只接受一条 `VIDEO_ENCODED` 输入：`MuxFormat::MPEGTS` 支持 H.264/HEVC，`MuxFormat::FLV` 首版只支持 H.264；音频、第二路视频和 fragmented MP4 在对应边界明确拒绝。
+`AVMuxNode` 是 `MuxNode` 的 FFmpeg 具体后端，以构造期不可变 `MuxFormat` 选择容器后端：
 
-`allocateContext()` 将 `MPEGTS → "mpegts"`、`FLV → "flv"`，分配自定义只写 `AVIOContext` 并设置 `AVFMT_FLAG_CUSTOM_IO`。callback 只通过 `appendContainerBytes()` 深拷贝 FFmpeg 临时字节至基类 `pending_output_`，不直接 publish 框架 Route。`addStream()` 要求完整 video Caps 的 codec_id、正 width/height 和非空 extradata；它将 extradata 以 `av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE)` 深拷贝给 `AVCodecParameters`，先设 `AVStream::time_base = {1, 1000000}`。
+| 格式 | 视频 | 音频 | 输出合同要点 |
+|---|---|---|---|
+| `MPEGTS` | H.264 / HEVC | AAC | 严格顺序 AVIO，无 seek |
+| `FLV` | 仅 H.264 | AAC | `flvflags=no_duration_filesize`，禁止 Trailer 回写 Header 时长/大小 |
+| `MP4` | H.264 / HEVC | AAC | 固定 fMP4；`movflags=frag_keyframe+empty_moov+default_base_moof`；未提交 AVIO tail + 有限 seek |
 
-Header、每个 Packet 与 Trailer 后均调用 `avio_flush()` 并检查 `avio_ctx_->error`，使基类随后能在正确的 `CONTAINER Caps → Header / Packet / Trailer bytes → EOS` 边界发布 pending 字节。Packet 由 `av_new_packet()` 分配 FFmpeg 自有、带 padding 的 payload 后从框架 Buffer 深拷贝，恢复 `EncodedMeta::flags`。Mux session 以首个有效 DTS 作为时间轴 origin，将框架 absolute monotonic PTS/DTS 归一化为容器相对时间，同时保持 PTS−DTS 重排偏移、duration 和后续间隔，并拒绝 DTS 回退；随后按 Header 后 muxer 确认的 stream time_base 重标定。由于 `MuxNode` 已是唯一 DTS 调度 owner，后端调用 `av_write_frame()`，不调用会建立 libavformat 通用重排队列的 `av_interleaved_write_frame()`。
+多路 encoded 输入由基类 staging 与全局 DTS 调度汇合。不支持的 codec、非法尺寸/采样率/声道布局或空 extradata 在 `addStream()` 明确 ERROR。同类型多 Track 与多视频交织仍属后续限制。
 
-`closeContext()` 支持部分初始化：解除 `fmt_ctx_->pb`，释放当前 `avio_ctx_->buffer`、`avio_context_free()`，再 `avformat_free_context()`。FLV 已通过 FileSink 两类真实链路验证；MPEG-TS 已通过 `TcpSinkNode` 的自然 EOS 与实时推流路径验收容器字节可被 ffmpeg/ffplay 识别解码。
+`allocateContext()` 按上表映射 FFmpeg muxer 名，分配自定义 `AVIOContext` 并设置 `AVFMT_FLAG_CUSTOM_IO`。callback 不直接 publish 框架 Route，只把容器字节交给节点侧缓冲合同：
+
+- **MPEG-TS / FLV**：write 回调立刻 `appendContainerBytes()` 深拷贝到基类 `pending_output_`；`seekable = 0`，不提供 seek 回调。
+- **fMP4**：write 回调先写入节点自有**未提交 AVIO tail**；提供有限 `seekCallback`，只允许在尚未 commit 的逻辑区间内定位与回写。已进入 pending / Route / 下游 Sink 的前缀禁止改写；也不在逻辑 EOF 之后制造稀疏空洞。`flushAvio()` 在 `avio_flush` 之后仅当写指针回到逻辑末尾时，才把整段 tail `appendContainerBytes` 并推进 commit 游标。该模型只覆盖 fragment 元数据在放出前必须完成的 size 回填（muxer 常先写 moof/traf size=0 再回填），不是传统 final-moov 整文件回写，也不把 CONTAINER Sink 变成可随机访问文件。大 fragment 的 moof 可超过 AVIO 内部小缓冲；若无 tail 而把 size=0 头部立刻提交，ISO 下 size=0 表示 box 延伸到文件末尾，会污染后续结构。
+
+`addStream()` 对视频要求 codec_id（H.264/HEVC，FLV 仅 H.264）、正 width/height 和非空 extradata；对音频要求 AAC、正 sample_rate、有效 channel layout 和非空 extradata。extradata 以 `av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE)` 深拷贝给 `AVCodecParameters`，并先设 `AVStream::time_base = {1, 1000000}`。
+
+Header、每个 Packet 与 Trailer 后均调用 `avio_flush()` 并检查 `avio_ctx_->error`，fMP4 路径再按上述条件 commit tail，使基类能在 `CONTAINER Caps → Header / Packet / Trailer bytes → EOS` 边界发布 pending 字节。Packet 由 `av_new_packet()` 分配 FFmpeg 自有、带 padding 的 payload 后从框架 Buffer 深拷贝，恢复 `EncodedMeta::flags`（含 keyframe，供 `frag_keyframe` 切 fragment）。Mux session 以首个有效 DTS 作为时间轴 origin，将框架 absolute monotonic PTS/DTS 归一化为容器相对时间，同时保持 PTS−DTS 重排偏移、duration 和后续间隔，并拒绝 DTS 回退；随后按 Header 后 muxer 确认的 stream time_base 重标定。由于 `MuxNode` 是唯一 DTS 调度 owner，后端调用 `av_write_frame()`，不调用会建立 libavformat 通用重排队列的 `av_interleaved_write_frame()`。
+
+`closeContext()` 支持部分初始化：解除 `fmt_ctx_->pb`，释放当前 `avio_ctx_->buffer`、`avio_context_free()`，再 `avformat_free_context()`，并清空 fMP4 tail 状态。
 
 #### 5.6.6 FileSinkNode 与文件验收边界
 
@@ -1976,8 +1989,8 @@ Pipeline::waitEOS
 8. **编码回环高延迟**：真实 `V4L2CaptureNode → EncodeNode(libx264) → DecodeNode → VideoRenderNode` 回环能稳定出画，但端到端延迟很高，已用分段延迟探针（`PIPELINE_LATENCY_TRACE=1`，默认关闭）定位到两个相互独立、会叠加的原因。其一，`EncodeConfig` 目前只有 `codec_name`/`framerate`，`avcodec_open2()` 不传任何 encoder 私有选项，x264 因而落在默认 `medium` 预设，`rc_lookahead=40`/`bframes=3` 形成约 47 帧、3.2 秒量级的固定内部缓存；实测 `preset=veryfast`+`tune=zerolatency` 可完全消除该缓存，但 EncodeNode 当前没有暴露任何编码器私有参数配置接口，也还没设计好这个接口该长什么样（显式字段还是通用键值对透传）；当前虚拟化环境干扰因素较多，暂不适合专门设计和实现，先记账。其二，`SDL_CreateRenderer("software")` 在当前 VMware/X11/Mesa 环境下经 `strace` 证实稳定耗时约 1.8–2.5 秒（卡在一次 DRI3 fd 传递的 `poll()`），期间 decoded RAW Route 等可靠队列填满并把背压一路传导回采集端，形成第二段与首段量级相当的固定延迟；已确认与 Pipeline 线程模型无关，但尚无目标板/原生 Linux 对照数据，不能把 VMware 数字泛化为框架架构成本，需要真实设备复验后再决定是否调整 VideoRender 的启动/消费策略。两个原因目前都不具备立即修的条件，待真实嵌入式设备或原生 PC 环境测过之后再看效果、再决定优先级。
 9. **媒体兼容性剩余边界**：Packet side data（例如 DISPLAYMATRIX、HDR/动态 metadata）当前仍在 Packet→Buffer 转换时丢弃，未接入 CapsEvent：目前没有消费端，尤其 VideoRender 没有旋转/HDR 应用路径。若素材来源出现手机直拍等必须按旋转矩阵显示的竖版视频，再单独确定“CapsEvent 的 rotation 字段 + Render 应用”设计；不得预先将所有逐 Packet side data 伪装为流级 Caps。色彩空间/HDR 的显式协商也仍待具体消费端语义确定。`libx265` 真实设备回环与 ASAN 端到端验收已完成（见桌面 `EncodeNode_x265_ASAN真实验收记录.md`）。
 10. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
-11. **Demux/Mux 与网络输出边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`。动态 Mux 输出 Pad、多视频交织、fragmented MP4 仍待实现。顺序 `CONTAINER` 网络输出已落地 `TcpSinkNode`（MPEG-TS/TCP Connect 首闭环）；RTMP、RTSP Server/客户端、TCP Listen 模式和 FFmpeg URL 输出 interrupt callback 仍待独立方案。HTTPS、TLS、RTMPS 尚未启用：它们需要 TLS 后端；当前 OpenSSL 3 与 GPL x264/x265 组合还需 `--enable-version3`，涉及单独的发布许可证决策，不能在未明确需求时擅自引入。不能用 FLV 文件路径替代 RTMP 会话合同，也不能把 CONTAINER 字节伪装成 RTP 包。
-12. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4；需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
+11. **Demux/Mux 与网络输出边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`。动态 Mux 输出 Pad 与多视频交织仍待实现。RTMP、RTSP Server/客户端、TCP Listen 模式和 FFmpeg URL 输出 interrupt callback 仍待独立方案。HTTPS、TLS、RTMPS 尚未启用：它们需要 TLS 后端；当前 OpenSSL 3 与 GPL x264/x265 组合还需 `--enable-version3`，涉及单独的发布许可证决策，不能在未明确需求时擅自引入。不能用 FLV 文件路径替代 RTMP 会话合同，也不能把 CONTAINER 字节伪装成 RTP 包。
+12. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4，其 AVIO 合同见 §5.6.5（未提交 tail 内的 fragment 元数据回写，不是整文件 moov 回写）。需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
 13. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
 14. **第三方 GUI LeakSanitizer 基线**：当前 Linux/X11 环境的 SDL3 2D software renderer 在 window surface 呈现时会内部尝试 GPU texture framebuffer，加载 Mesa/GLX；即使独立最小程序完整销毁 Texture、Renderer、Window，退出 VIDEO 并调用 `SDL_Quit()`，LeakSanitizer 仍报告 Mesa/GLX 约 1464B/16 allocations。强制直接 X11 framebuffer 可避免 Mesa 报告，但会出现约 33066B/572 allocations 的 X11/XKB 报告。两者均可由独立 SDL 最小程序复现，不属于 Pipeline、Buffer、Route 或节点资源泄漏；不为消除报告而改 renderer/backend。player 的 LeakSanitizer 验证应将该 Mesa/GLX 基线与项目自身泄漏区分，框架单测仍无 suppression 严格运行。
 15. SDL_GetAudioDeviceFormat 查询已打开设备偶发返回空错误失败,而当前它被当硬 ERROR 直接毙掉整个 Ready。将来或可对这个查询加一次重试/容忍,但现在按硬失败处理也说得过去,先不动。
@@ -2023,7 +2036,8 @@ media-pipeline/
 │   ├── v4l2_preview.cpp                   # V4L2Capture → VideoRender 真实预览
 │   ├── v4l2_encode_decode_preview.cpp     # V4L2Capture → Encode → Decode → VideoRender（x264/x265 回环与 ASAN 已验收）
 │   ├── v4l2_record_flv.cpp                # V4L2 → Encode → FLV → FileSink
-│   ├── transcode_to_flv.cpp               # 文件转码 FLV 自然 EOS
+│   ├── transcode_to_flv.cpp               # 文件转码 FLV 自然 EOS（H.264 重编码 + AAC 旁路）
+│   ├── transcode_to_fmp4.cpp              # 文件转码 fMP4 自然 EOS（H.264/HEVC 重编码 + AAC 旁路）
 │   ├── v4l2_push_mpegts_tcp.cpp           # V4L2 → Encode → MPEG-TS → TcpSink
 │   ├── transcode_to_mpegts_tcp.cpp        # 文件转码 MPEG-TS/TCP 自然 EOS
 │   ├── recorder.cpp                       # 采集录制

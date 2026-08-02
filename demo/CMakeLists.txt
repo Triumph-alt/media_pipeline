@@ -25,6 +25,10 @@ target_link_libraries(v4l2_record_flv PRIVATE pipeline)
 add_executable(transcode_to_flv transcode_to_flv.cpp)
 target_link_libraries(transcode_to_flv PRIVATE pipeline)
 
+# 有限文件自然 EOS：H.264/HEVC 重编码 + AAC 旁路 → fMP4（MuxFormat::MP4）→ FileSink。
+add_executable(transcode_to_fmp4 transcode_to_fmp4.cpp)
+target_link_libraries(transcode_to_fmp4 PRIVATE pipeline)
+
 # 实时采集 MPEG-TS/TCP 推流：SIGINT 强制 stop，不承诺 Mux trailer。
 add_executable(v4l2_push_mpegts_tcp v4l2_push_mpegts_tcp.cpp)
 target_link_libraries(v4l2_push_mpegts_tcp PRIVATE pipeline)

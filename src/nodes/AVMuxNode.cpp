@@ -41,14 +41,132 @@ bool AVMuxNode::acceptsInputPad(MuxFormat format, MediaType hint_type) const {
     switch (format) {
         case MuxFormat::MPEGTS:
         case MuxFormat::FLV:
+        case MuxFormat::MP4:
             // 容器实例可服务任意数量 encoded 输入；视频/音频 codec 兼容性和 stream 参数
             // 在各 Pad 首份完整 Caps 到达时由 addStream() 做格式相关验证
+            // MuxFormat::MP4 固定 fMP4：视频 H.264/HEVC，音频 AAC
             return true;
-        case MuxFormat::MP4:
-            // fragmented MP4 后端尚未实现，link 阶段直接拒绝任何输入
-            return false;
     }
     return false;
+}
+
+void AVMuxNode::resetAvioTail() {
+    avio_tail_seek_enabled_ = false;
+    avio_committed_ = 0;
+    avio_pos_ = 0;
+    avio_end_ = 0;
+    avio_tail_.clear();
+}
+
+int AVMuxNode::writeAvioTail(const uint8_t* data, int size) {
+    if (size < 0 || (size > 0 && !data)) {
+        return AVERROR(EINVAL);
+    }
+    if (size == 0) {
+        return 0;
+    }
+    if (avio_pos_ < avio_committed_) {
+        // 已交给 pending/Route 的前缀不能再改；说明 commit 过早或 seek 越界
+        postMessage(MessageType::ERROR,
+                    "AVMuxNode: fMP4 AVIO attempted to rewrite committed container prefix");
+        return AVERROR(ESPIPE);
+    }
+
+    // 把绝对位置转化成 tail 内下标
+    const int64_t offset_in_tail = avio_pos_ - avio_committed_;
+    if (offset_in_tail > static_cast<int64_t>(avio_tail_.size())) {
+        postMessage(MessageType::ERROR, "AVMuxNode: fMP4 AVIO write position past tail end");
+        return AVERROR(EINVAL);
+    }
+
+    // 需要的 tail 容量
+    const int64_t need = offset_in_tail + static_cast<int64_t>(size);
+    if (need < 0 || need > static_cast<int64_t>(avio_tail_.max_size())) {
+        postMessage(MessageType::ERROR, "AVMuxNode: fMP4 AVIO tail size overflow");
+        return AVERROR(EINVAL);
+    }
+    if (need > static_cast<int64_t>(avio_tail_.size())) {
+        avio_tail_.resize(static_cast<size_t>(need));
+    }
+
+    // FFmpeg 只在本 callback 期间拥有 data，立刻落入节点自有 tail
+    std::memcpy(avio_tail_.data() + static_cast<size_t>(offset_in_tail), data,
+                static_cast<size_t>(size));
+    avio_pos_ += size;
+    if (avio_pos_ > avio_end_) {
+        avio_end_ = avio_pos_;
+    }
+    // tail 逻辑长度始终覆盖 [committed, end)
+    if (avio_end_ - avio_committed_ != static_cast<int64_t>(avio_tail_.size())) {
+        // 允许在 end 之前覆写；若 write 扩展了 end，size 已在上方 resize
+        // 若 seek 回写未延伸 end，保持 tail.size 与 end-committed 一致
+        const int64_t tail_len = avio_end_ - avio_committed_;
+        if (tail_len >= 0 && tail_len != static_cast<int64_t>(avio_tail_.size())) {
+            avio_tail_.resize(static_cast<size_t>(tail_len));
+        }
+    }
+    return size;
+}
+
+int64_t AVMuxNode::seekAvioTail(int64_t offset, int whence) {
+    if (whence == AVSEEK_SIZE) {
+        return avio_end_;
+    }
+
+    int64_t target = 0;
+    switch (whence) {
+        case SEEK_SET:
+            target = offset;
+            break;
+        case SEEK_CUR:
+            target = avio_pos_ + offset;
+            break;
+        case SEEK_END:
+            target = avio_end_ + offset;
+            break;
+        default:
+            return AVERROR(EINVAL);
+    }
+
+    if (target < 0) {
+        return AVERROR(EINVAL);
+    }
+    if (target < avio_committed_) {
+        // 不能 seek 到已 commit 前缀；fMP4 只应回写当前未提交 fragment 元数据
+        postMessage(MessageType::ERROR,
+                    "AVMuxNode: fMP4 AVIO seek into committed container prefix");
+        return AVERROR(ESPIPE);
+    }
+    if (target > avio_end_) {
+        // 不支持在逻辑 EOF 之后制造稀疏空洞
+        postMessage(MessageType::ERROR,
+                    "AVMuxNode: fMP4 AVIO seek past current logical end");
+        return AVERROR(EINVAL);
+    }
+
+    avio_pos_ = target;
+    return avio_pos_;
+}
+
+bool AVMuxNode::commitAvioTail() {
+    if (!avio_tail_seek_enabled_) {
+        return true;
+    }
+    if (avio_pos_ != avio_end_) {
+        // 仍停在 tail 中部时不能提交，否则后续 size 回填会打到已发出的前缀
+        return true;
+    }
+    if (avio_tail_.empty()) {
+        return true;
+    }
+
+    // 游标在逻辑末尾：此前 fragment 的 moof size 回填已完成，整段 tail 可顺序放出
+    if (!appendContainerBytes(avio_tail_.data(), avio_tail_.size())) {
+        return false;
+    }
+    avio_committed_ += static_cast<int64_t>(avio_tail_.size());
+    avio_tail_.clear();
+    return true;
 }
 
 int AVMuxNode::writeCallback(void* opaque, const uint8_t* data, int size) {
@@ -60,10 +178,22 @@ int AVMuxNode::writeCallback(void* opaque, const uint8_t* data, int size) {
         return 0;
     }
 
-    // FFmpeg 只在本 callback 的调用期间拥有 data，必须立刻深拷贝到基类 pending 输出
+    if (self->avio_tail_seek_enabled_) {
+        return self->writeAvioTail(data, size);
+    }
+
+    // MPEG-TS/FLV：FFmpeg 只在本 callback 期间拥有 data，必须立刻深拷贝到基类 pending
     return self->appendContainerBytes(data, static_cast<size_t>(size))
         ? size
         : AVERROR_EXTERNAL;
+}
+
+int64_t AVMuxNode::seekCallback(void* opaque, int64_t offset, int whence) {
+    auto* self = static_cast<AVMuxNode*>(opaque);
+    if (!self || !self->avio_tail_seek_enabled_) {
+        return AVERROR(ESPIPE);
+    }
+    return self->seekAvioTail(offset, whence);
 }
 
 bool AVMuxNode::allocateContext(MuxFormat format) {
@@ -76,9 +206,9 @@ bool AVMuxNode::allocateContext(MuxFormat format) {
             muxer_name = "flv";
             break;
         case MuxFormat::MP4:
-            postMessage(MessageType::ERROR,
-                        "AVMuxNode: fragmented MP4 is not implemented yet");
-            return false;
+            // 项目中 MP4 固定表示 fragmented MP4；muxer 字符串仍为 "mp4"，由 movflags 强制 fMP4
+            muxer_name = "mp4";
+            break;
     }
 
     int result = avformat_alloc_output_context2(&fmt_ctx_, nullptr, muxer_name, nullptr);
@@ -95,12 +225,24 @@ bool AVMuxNode::allocateContext(MuxFormat format) {
         return false;
     }
 
-    avio_ctx_ = avio_alloc_context(avio_buffer, kAvioBufferSize, 1, this,
-                                   nullptr, &AVMuxNode::writeCallback, nullptr);
+    resetAvioTail();
+    // fMP4 需要 seek 回填 moof/traf size；其它格式保持无 seek 顺序写出
+    const bool enable_tail_seek = (format == MuxFormat::MP4);
+    avio_ctx_ = avio_alloc_context(
+        avio_buffer, kAvioBufferSize, 1, this, nullptr, &AVMuxNode::writeCallback,
+        enable_tail_seek ? &AVMuxNode::seekCallback : nullptr);
     if (!avio_ctx_) {
         av_free(avio_buffer);
         postMessage(MessageType::ERROR, "AVMuxNode: avio_alloc_context failed");
         return false;
+    }
+
+    if (enable_tail_seek) {
+        // 仅声明对未 commit tail 可 seek；已发出的 CONTAINER 前缀仍不可改
+        avio_ctx_->seekable = AVIO_SEEKABLE_NORMAL;
+        avio_tail_seek_enabled_ = true;
+    } else {
+        avio_ctx_->seekable = 0;
     }
 
     // 自定义 AVIO 由节点回收，FFmpeg 不得在 avformat_free_context 中关闭或释放它
@@ -148,7 +290,9 @@ bool AVMuxNode::addStream(const CapsEvent& caps, int* stream_index) {
                         "AVMuxNode: FLV accepts only H.264 video input");
             return false;
         }
+        // MPEG-TS / fMP4 视频均接受 H.264 与 HEVC；尺寸与 extradata 已在上方校验
     } else {
+        // FLV 与 fMP4 音频均要求 AAC；MPEG-TS 当前同样只声明 AAC 兼容性
         if (caps.codec_id != AV_CODEC_ID_AAC || caps.sample_rate <= 0 ||
             !caps.channel_layout.isValid()) {
             postMessage(MessageType::ERROR,
@@ -209,11 +353,12 @@ bool AVMuxNode::flushAvio() {
                     avio_ctx_->error);
         return false;
     }
-    return true;
+    // fMP4：仅在逻辑写指针回到末尾时提交 tail，保证 moof size 回填已落在未提交区
+    return commitAvioTail();
 }
 
 bool AVMuxNode::writeHeader(MuxFormat format) {
-    if ((format != MuxFormat::MPEGTS && format != MuxFormat::FLV) ||
+    if ((format != MuxFormat::MPEGTS && format != MuxFormat::FLV && format != MuxFormat::MP4) ||
         format != backend_format_ || !fmt_ctx_) {
         postMessage(MessageType::ERROR,
                     "AVMuxNode: output context is unavailable or does not match header format");
@@ -224,6 +369,11 @@ bool AVMuxNode::writeHeader(MuxFormat format) {
     if (format == MuxFormat::FLV) {
         // custom AVIO 是严格顺序输出，不能让 FLV muxer 在 Trailer 时 seek 回 Header 更新时长/文件大小
         av_dict_set(&options, "flvflags", "no_duration_filesize", 0);
+    } else if (format == MuxFormat::MP4) {
+        // empty_moov 先发可流式 moov；frag_keyframe 按关键帧切 fragment
+        // default_base_moof 让 sample 偏移相对 moof，避免依赖全局绝对文件偏移回写
+        av_dict_set(&options, "movflags",
+                    "frag_keyframe+empty_moov+default_base_moof", 0);
     }
     const int result = avformat_write_header(fmt_ctx_, &options);
     av_dict_free(&options);
@@ -344,6 +494,7 @@ void AVMuxNode::closeContext() {
         avformat_free_context(fmt_ctx_);
         fmt_ctx_ = nullptr;
     }
+    resetAvioTail();
 }
 
 } // namespace pipeline
