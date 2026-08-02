@@ -50,7 +50,6 @@ private:
     // 返回 true 表示当前帧应呈现；返回 false 表示当前帧应跳过或等待被 stop 打断。
     bool waitForPresentationTime(int64_t pts_us, int64_t duration_us);
     bool waitForStartupBarrier();
-    void traceStartupStage(const char* stage);
     // 查询主显示器可用区域；失败时不伪造屏幕尺寸，调用方回退为不限幅
     bool queryDisplayUsableSize(int* max_w, int* max_h) const;
     // 将视频宽高等比装入显示器上限，仅缩小不放大
@@ -87,9 +86,6 @@ private:
 
     int rendered_frames_ = 0;
     int dropped_frames_ = 0;
-    uint64_t received_frames_ = 0;
-    int64_t startup_trace_origin_us_ = 0;
-    int64_t startup_trace_previous_us_ = 0;
 };
 
 } // namespace pipeline

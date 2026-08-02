@@ -243,12 +243,12 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 ### 验收标准
 
 - [x] SourceNode 能在同一 Route 上可靠发布 `CapsEvent → Buffer*`，Buffer 不会越过 active Caps，采集 Source 不生成自然 EOS；普通 Source/Transform 的首个输出能力仅能在具体类构造期声明，分叉、Route 背压、cancel/stop 语义保持成立（普通与 ASAN 单测通过）
-- [ ] V4L2CaptureNode 能打开指定设备并协商、发布与实际 DQBUF 图像一致的 VIDEO_RAW Caps
-- [ ] `V4L2CaptureNode → VideoRenderNode` 在真实设备上持续预览；YUV420P 直传，其他 CPU 可访问协商格式经现有 swscale 正确显示
-- [ ] 采集帧在拷贝后立即归还 V4L2 driver buffer；持续预览期间无驱动 Buffer 耗尽、框架内存单调增长或 Buffer 所有权错误
-- [ ] SIGINT、窗口关闭、外部 `Pipeline::stop()` 都能取消阻塞 DQBUF/Route 等待、join 全部线程并正常退出
-- [ ] 单元测试和真实设备路径分别完成 ASAN 验证；真实 GUI 的 Mesa/Gallium 基线与项目自身错误分开报告
-- [ ] x86_64 通过；aarch64 仅在存在目标板与 V4L2 设备时验收
+- [x] V4L2CaptureNode 能打开指定设备并协商、发布与实际 DQBUF 图像一致的 VIDEO_RAW Caps（VMware 与 aarch64 目标板真实设备均已验证：`vcap ready` 日志显示协商 width/height/pixelformat/framerate 与实际 DQBUF 一致）
+- [x] `V4L2CaptureNode → VideoRenderNode` 在真实设备上持续预览；YUV420P 直传，其他 CPU 可访问协商格式经现有 swscale 正确显示（aarch64 目标板 YUYV 输入经 swscale 转 IYUV 出画确认；同板编码回环 Decode 输出直传 YUV420P 出画确认）
+- [ ] 采集帧在拷贝后立即归还 V4L2 driver buffer；持续预览期间无驱动 Buffer 耗尽、框架内存单调增长或 Buffer 所有权错误（当前仅验证短时运行不报错，未做长时间运行的内存增长专项观测）
+- [ ] SIGINT、窗口关闭、外部 `Pipeline::stop()` 都能取消阻塞 DQBUF/Route 等待、join 全部线程并正常退出（aarch64 现有 trace 日志在数据流中段截断，无“interrupted”等正常退出标记，不能作为取消路径验证证据；需专门补跑）
+- [ ] 单元测试和真实设备路径分别完成 ASAN 验证；真实 GUI 的 Mesa/Gallium 基线与项目自身错误分开报告（aarch64 目标板真实设备路径尚未跑过 ASAN 构建；已有 aarch64 trace 均为普通构建）
+- [ ] x86_64 通过；aarch64 已具备目标板与 V4L2 设备，Caps 协商与出画路径已复验，但取消行为、长时间运行与 ASAN 路径仍待补充（真机结论见框架文档 §13）
 
 ---
 
@@ -271,12 +271,12 @@ set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 
 ### 验收标准
 
-- [ ] EncodeNode 对第四阶段协商出的固定 RAW 视频格式稳定输出 H.264 或 H.265；输出 Packet 可由 ffprobe/ffmpeg 解码，PTS/DTS 合法，EOS 后延迟 Packet 完整输出
+- [x] EncodeNode 对第四阶段协商出的固定 RAW 视频格式稳定输出 H.264 或 H.265；输出 Packet 可由 ffprobe/ffmpeg 解码，PTS/DTS 合法，EOS 后延迟 Packet 完整输出（x86_64 上 `transcode_to_flv`/`transcode_to_mpegts`/`transcode_to_fmp4` 系列 demo 已反复验证输出 H.264 Packet 可被 ffprobe/ffmpeg 正确解码；此项由既有 x86_64 验收满足，非本次 aarch64 真机新增证据）
 - [x] AVMuxNode 已完成 MPEG-TS、H.264 FLV 与 fragmented MP4 后端；FLV 已由正式 FileSink 实测：V4L2 中断流文件、单视频自然 EOS、以及 H.264 重编码 + AAC 旁路多路自然 EOS（真实约 3:10 素材，ffprobe 双轨可识别、ffplay 可播放）均已通过，并完成 Mux 等齐期 staging 死锁修复。MPEG-TS 真实字节已由 `TcpSink` 推流路径验收。fMP4 已由 `transcode_to_fmp4` 自然 EOS 验收：短/长素材（约 3:10，aac 8190 + h264 5706）ffprobe 可识别、`ffmpeg -xerror` 完整解码，atom 为成对 `moof/mdat` + `mfra`；fMP4 未提交 AVIO tail + 有限 seek 合同已落地
 - [x] 网络 Sink 在本地可控接收端完成端到端推流（MPEG-TS/TCP）；断连、写失败和外部 stop 可在有限时间内取消并完整回收线程与资源
 - [x] `V4L2CaptureNode → EncodeNode → AVMuxNode → TcpSink` 连续运行时，框架不静默丢弃已获得的 encoded Packet，Route 不发生无界积压；必要时以预览分叉验证最慢可靠订阅者背压
-- [ ] 单测、端到端推流与 ASAN 验证通过；第三方协议库/驱动泄漏与项目自身问题分开报告
-- [ ] x86_64 通过；aarch64 在具备目标板、摄像头和接收端时验收
+- [ ] 单测、端到端推流与 ASAN 验证通过；第三方协议库/驱动泄漏与项目自身问题分开报告（x86_64 单测/ASAN 已通过；aarch64 尚未跑 ASAN 构建）
+- [ ] x86_64 通过；aarch64 在具备目标板、摄像头和接收端时验收（目标板与摄像头已具备，已完成 `v4l2_preview` / `v4l2_encode_decode_preview` 真机出画与延迟结论复验；aarch64 上的 TcpSink/FileSink/fMP4 等第五阶段新增节点与真实接收端尚未验收）
 
 ---
 

@@ -1983,20 +1983,21 @@ Pipeline::waitEOS
 
 1. **Route 容量与内存预算**：当前 Route 先按条目数硬限，`VIDEO_RAW=4`、`VIDEO_ENCODED=32`、`AUDIO_RAW=50`、`AUDIO_ENCODED=32`、`CONTAINER=32`；RAW audio 和 CONTAINER 要等 AudioPlay/Mux 的设备缓冲与实际输出块大小确定后再调，且需与第 3 条的按订阅者丢帧模型一并重新校准。后续增加 payload 字节上限、节点级总内存预算和高低水位监控。
 2. **端到端零拷贝未完成**：FFmpeg AVPacket/AVFrame 与框架 Buffer、以及未来 V4L2/硬件 surface 之间仍会复制。后续需要 DMA-BUF/硬件帧等外部存储模型。
-3. **有损订阅策略暂不支持**：当前所有静态订阅者都可靠，`OutputRoute` 只有 `publishBlocking()`，容量满时无条件阻塞发布者；这个阻塞会沿"节点不再读取输入"逐级传导回最上游的实时采集节点。对 V4L2CaptureNode 这类实时源而言，旧的 VIDEO_RAW 帧通常没有回放价值，阻塞模型会把下游短暂卡顿（Decode/Render 抖动、SDL 慢启动等）转化为 Route 积压；2026-08-01 定向实验（稳定播放后人为暂停消费侧 1 秒，纯视频 `V4L2CaptureNode → VideoRenderNode`）已证伪"恢复后连续快速吐出积压帧、表现为卡顿后快进"：VIDEO_RAW Route 积压至满容量属实，但恢复后积压帧因 age 超过 `max(duration, 40ms)` 晚帧阈值被正式晚帧丢弃逻辑拦截，未被 Present；实测最小 Present 间隔约 31.5ms，无小于 10ms 的连续 Present。当前更准确的表述是恢复后跳帧/画面跃迁，而非快进；该结论只覆盖稳定播放、Clock 已锚定、有效 monotonic PTS 的纯视频场景，NOPTS、首帧前启动积压、Clock 未锚定仍走不同正式分支，不能由此外推，也不支持据此调整晚帧阈值或 Clock 锚定逻辑（详见 `phase4_ffmpeg_avmux_work.md` 与桌面实验记录）。真正的丢帧模型不能简单假设“整条 Route 只有一种用途”：同一路 VIDEO_RAW 输出可能同时分叉给本地预览（可接受丢帧）和 EncodeNode（不可接受丢帧或时间戳跳变），中间层不应预设上层只接哪一种下游，因此丢帧粒度需要是按订阅者可声明，而不是整条 Route 一刀切；这决定了它不是给 `OutputRoute` 加一个 `tryPublish()` 就能解决的，需要先重新设计 Subscription 一层的可靠性语义。Route 容量数值（见第 1 条）与本项一并重新校准：当前按“阻塞前能攒多少”选取，丢帧模型落地后应改按“丢帧前能攒多少”的语义重新评估，不宜提前单独调整容量数字。此外，纯视频场景下 `VideoRenderNode::waitForPresentationTime()` 只在首帧用 `Clock::anchorOnce()` 锚定一次且不可覆盖；若 Route 积压导致首帧本身已迟到较多，这个迟到量会被当作播放起点永久保留、不被晚帧策略追回。该问题大概率是丢帧模型落地、旧帧不再堆积后的自然结果，暂不单独设计，随上面的丢帧模型一并重新评估。Caps、EOS、格式变化等控制事件仍必须可靠，不在这次讨论范围内。
+3. **有损订阅策略暂不支持**：当前所有静态订阅者都可靠，`OutputRoute` 只有 `publishBlocking()`，容量满时无条件阻塞发布者；这个阻塞会沿"节点不再读取输入"逐级传导回最上游的实时采集节点。对 V4L2CaptureNode 这类实时源而言，旧的 VIDEO_RAW 帧通常没有回放价值，阻塞模型会把下游短暂卡顿（Decode/Render 抖动、SDL 慢启动等）转化为 Route 积压；2026-08-01 定向实验（稳定播放后人为暂停消费侧 1 秒，纯视频 `V4L2CaptureNode → VideoRenderNode`）已证伪"恢复后连续快速吐出积压帧、表现为卡顿后快进"：VIDEO_RAW Route 积压至满容量属实，但恢复后积压帧因 age 超过 `max(duration, 40ms)` 晚帧阈值被正式晚帧丢弃逻辑拦截，未被 Present；实测最小 Present 间隔约 31.5ms，无小于 10ms 的连续 Present。当前更准确的表述是恢复后跳帧/画面跃迁，而非快进；该结论只覆盖稳定播放、Clock 已锚定、有效 monotonic PTS 的纯视频场景，NOPTS、首帧前启动积压、Clock 未锚定仍走不同正式分支，不能由此外推，也不支持据此调整晚帧阈值或 Clock 锚定逻辑。真正的丢帧模型不能简单假设"整条 Route 只有一种用途"：同一路 VIDEO_RAW 输出可能同时分叉给本地预览（可接受丢帧）和 EncodeNode（不可接受丢帧或时间戳跳变），中间层不应预设上层只接哪一种下游，因此丢帧粒度需要是按订阅者可声明，而不是整条 Route 一刀切；这决定了它不是给 `OutputRoute` 加一个 `tryPublish()` 就能解决的，需要先重新设计 Subscription 一层的可靠性语义。Route 容量数值（见第 1 条）与本项一并重新校准：当前按"阻塞前能攒多少"选取，丢帧模型落地后应改按"丢帧前能攒多少"的语义重新评估，不宜提前单独调整容量数字。此外，纯视频场景下 `VideoRenderNode::waitForPresentationTime()` 只在首帧用 `Clock::anchorOnce()` 锚定一次且不可覆盖；若 Route 积压导致首帧本身已迟到较多，这个迟到量会被当作播放起点永久保留、不被晚帧策略追回。该问题大概率是丢帧模型落地、旧帧不再堆积后的自然结果，暂不单独设计，随上面的丢帧模型一并重新评估。Caps、EOS、格式变化等控制事件仍必须可靠，不在这次讨论范围内。
 4. **Route 通知回调限制**：当前只在 Mux Ready 阶段注册，用于唤醒多输入调度；若未来需要运行期变更，必须定义通知列表的线程安全边界。
 5. **link/build 错误报告**：核心库当前只返回 bool，不直接 fprintf，也不适合走运行期 MessageBus；详细错误报告机制仍需独立设计。
 6. **Caps 运行期边界剩余限制**：尚不支持 PTS discontinuity、Caps generation，以及色彩空间/range/primaries/transfer/HDR 的显式格式协商与严格色彩管理。
-7. **采集具体节点、运行期重配与帧率/卡顿观测**：`V4L2_BUF_FLAG_ERROR` 当前只做丢帧继续，尚未提供计数、限频 WARNING 或用户可观测统计；这些可在后续诊断需求明确后补充。AudioCapture 尚未落地；多平面、压缩设备格式、DMA-BUF、设备运行期重配、PTS discontinuity 与 Caps generation 仍待设计。虚拟机 V4L2 设备上曾观察到 `G_PARM` 接受 30 fps、但直接 `v4l2-ctl` 依据 DQBUF timestamp 实测仅约 14–15 fps（不经 Pipeline、swscale 或 SDL），另一次未显式 S_PARM 的外接设备测试约 22 fps；`V4L2CaptureNode → VideoRenderNode` 直接预览（`v4l2_preview`）同样表现出明显卡顿和延迟，怀疑与第 8 条记录的编码回环高延迟属于同一族问题（Route 阻塞背压、`SDL_CreateRenderer("software")` 慢启动等），但尚未做分段探针实测确认，不能先假定根因。当前只记录为宿主机/VMware/UVC 链路待观察项，待交叉编译至嵌入式目标板和真实 V4L2 设备后统一复验，不在项目层伪造帧率或以渲染补丁掩盖。
-8. **编码回环高延迟**：真实 `V4L2CaptureNode → EncodeNode(libx264) → DecodeNode → VideoRenderNode` 回环能稳定出画，但端到端延迟很高，已用分段延迟探针（`PIPELINE_LATENCY_TRACE=1`，默认关闭）定位到两个相互独立、会叠加的原因。其一，`EncodeConfig` 目前只有 `codec_name`/`framerate`，`avcodec_open2()` 不传任何 encoder 私有选项，x264 因而落在默认 `medium` 预设，`rc_lookahead=40`/`bframes=3` 形成约 47 帧、3.2 秒量级的固定内部缓存；实测 `preset=veryfast`+`tune=zerolatency` 可完全消除该缓存，但 EncodeNode 当前没有暴露任何编码器私有参数配置接口，也还没设计好这个接口该长什么样（显式字段还是通用键值对透传）；当前虚拟化环境干扰因素较多，暂不适合专门设计和实现，先记账。其二，`SDL_CreateRenderer("software")` 在当前 VMware/X11/Mesa 环境下经 `strace` 证实稳定耗时约 1.8–2.5 秒（卡在一次 DRI3 fd 传递的 `poll()`），期间 decoded RAW Route 等可靠队列填满并把背压一路传导回采集端，形成第二段与首段量级相当的固定延迟；已确认与 Pipeline 线程模型无关，但尚无目标板/原生 Linux 对照数据，不能把 VMware 数字泛化为框架架构成本，需要真实设备复验后再决定是否调整 VideoRender 的启动/消费策略。两个原因目前都不具备立即修的条件，待真实嵌入式设备或原生 PC 环境测过之后再看效果、再决定优先级。
-9. **媒体兼容性剩余边界**：Packet side data（例如 DISPLAYMATRIX、HDR/动态 metadata）当前仍在 Packet→Buffer 转换时丢弃，未接入 CapsEvent：目前没有消费端，尤其 VideoRender 没有旋转/HDR 应用路径。若素材来源出现手机直拍等必须按旋转矩阵显示的竖版视频，再单独确定“CapsEvent 的 rotation 字段 + Render 应用”设计；不得预先将所有逐 Packet side data 伪装为流级 Caps。色彩空间/HDR 的显式协商也仍待具体消费端语义确定。`libx265` 真实设备回环与 ASAN 端到端验收已完成（见桌面 `EncodeNode_x265_ASAN真实验收记录.md`）。
-10. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
-11. **Demux/Mux 与网络输出边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`。动态 Mux 输出 Pad 与多视频交织仍待实现。RTMP、RTSP Server/客户端、TCP Listen 模式和 FFmpeg URL 输出 interrupt callback 仍待独立方案。HTTPS、TLS、RTMPS 尚未启用：它们需要 TLS 后端；当前 OpenSSL 3 与 GPL x264/x265 组合还需 `--enable-version3`，涉及单独的发布许可证决策，不能在未明确需求时擅自引入。不能用 FLV 文件路径替代 RTMP 会话合同，也不能把 CONTAINER 字节伪装成 RTP 包。
-12. **传统 MP4**：项目中 `MuxFormat::MP4` 固定表示 fragmented MP4，其 AVIO 合同见 §5.6.5（未提交 tail 内的 fragment 元数据回写，不是整文件 moov 回写）。需要 seek 回文件头的传统 MP4 应使用专用节点，而不是通用 MuxNode。
-13. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
-14. **第三方 GUI LeakSanitizer 基线**：当前 Linux/X11 环境的 SDL3 2D software renderer 在 window surface 呈现时会内部尝试 GPU texture framebuffer，加载 Mesa/GLX；即使独立最小程序完整销毁 Texture、Renderer、Window，退出 VIDEO 并调用 `SDL_Quit()`，LeakSanitizer 仍报告 Mesa/GLX 约 1464B/16 allocations。强制直接 X11 framebuffer 可避免 Mesa 报告，但会出现约 33066B/572 allocations 的 X11/XKB 报告。两者均可由独立 SDL 最小程序复现，不属于 Pipeline、Buffer、Route 或节点资源泄漏；不为消除报告而改 renderer/backend。player 的 LeakSanitizer 验证应将该 Mesa/GLX 基线与项目自身泄漏区分，框架单测仍无 suppression 严格运行。
-15. SDL_GetAudioDeviceFormat 查询已打开设备偶发返回空错误失败,而当前它被当硬 ERROR 直接毙掉整个 Ready。将来或可对这个查询加一次重试/容忍,但现在按硬失败处理也说得过去,先不动。
-16. SourceNode 的 active_output_caps_ 私有成员,和 SinkPad/OutputRoute 里已有的 active_caps_/actualType 概念是同一件事在不同层面的第三份实现(Sink 侧、Route 侧、现在 Source 侧各自维护一份"当前生效格式"的状态)。因为 Source 天生没有输入 Route 可以借,只能自己长一份，但如果以后再新增第四个需要类似状态的地方,值得先看看能不能收敛成一个共享的小工具类,而不是继续复制这段"先存副本、发布成功才切换"的逻辑。
+7. **采集具体节点、运行期重配观测**：`V4L2_BUF_FLAG_ERROR` 当前只做丢帧继续，尚未提供计数、限频 WARNING 或用户可观测统计；这些可在后续诊断需求明确后补充。AudioCapture 尚未落地；多平面、压缩设备格式、DMA-BUF、设备运行期重配、PTS discontinuity 与 Caps generation 仍待设计。
+8. **V4L2 实际帧率低于协商值（已在 VMware 与 aarch64 目标板复验，根因已定位）**：`G_PARM` 接受 30 fps，但绕开 Pipeline 的裸 `v4l2-ctl` 直采实测远低于该值——VMware 上约 14–15 fps，aarch64 目标板（lubancat）上 150 帧窗口内从 4.88 fps 收敛到 24.92 fps，均属设备/驱动自身特性，不是项目代码问题。`v4l2_preview` 内部测得的 Capture PTS 间隔在 aarch64 板上进一步低至约 14.7 fps、且反复出现数百毫秒骤增，已确认这不是采集或驱动侧问题，而是第 9 条记录的 VideoRenderNode 周期性卡顿通过 VIDEO_RAW Route（容量 4）与 V4L2 driver buffer（默认 4 个）的浅背压窗口反向拖慢了 Pipeline 观测到的采集节奏；编码回环链路未观测到同等级拖慢。不在项目层伪造帧率或以渲染补丁掩盖。
+9. **`v4l2_preview` 周期性卡顿，疑与 `sws_scale()` 相关（aarch64 目标板新发现，尚未定位根因，待排查）**：2026-08-02 aarch64 目标板对照测试显示，`v4l2_preview`（VideoRenderNode 收到 YUYV，经 `sws_scale()` 转 IYUV）每约 9 帧出现一次单帧处理耗时骤增至 700–830ms（204 帧样本中 22 次，间隔严格为 9）；`v4l2_encode_decode_preview`（Decode 输出标准 YUV420P，VideoRenderNode 直传不经 swscale）同板同期运行 1389 帧样本无此现象。驱动侧采集间隔在卡顿发生时仍正常，确认是 VideoRenderNode 内部单帧处理异常，不是采集或驱动侧问题；两条链路唯一实质差异是是否经过 `sws_scale()`。但 640×480 的 `sws_scale()` 正常应为亚毫秒到几毫秒级，不足以直接解释 700ms+ 的单帧耗时，怀疑是调用它触发了某种更深层的系统行为（内存分配、缓存失效、被调度器打断等）而非算法本身慢，具体机制仍未定位。此前 VMware 环境测试未观察到该现象，是本轮真机测试独有的新发现，需要独立最小复现程序（只做 YUYV→YUV420P 转换、不经过完整 Pipeline）配合 `strace`/`perf` 排查。
+10. **编码回环启动延迟（已在 VMware 与 aarch64 目标板复验，结论一致，暂不具备立即修的条件）**：真实 `V4L2CaptureNode → EncodeNode(libx264) → DecodeNode → VideoRenderNode` 回环能稳定出画，但端到端延迟很高。历史分段诊断（探针代码已拆除，结论保留）定位到两个相互独立、会叠加的固定启动延迟源，均已在两种环境下复验、结论保持不变：其一，`EncodeConfig` 目前只有 `codec_name`/`framerate`，`avcodec_open2()` 不传任何 encoder 私有选项，x264 因而落在默认 `medium` 预设，`rc_lookahead=40`/`bframes=3` 形成固定内部缓存——VMware 上约 47 帧/3.2 秒，aarch64 目标板上约 57 帧（差异源于板载 12 编码线程 vs VMware 3 线程，流水线更深，量级相符）；两种环境下 Present age 均稳态不随运行时长增长，确认是固定启动缓存而非持续积压。`preset=veryfast`+`tune=zerolatency` 可完全消除该缓存，但 EncodeNode 当前没有暴露任何编码器私有参数配置接口；已决定暂不做，待后续需求明确后再设计。其二，`SDL_CreateRenderer("software")` 慢启动——VMware/X11/Mesa 环境下稳定约 1.8–2.5 秒（`strace` 证实卡在一次 DRI3 fd 传递的 `poll()`），aarch64 目标板上复现同一现象、耗时降至约 1.12–1.13 秒（根因确认为板上 Mesa 缺少 rockchip 的 GLX/DRI 驱动而回退 software renderer，与 VMware 属同一类图形栈慢启动，但因缺少厂商 GPU 驱动而非纯虚拟化开销；耗时降低约一半说明确有部分是虚拟化开销，但真机上问题依然存在）；期间 decoded RAW Route 等可靠队列填满并把背压一路传导回采集端，形成第二段与首段量级相当的固定延迟，已确认与 Pipeline 线程模型无关。两个原因均不具备立即修的条件，待产品需要低延迟直播或本地预览场景时再按第 3 条丢帧模型和本条编码私参接口一并设计。
+11. **媒体兼容性剩余边界**：Packet side data（例如 DISPLAYMATRIX、HDR/动态 metadata）当前仍在 Packet→Buffer 转换时丢弃，未接入 CapsEvent：目前没有消费端，尤其 VideoRender 没有旋转/HDR 应用路径。若素材来源出现手机直拍等必须按旋转矩阵显示的竖版视频，再单独确定"CapsEvent 的 rotation 字段 + Render 应用"设计；不得预先将所有逐 Packet side data 伪装为流级 Caps。色彩空间/HDR 的显式协商也仍待具体消费端语义确定。
+12. **VideoRender 事件轮询**：当前只在有视频帧进入 `consume()` 时检查自身窗口关闭请求；上游无帧期间的窗口事件响应及时性仍待优化。
+13. **Demux/Mux 与网络输出边界**：同类型多 Track 暂不支持，每种媒体只选一路最佳流；Mux 当前固定 `out_0`。动态 Mux 输出 Pad 与多视频交织仍待实现。RTMP、RTSP Server/客户端、TCP Listen 模式和 FFmpeg URL 输出 interrupt callback 仍待独立方案。HTTPS、TLS、RTMPS 尚未启用：它们需要 TLS 后端；当前 OpenSSL 3 与 GPL x264/x265 组合还需 `--enable-version3`，涉及单独的发布许可证决策，不能在未明确需求时擅自引入。不能用 FLV 文件路径替代 RTMP 会话合同，也不能把 CONTAINER 字节伪装成 RTP 包。
+14. 当前 Clock 是多字段原子快照：base_pts_us_/base_wall_us_/anchored_ 是三个独立的 memory_order_relaxed 原子,setAudioPosition 写三次、getPositionUs 读两次,中间没有任何东西保证这五次操作在其他线程眼里是一个原子整体。C++ 内存模型允许读者看到"新 pts + 旧 wall"撕裂组合。当前不会崩溃、不会破坏不变量,下一次 getPositionUs 就自我修正。真正需要收紧内存序的场景是"未来出现多写者"或"要给撕裂上硬性正确性保证"。
+15. **第三方 GUI LeakSanitizer 基线**：当前 Linux/X11 环境的 SDL3 2D software renderer 在 window surface 呈现时会内部尝试 GPU texture framebuffer，加载 Mesa/GLX；即使独立最小程序完整销毁 Texture、Renderer、Window，退出 VIDEO 并调用 `SDL_Quit()`，LeakSanitizer 仍报告 Mesa/GLX 约 1464B/16 allocations。强制直接 X11 framebuffer 可避免 Mesa 报告，但会出现约 33066B/572 allocations 的 X11/XKB 报告。两者均可由独立 SDL 最小程序复现，不属于 Pipeline、Buffer、Route 或节点资源泄漏；不为消除报告而改 renderer/backend。player 的 LeakSanitizer 验证应将该 Mesa/GLX 基线与项目自身泄漏区分，框架单测仍无 suppression 严格运行。
+16. SDL_GetAudioDeviceFormat 查询已打开设备偶发返回空错误失败,而当前它被当硬 ERROR 直接毙掉整个 Ready。将来或可对这个查询加一次重试/容忍,但现在按硬失败处理也说得过去,先不动。
+17. SourceNode 的 active_output_caps_ 私有成员,和 SinkPad/OutputRoute 里已有的 active_caps_/actualType 概念是同一件事在不同层面的第三份实现(Sink 侧、Route 侧、现在 Source 侧各自维护一份"当前生效格式"的状态)。因为 Source 天生没有输入 Route 可以借,只能自己长一份，但如果以后再新增第四个需要类似状态的地方,值得先看看能不能收敛成一个共享的小工具类,而不是继续复制这段"先存副本、发布成功才切换"的逻辑。
 
 ---
 
@@ -2008,48 +2009,64 @@ media-pipeline/
 │   ├── core/
 │   │   ├── Buffer.h             # Buffer、BufferRef、MediaType
 │   │   ├── Caps.h               # TemplateCaps、CapsEvent
-│   │   ├── Event.h              # EOSEvent、CapsEvent
+│   │   ├── Event.h              # Event variant
+│   │   ├── Types.h              # NodeType、PipelineState 等
 │   │   ├── Pad.h                # Pad、SrcPad、SinkPad
 │   │   ├── Edge.h               # Edge，持有 RouteSubscription
-│   │   ├── OutputRoute.h         # 有界多订阅者 Route、Subscription、Delivery
-│   │   ├── BaseNode.h           # BaseNode + SourceNode + SinkNode + TransformNode
-│   │   │                          # + DemuxNode + MuxNode 五个节点基类
+│   │   ├── OutputRoute.h        # 有界多订阅者 Route、Subscription、Delivery
+│   │   ├── BoundedQueue.h       # 有界队列
+│   │   ├── BaseNode.h           # BaseNode + Source/Sink/Transform/Demux/Mux
 │   │   ├── Graph.h              # 显式邻接表、拓扑排序、静态协商
 │   │   ├── Pipeline.h           # 三阶段启动、线程管理
 │   │   ├── Clock.h              # 主时钟，AV Sync
 │   │   └── MessageBus.h         # 节点→Pipeline 消息上报
 │   └── nodes/
 │       ├── V4L2CaptureNode.h    # V4L2 视频采集
-│       ├── AudioCaptureNode.h   # ALSA 音频采集
 │       ├── DecodeNode.h         # FFmpeg 解码
 │       ├── EncodeNode.h         # FFmpeg 编码
-│       ├── AVDemuxNode.h        # FFmpeg 解复用（继承 DemuxNode 基类）
-│       ├── AVMuxNode.h          # FFmpeg 复用（继承 MuxNode 基类）
-│       ├── VideoRenderNode.h    # SDL3 视频渲染
+│       ├── AVDemuxNode.h        # FFmpeg 解复用（继承 DemuxNode）
+│       ├── AVMuxNode.h          # FFmpeg 复用：MPEG-TS / FLV / fMP4
+│       ├── VideoRenderNode.h    # SDL3 视频渲染（默认适配显示器）
 │       ├── AudioPlayNode.h      # SDL3 音频播放
-│       ├── FileSinkNode.h       # 本地文件写入
-│       ├── TcpSinkNode.h        # CONTAINER TCP 推流（MPEG-TS/TCP 首闭环）
-│       └── RTSPPushNode.h       # RTSP/RTMP 推流（后续）
+│       ├── FileSinkNode.h       # CONTAINER 顺序文件输出
+│       └── TcpSinkNode.h        # CONTAINER TCP 推流（主动 Connect）
 ├── src/
 │   ├── core/
 │   └── nodes/
 ├── demo/
-│   ├── player.cpp                         # 本地播放
-│   ├── v4l2_preview.cpp                   # V4L2Capture → VideoRender 真实预览
-│   ├── v4l2_encode_decode_preview.cpp     # V4L2Capture → Encode → Decode → VideoRender（x264/x265 回环与 ASAN 已验收）
+│   ├── player.cpp                         # 本地音视频播放
+│   ├── player_video_only.cpp              # 纯视频播放
+│   ├── player_audio_only.cpp              # 纯音频播放
+│   ├── v4l2_preview.cpp                   # V4L2 → VideoRender
+│   ├── v4l2_encode_decode_preview.cpp     # V4L2 → Encode → Decode → VideoRender
 │   ├── v4l2_record_flv.cpp                # V4L2 → Encode → FLV → FileSink
 │   ├── v4l2_record_mpegts.cpp             # V4L2 → Encode → MPEG-TS → FileSink
-│   ├── transcode_to_flv.cpp               # 文件转码 FLV 自然 EOS（H.264 重编码 + AAC 旁路）
-│   ├── transcode_to_mpegts.cpp            # 文件转码 MPEG-TS 自然 EOS（H.264/HEVC 重编码 + AAC 旁路）
-│   ├── transcode_to_fmp4.cpp              # 文件转码 fMP4 自然 EOS（H.264/HEVC 重编码 + AAC 旁路）
 │   ├── v4l2_push_mpegts_tcp.cpp           # V4L2 → Encode → MPEG-TS → TcpSink
-│   ├── transcode_to_mpegts_tcp.cpp        # 文件转码 MPEG-TS/TCP 自然 EOS
-│   ├── recorder.cpp                       # 采集录制
-│   ├── pusher.cpp                         # 推流
-│   └── transcoder.cpp                     # 转码
-└── tests/
-    ├── test_graph.cpp
-    ├── test_caps.cpp
-    ├── test_buffer.cpp
-    └── test_av_sync.cpp
+│   ├── transcode_to_flv.cpp               # 文件 → FLV 自然 EOS（H.264 重编码 + AAC 旁路）
+│   ├── transcode_to_mpegts.cpp            # 文件 → MPEG-TS 自然 EOS
+│   ├── transcode_to_fmp4.cpp              # 文件 → fMP4 自然 EOS
+│   └── transcode_to_mpegts_tcp.cpp        # 文件 → MPEG-TS → TcpSink 自然 EOS
+├── tests/
+│   └── test_pipeline.cpp                  # 框架合同单测入口
+├── scripts/
+│   ├── build_x264.sh
+│   ├── build_x265.sh
+│   ├── build_ffmpeg.sh
+│   └── build_sdl3.sh
+├── cmake/
+│   ├── FindFFmpeg.cmake                   # 消费 third_party/ffmpeg/<arch> 的 --static 闭包
+│   ├── FindSDL3.cmake
+│   └── toolchains/
+│       ├── aarch64.cmake
+│       ├── x86_64.cmake
+│       └── riscv64.cmake                  # 占位
+├── third_party/                           # 按架构安装前缀，不入库大体积 .a 时可本地生成
+│   ├── encoders/<arch>/                   # x264 / x265
+│   ├── ffmpeg/<arch>/
+│   └── SDL3/<arch>/
+├── Media_Pipeline_Framework_V5.4.md       # 正式设计文档
+├── implementation_plan.md                 # 分阶段实施计划
+└── refactoring_decisions.md               # 重构决策与否决流水
 ```
+
+尚未落地、仅作规划的节点（如 AudioCapture、RTSP/RTMP 会话输出）不列入上表。

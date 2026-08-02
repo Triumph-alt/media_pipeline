@@ -656,3 +656,52 @@ kStagingTotalLimit = 512
 - 允许改写已进入 pending / Route / FileSink 的前缀
 - 在 AVIO callback 内 publish Route 或发送 EOS
 - 以短素材单小 fragment“碰巧可解码”单独作为 fMP4 完成判据
+
+---
+
+## aarch64 交叉编码依赖构建边界
+
+### 决策
+
+- x264 / x265 / FFmpeg 分架构静态构建，安装到 `third_party/encoders/<arch>` 与 `third_party/ffmpeg/<arch>`；项目 CMake 只消费安装前缀与 pkg-config 闭包
+- aarch64 交叉工具链固定为脚本与 `cmake/toolchains/aarch64.cmake` 中的 `/opt/aarch64-linux-gnu-11.4.0-64`（GCC 11.4）
+- aarch64 x265：配置期 `ENABLE_SVE2=OFF`、`ENABLE_SVE2_BITPERM=OFF`，因 GCC 11.4 不认 `-march=armv9-a+…+sve2`；保留 Neon / DotProd / I8MM / SVE1
+- aarch64 FFmpeg：configure 显式 `--pkg-config=pkg-config`，配合 `PKG_CONFIG_LIBDIR` 指向 `third_party/encoders/aarch64/lib/pkgconfig`；有 `--cross-prefix` 时 FFmpeg 默认找 `${cross_prefix}pkg-config`，工具链无该包装会退化为 `false`，导致 x264/x265 检测失败
+
+### 明确否决
+
+- 为过编译去改外部 x265 源码树
+- 跳过 x265、只拿 x264 编 FFmpeg（与双 encoder 合同不一致，且 `build_ffmpeg.sh` 硬依赖 `x265.pc`）
+- 在未统一工具链与 SDL3 构建前，把交叉前缀随意切到系统 `aarch64-linux-gnu-gcc-13` 而不改脚本/工具链文件
+
+---
+
+## VideoRender 默认适配显示器
+
+### 决策
+
+- `VideoRenderNode` 在 `SDL_InitSubSystem(SDL_INIT_VIDEO)` 成功后查询主显示器（失败则 displays 列表首项）的 `SDL_GetDisplayUsableBounds`，不可用时退回 `SDL_GetDisplayBounds`
+- Texture 始终保持视频原始宽高；窗口宽高为视频相对可用区域的等比缩小结果，**只缩小不放大**
+- Present 使用 `SDL_RenderTexture(..., nullptr, nullptr)`，由 SDL 将 Texture 缩放到当前窗口
+- 查询失败时不伪造屏幕尺寸，窗口回退为与视频同尺寸
+- 不要求应用层填写屏幕宽高
+
+### 明确否决
+
+- 在 Render 路径用 swscale 改视频内容分辨率来“适配屏”
+- 默认全屏 / 用户可配置屏幕尺寸作为本轮合同
+- 把窗口适配做成 demo 私有逻辑而非节点默认行为
+
+---
+
+## 拆除实时链路延迟探针
+
+### 决策
+
+- 删除 `LatencyTrace` 与节点内分段/启动探针代码；诊断结论已写入框架 §13，不再保留默认关闭的运行时探针路径
+- 正式产品路径不依赖环境变量探针
+
+### 明确否决
+
+- 以探针代码作为长期架构组成部分
+- 用临时低延迟 encoder 参数或改 Route/Clock 掩盖已定位的固定启动缓存

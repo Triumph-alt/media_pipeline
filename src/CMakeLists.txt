@@ -7,7 +7,6 @@ set(CORE_SOURCES
     core/Pad.cpp
     core/BaseNode.cpp
     core/Graph.cpp
-    core/LatencyTrace.cpp
     core/Pipeline.cpp
     core/MessageBus.cpp
 )

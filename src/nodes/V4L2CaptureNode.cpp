@@ -1,7 +1,6 @@
 #include "pipeline/nodes/V4L2CaptureNode.h"
 
 #include "pipeline/core/Buffer.h"
-#include "pipeline/core/LatencyTrace.h"
 
 extern "C" {
 #include <libavutil/error.h>
@@ -74,7 +73,6 @@ V4L2CaptureNode::V4L2CaptureNode(const std::string& name, V4L2CaptureConfig conf
 
 bool V4L2CaptureNode::onReady() {
     initial_caps_emitted_ = false;
-    captured_frames_ = 0;
     return openAndConfigureDevice();
 }
 
@@ -536,9 +534,6 @@ bool V4L2CaptureNode::copyDequeuedBuffer(uint32_t index, const timeval& timestam
         BufferRef(raw);
         return false;
     }
-    ++captured_frames_;
-    traceLatencySample(name_.c_str(), "capture-out", captured_frames_,
-                       raw->pts, raw->dts);
     outputs.emplace_back(BufferRef(raw));
     return true;
 }
